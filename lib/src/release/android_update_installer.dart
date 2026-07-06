@@ -5,7 +5,9 @@ import 'package:flutter/services.dart';
 class AndroidUpdateInstaller {
   const AndroidUpdateInstaller();
 
-  static const _channel = MethodChannel('app.nyamail.client/update_installer');
+  static const _channel = MethodChannel(
+    'com.nyatori.nyamail/update_installer',
+  );
 
   Future<void> installApk(File file) async {
     if (!file.path.toLowerCase().endsWith('.apk')) {

@@ -32,7 +32,7 @@ val releaseKeyPassword = signingValue("keyPassword", "NYAMAIL_ANDROID_KEY_PASSWO
 val oauthRedirectScheme = configValue(
     "nyamail.oauthRedirectScheme",
     "NYAMAIL_ANDROID_OAUTH_REDIRECT_SCHEME",
-    "app.nyamail.client"
+    "com.nyatori.nyamail"
 )
 val hasReleaseSigning = listOf(
     releaseStoreFilePath,
@@ -42,7 +42,7 @@ val hasReleaseSigning = listOf(
 ).all { it != null }
 
 android {
-    namespace = "app.nyamail.client"
+    namespace = "com.nyatori.nyamail"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "28.2.13676358"
 
@@ -53,7 +53,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "app.nyamail.client"
+        applicationId = "com.nyatori.nyamail"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = maxOf(flutter.minSdkVersion, 24)

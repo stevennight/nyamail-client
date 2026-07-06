@@ -63,7 +63,7 @@ void main() {
             clientSecret: 'client-secret',
             androidClientId: 'android-client-id',
             androidClientSecret: 'android-client-secret',
-            androidRedirectUri: 'app.nyamail.client:/oauth2redirect',
+            androidRedirectUri: 'com.nyatori.nyamail:/oauth2redirect',
           ),
         )
         .upsertMailbox(
@@ -98,7 +98,10 @@ void main() {
     expect(provider?.clientSecret, 'client-secret');
     expect(provider?.androidClientId, 'android-client-id');
     expect(provider?.androidClientSecret, 'android-client-secret');
-    expect(provider?.androidRedirectUri, 'app.nyamail.client:/oauth2redirect');
+    expect(
+      provider?.androidRedirectUri,
+      'com.nyatori.nyamail:/oauth2redirect',
+    );
     expect(decoded.toCredentials().single.authType, MailboxAuthType.oauth2);
   });
 }

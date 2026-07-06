@@ -18,6 +18,7 @@ import '../mail/mail_cache.dart';
 import '../mail/mail_draft_cache.dart';
 import '../mail/mail_appearance.dart';
 import '../mail/mail_html_sanitizer.dart';
+import '../mail/mail_interaction_settings.dart';
 import '../mail/mailbox_diagnostics.dart';
 import '../mail/mail_models.dart';
 import '../mail/mail_render_settings.dart';
@@ -131,6 +132,10 @@ class _MailHomePageState extends State<MailHomePage> {
   String? _selectedAccountId;
   MailMessage? _selected;
   MailRenderSettings _renderSettings = MailRenderSettings.defaults;
+  MailInteractionSettings _interactionSettings =
+      MailInteractionSettings.defaults;
+  Set<String> _pinnedMessageIds = const <String>{};
+  Set<String> _selectedMessageIds = const <String>{};
   bool _loading = true;
   bool _vaultUnlocking = false;
   bool _loadingMore = false;
@@ -225,11 +230,15 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Future<void> _bootstrapLocal() async {
     final renderSettings = await const MailRenderSettingsStore().load();
+    final interactionSettings =
+        await const MailInteractionSettingsStore().load();
     var profile = await widget.secureStore.readLocalProfile();
     if (profile == null) {
       if (!mounted) return;
       setState(() {
         _renderSettings = renderSettings;
+        _interactionSettings = interactionSettings;
+        _pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
         _loading = false;
         _vaultUnlocking = false;
         _banner = 'Create a local encrypted vault before using NyaMail.';
@@ -244,6 +253,8 @@ class _MailHomePageState extends State<MailHomePage> {
       if (!mounted) return;
       setState(() {
         _renderSettings = renderSettings;
+        _interactionSettings = interactionSettings;
+        _pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
         _loading = false;
         _vaultUnlocking = false;
         _banner ??= 'Unlock the local vault before using NyaMail.';
@@ -252,12 +263,14 @@ class _MailHomePageState extends State<MailHomePage> {
     }
     await _finishLocalBootstrap(
       renderSettings: renderSettings,
+      interactionSettings: interactionSettings,
       profile: profile,
     );
   }
 
   Future<void> _finishLocalBootstrap({
     required MailRenderSettings renderSettings,
+    required MailInteractionSettings interactionSettings,
     required LocalProfile profile,
     String? banner,
   }) async {
@@ -275,6 +288,11 @@ class _MailHomePageState extends State<MailHomePage> {
       view: activeView,
       limit: _messagePageSize,
     );
+    final pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
+    final messages = _sortMessagesForDisplay(
+      page.messages,
+      pinnedMessageIds: pinnedMessageIds,
+    );
     _debugVault(
       'finish bootstrap: cached page ready (${page.messages.length} messages)',
     );
@@ -287,13 +305,12 @@ class _MailHomePageState extends State<MailHomePage> {
       _folders = folders;
       _view = activeView;
       _selectedAccountId = activeView.folder?.accountId;
-      _messages = page.messages;
-      _selected = _messageFor(
-        page.messages,
-        _selected?.id,
-        fallbackToFirst: false,
-      );
+      _messages = messages;
+      _selected = _messageFor(messages, _selected?.id, fallbackToFirst: false);
       _renderSettings = renderSettings;
+      _interactionSettings = interactionSettings;
+      _pinnedMessageIds = pinnedMessageIds;
+      _selectedMessageIds = const <String>{};
       _hasMoreMessages = page.hasMore;
       _loading = false;
       _vaultUnlocking = false;
@@ -1017,12 +1034,16 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
+      final messages = _sortMessagesForDisplay(page.messages);
       setState(() {
-        _messages = page.messages;
+        _messages = messages;
         _selected = _messageFor(
-          page.messages,
+          messages,
           resetSelection ? null : _selected?.id,
           fallbackToFirst: false,
+        );
+        _selectedMessageIds = _selectedMessageIds.intersection(
+          messages.map((message) => message.id).toSet(),
         );
         _hasMoreMessages = page.hasMore;
         _loadingMore = false;
@@ -1053,12 +1074,16 @@ class _MailHomePageState extends State<MailHomePage> {
       if (_notificationBaselineReady) {
         unawaited(_notifyForNewIncomingMail(page.messages));
       }
+      final messages = _sortMessagesForDisplay(page.messages);
       setState(() {
-        _messages = page.messages;
+        _messages = messages;
         _selected = _messageFor(
-          page.messages,
+          messages,
           preserveSelection ? _selected?.id : null,
           fallbackToFirst: false,
+        );
+        _selectedMessageIds = _selectedMessageIds.intersection(
+          messages.map((message) => message.id).toSet(),
         );
         _hasMoreMessages = page.hasMore;
         _loadingMore = false;
@@ -1101,12 +1126,16 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
+      final messages = _sortMessagesForDisplay(page.messages);
       setState(() {
-        _messages = page.messages;
+        _messages = messages;
         _selected = _messageFor(
-          page.messages,
+          messages,
           _selected?.id,
           fallbackToFirst: false,
+        );
+        _selectedMessageIds = _selectedMessageIds.intersection(
+          messages.map((message) => message.id).toSet(),
         );
         _hasMoreMessages = page.hasMore;
         _loadingMore = false;
@@ -1177,6 +1206,19 @@ class _MailHomePageState extends State<MailHomePage> {
                       canLoadMore: _canLoadMore,
                       loadingMore: _loadingMore,
                       onLoadMore: _loadMoreMessages,
+                      interactionSettings: _interactionSettings,
+                      pinnedMessageIds: _pinnedMessageIds,
+                      selectedMessageIds: _selectedMessageIds,
+                      onMessageAction: _runMessageAction,
+                      onBatchAction: _runBatchMessageAction,
+                      onMessageSelected: _setMessageSelected,
+                      onClearSelection: _clearMessageSelection,
+                      onSelectAll: _selectAllVisibleMessages,
+                      onAccountSettings:
+                          (account) => unawaited(_showMailboxSettings(account)),
+                      onDeleteAccount: _deleteMailbox,
+                      supportsMobileSwipe: _supportsMobileSwipe,
+                      supportsDesktopContextMenu: _supportsDesktopContextMenu,
                     );
                   }
                   return Row(
@@ -1186,6 +1228,9 @@ class _MailHomePageState extends State<MailHomePage> {
                         folders: _folders,
                         view: _view,
                         onViewChanged: _changeView,
+                        onAccountSettings:
+                            (account) =>
+                                unawaited(_showMailboxSettings(account)),
                         onDeleteAccount: _deleteMailbox,
                       ),
                       const VerticalDivider(width: 1),
@@ -1196,11 +1241,23 @@ class _MailHomePageState extends State<MailHomePage> {
                           messages: _messages,
                           selected: _selected,
                           search: _search,
+                          accounts: _accounts,
+                          interactionSettings: _interactionSettings,
+                          pinnedMessageIds: _pinnedMessageIds,
+                          selectedMessageIds: _selectedMessageIds,
                           onSearch: _reloadMessages,
                           onSelect: _selectMessage,
+                          onMessageAction: _runMessageAction,
+                          onBatchAction: _runBatchMessageAction,
+                          onMessageSelected: _setMessageSelected,
+                          onClearSelection: _clearMessageSelection,
+                          onSelectAll: _selectAllVisibleMessages,
                           canLoadMore: _canLoadMore,
                           loadingMore: _loadingMore,
                           onLoadMore: _loadMoreMessages,
+                          supportsMobileSwipe: _supportsMobileSwipe,
+                          supportsDesktopContextMenu:
+                              _supportsDesktopContextMenu,
                         ),
                       ),
                       const VerticalDivider(width: 1),
@@ -1265,6 +1322,7 @@ class _MailHomePageState extends State<MailHomePage> {
         }
         await _finishLocalBootstrap(
           renderSettings: _renderSettings,
+          interactionSettings: _interactionSettings,
           profile: created,
         );
         return;
@@ -1284,6 +1342,7 @@ class _MailHomePageState extends State<MailHomePage> {
       }
       await _finishLocalBootstrap(
         renderSettings: _renderSettings,
+        interactionSettings: _interactionSettings,
         profile: profile,
         banner: 'Local vault unlocked.',
       );
@@ -1437,12 +1496,16 @@ class _MailHomePageState extends State<MailHomePage> {
         await _checkUpdates();
       case _SettingsAction.addMailbox:
         await _showAddMailbox();
+      case _SettingsAction.mailboxes:
+        await _showMailboxSettings();
       case _SettingsAction.appThemeSettings:
         await _showAppThemeSettings();
       case _SettingsAction.localVaultSettings:
         await _showLocalVaultSettings();
       case _SettingsAction.mailSettings:
         await _showMailSettings();
+      case _SettingsAction.mailInteractionSettings:
+        await _showMailInteractionSettings();
       case _SettingsAction.oauthProviderSettings:
         await _showOAuthProviderSettings();
       case _SettingsAction.systemSettings:
@@ -1642,6 +1705,158 @@ class _MailHomePageState extends State<MailHomePage> {
     }
   }
 
+  Future<void> _showMailboxSettings([MailAccount? account]) async {
+    final document = _vaultDocument;
+    if (document == null) {
+      setState(() => _banner = 'Mailbox account data is not loaded yet.');
+      return;
+    }
+    final items =
+        account == null
+            ? document.items
+            : document.items.where((item) => item.id == account.id).toList();
+    if (items.isEmpty) {
+      setState(() => _banner = 'Mailbox account data is not available.');
+      return;
+    }
+    final action = await showDialog<_MailboxSettingsAction>(
+      context: context,
+      builder:
+          (context) => _MailboxSettingsDialog(
+            items: items,
+            selectedMailboxId: account?.id,
+          ),
+    );
+    if (!mounted || action == null) return;
+    switch (action.kind) {
+      case _MailboxSettingsActionKind.edit:
+        await _editMailboxItem(action.item);
+      case _MailboxSettingsActionKind.reauthorize:
+        await _reauthorizeMailboxItem(action.item);
+      case _MailboxSettingsActionKind.switchToPassword:
+        await _editMailboxItem(action.item, forcePassword: true);
+      case _MailboxSettingsActionKind.remove:
+        await _deleteMailbox(
+          MailAccount(
+            id: action.item.id,
+            address: action.item.address,
+            displayName:
+                action.item.displayName.trim().isEmpty
+                    ? action.item.address
+                    : action.item.displayName,
+            provider:
+                action.item.kind == VaultItemKind.oauth ? 'oauth2' : 'imap',
+          ),
+        );
+    }
+  }
+
+  Future<void> _editMailboxItem(
+    VaultMailboxItem item, {
+    bool forcePassword = false,
+  }) async {
+    final updated = await showDialog<VaultMailboxItem>(
+      context: context,
+      builder:
+          (context) =>
+              _MailboxEditDialog(item: item, forcePassword: forcePassword),
+    );
+    if (updated == null || !mounted) return;
+    await _saveUpdatedMailboxItem(
+      updated,
+      '${updated.address} settings saved to the local encrypted vault.',
+    );
+  }
+
+  Future<void> _reauthorizeMailboxItem(VaultMailboxItem item) async {
+    try {
+      final provider = oauthProviderConfig(item.provider);
+      final clientId = _oauthClientIdForProvider(item.provider);
+      if (clientId.isEmpty) {
+        throw StateError(
+          'OAuth client id is not configured for ${item.provider}.',
+        );
+      }
+      final tokenSet = await widget.oauthClient.authorize(
+        provider: provider,
+        clientId: clientId,
+        clientSecret: _oauthClientSecretForProvider(item.provider),
+        loginHint: item.address,
+        mobileRedirectUri: _oauthMobileRedirectUriForProvider(item.provider),
+      );
+      final updated = VaultMailboxItem(
+        id: item.id,
+        kind: VaultItemKind.oauth,
+        address: item.address,
+        displayName:
+            item.displayName.trim().isEmpty ? item.address : item.displayName,
+        provider: provider.provider,
+        username: item.username.trim().isEmpty ? item.address : item.username,
+        secret: tokenSet.accessToken,
+        refreshToken: tokenSet.refreshToken ?? item.refreshToken,
+        tokenExpiresAt:
+            tokenSet.expiresIn == null
+                ? item.tokenExpiresAt
+                : DateTime.now().toUtc().add(
+                  Duration(seconds: tokenSet.expiresIn!),
+                ),
+        tokenScope: tokenSet.scope ?? item.tokenScope,
+        oauthClientId: clientId,
+        oauthClientSecret: _oauthClientSecretForProvider(item.provider),
+        imapHost:
+            item.imapHost.trim().isEmpty ? provider.imapHost : item.imapHost,
+        imapPort: item.imapPort,
+        smtpHost:
+            item.smtpHost.trim().isEmpty ? provider.smtpHost : item.smtpHost,
+        smtpPort: item.smtpPort,
+        useTls: item.useTls,
+      );
+      await _saveUpdatedMailboxItem(
+        updated,
+        '${item.address} OAuth authorization refreshed.',
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _banner = 'Could not reauthorize mailbox: $error');
+    }
+  }
+
+  Future<void> _saveUpdatedMailboxItem(
+    VaultMailboxItem item,
+    String successBanner,
+  ) async {
+    final profile = await _ensureLocalProfile();
+    final document = _vaultDocument;
+    if (profile == null || document == null) return;
+    final updatedDocument = document.upsertMailbox(item);
+    await _saveLocalVaultDocument(profile: profile, document: updatedDocument);
+    await _applyVaultDocument(updatedDocument);
+    final synced = await _syncVaultRecordsWithServer(silent: true);
+    if (!mounted) return;
+    setState(
+      () =>
+          _banner =
+              synced || _session == null
+                  ? successBanner
+                  : '$successBanner Sync will retry later.',
+    );
+  }
+
+  Uri? _oauthMobileRedirectUriForProvider(String provider) {
+    if (kIsWeb || !io.Platform.isAndroid) return null;
+    final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
+    final redirect = vaultConfig?.androidRedirectUri.trim() ?? '';
+    final value =
+        redirect.isNotEmpty
+            ? redirect
+            : switch (normalizeOAuthProviderKey(provider)) {
+              'gmail' => widget.gmailAndroidOAuthRedirectUri.trim(),
+              'outlook' => widget.outlookAndroidOAuthRedirectUri.trim(),
+              _ => '',
+            };
+    return value.isEmpty ? null : Uri.parse(value);
+  }
+
   Future<bool> _confirmClearLocalData() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -1710,6 +1925,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: view,
       limit: _messagePageSize,
     );
+    final messages = _sortMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -1725,8 +1941,9 @@ class _MailHomePageState extends State<MailHomePage> {
       _hasMoreMessages = page.hasMore;
       _accounts = accounts;
       _folders = folders;
-      _messages = page.messages;
-      _selected = _messageFor(page.messages, null);
+      _messages = messages;
+      _selected = _messageFor(messages, null);
+      _selectedMessageIds = const <String>{};
       _banner = 'Local data cleared on this device.';
     });
     _ensureSelectedMessageBody();
@@ -1964,6 +2181,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: activeView,
       limit: _messagePageSize,
     );
+    final messages = _sortMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -1973,8 +2191,9 @@ class _MailHomePageState extends State<MailHomePage> {
       _hasMoreMessages = page.hasMore;
       _accounts = accounts;
       _folders = folders;
-      _messages = page.messages;
-      _selected = _messageFor(page.messages, _selected?.id);
+      _messages = messages;
+      _selected = _messageFor(messages, _selected?.id);
+      _selectedMessageIds = const <String>{};
       _banner = 'This device left sync. Local vault remains available.';
     });
     _ensureSelectedMessageBody();
@@ -1997,6 +2216,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: view,
       limit: _messagePageSize,
     );
+    final messages = _sortMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -2006,8 +2226,9 @@ class _MailHomePageState extends State<MailHomePage> {
       _hasMoreMessages = page.hasMore;
       _accounts = accounts;
       _folders = folders;
-      _messages = page.messages;
-      _selected = _messageFor(page.messages, null);
+      _messages = messages;
+      _selected = _messageFor(messages, null);
+      _selectedMessageIds = const <String>{};
       _banner = 'Sync server disconnected. Local vault remains available.';
     });
     _ensureSelectedMessageBody();
@@ -2599,6 +2820,7 @@ class _MailHomePageState extends State<MailHomePage> {
               limit: _messagePageSize,
             )
             : MailMessagePage(messages: _messages, hasMore: _hasMoreMessages);
+    final messages = _sortMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _accounts = accounts;
@@ -2606,12 +2828,13 @@ class _MailHomePageState extends State<MailHomePage> {
       _view = activeView;
       _selectedAccountId = activeView.folder?.accountId;
       if (loadMessages) {
-        _messages = page.messages;
+        _messages = messages;
         _selected = _messageFor(
-          page.messages,
+          messages,
           _selected?.id,
           fallbackToFirst: false,
         );
+        _selectedMessageIds = const <String>{};
         _hasMoreMessages = page.hasMore;
       }
     });
@@ -3130,6 +3353,184 @@ class _MailHomePageState extends State<MailHomePage> {
     setState(() => _banner = 'Attachment downloaded: ${file.path}');
   }
 
+  bool get _supportsMobileSwipe {
+    return !kIsWeb && (io.Platform.isAndroid || io.Platform.isIOS);
+  }
+
+  bool get _supportsDesktopContextMenu {
+    return !kIsWeb &&
+        (io.Platform.isWindows || io.Platform.isLinux || io.Platform.isMacOS);
+  }
+
+  List<MailMessage> _sortMessagesForDisplay(
+    List<MailMessage> messages, {
+    Set<String>? pinnedMessageIds,
+  }) {
+    final pinned = pinnedMessageIds ?? _pinnedMessageIds;
+    if (pinned.isEmpty || messages.length < 2) return messages;
+    final top = <MailMessage>[];
+    final rest = <MailMessage>[];
+    for (final message in messages) {
+      if (pinned.contains(message.id)) {
+        top.add(message);
+      } else {
+        rest.add(message);
+      }
+    }
+    return [...top, ...rest];
+  }
+
+  Future<void> _saveInteractionSettings(
+    MailInteractionSettings settings,
+  ) async {
+    await const MailInteractionSettingsStore().save(settings);
+    if (!mounted) return;
+    setState(() => _interactionSettings = settings);
+  }
+
+  Future<void> _showMailInteractionSettings() async {
+    final next = await showDialog<MailInteractionSettings>(
+      context: context,
+      builder:
+          (context) => _MailInteractionSettingsDialog(
+            settings: _interactionSettings,
+            supportsMobileSwipe: _supportsMobileSwipe,
+            supportsDesktopContextMenu: _supportsDesktopContextMenu,
+          ),
+    );
+    if (next == null) return;
+    final settings = next.copyWith(
+      pinnedMessageIds: _pinnedMessageIds.toList()..sort(),
+    );
+    await _saveInteractionSettings(settings);
+  }
+
+  Future<void> _setPinnedMessageIds(Set<String> pinnedMessageIds) async {
+    final settings = _interactionSettings.copyWith(
+      pinnedMessageIds: pinnedMessageIds.toList()..sort(),
+    );
+    await const MailInteractionSettingsStore().save(settings);
+    if (!mounted) return;
+    setState(() {
+      _interactionSettings = settings;
+      _pinnedMessageIds = pinnedMessageIds;
+      _messages = _sortMessagesForDisplay(
+        _messages,
+        pinnedMessageIds: pinnedMessageIds,
+      );
+    });
+  }
+
+  Future<void> _togglePinnedMessage(MailMessage message) async {
+    final next = {..._pinnedMessageIds};
+    if (!next.add(message.id)) {
+      next.remove(message.id);
+    }
+    await _setPinnedMessageIds(next);
+  }
+
+  void _setMessageSelected(String messageId, bool selected) {
+    setState(() {
+      final next = {..._selectedMessageIds};
+      if (selected) {
+        next.add(messageId);
+      } else {
+        next.remove(messageId);
+      }
+      _selectedMessageIds = next;
+    });
+  }
+
+  void _clearMessageSelection() {
+    setState(() => _selectedMessageIds = const <String>{});
+  }
+
+  void _selectAllVisibleMessages() {
+    setState(
+      () =>
+          _selectedMessageIds = _messages.map((message) => message.id).toSet(),
+    );
+  }
+
+  List<MailMessage> get _selectedMessages {
+    if (_selectedMessageIds.isEmpty) return const [];
+    return [
+      for (final message in _messages)
+        if (_selectedMessageIds.contains(message.id)) message,
+    ];
+  }
+
+  Future<void> _runMessageAction(
+    MailMessage message,
+    MailListActionPreference action,
+  ) async {
+    try {
+      switch (action) {
+        case MailListActionPreference.pin:
+          await _togglePinnedMessage(message);
+        case MailListActionPreference.delete:
+          await _deleteMessage(message);
+        case MailListActionPreference.toggleRead:
+          await _setRead(message, !message.read);
+        case MailListActionPreference.toggleStar:
+          await _setStarred(message, !message.starred);
+        case MailListActionPreference.archive:
+          await _archiveMessage(message);
+        case MailListActionPreference.moveToInbox:
+          await _moveToInboxMessage(message);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _banner = 'Mail action failed: $error');
+    }
+  }
+
+  Future<void> _runBatchMessageAction(MailListActionPreference action) async {
+    final messages = _selectedMessages;
+    if (messages.isEmpty) return;
+    try {
+      switch (action) {
+        case MailListActionPreference.pin:
+          final selectedIds = messages.map((message) => message.id).toSet();
+          final allPinned = selectedIds.every(_pinnedMessageIds.contains);
+          final next = {..._pinnedMessageIds};
+          if (allPinned) {
+            next.removeAll(selectedIds);
+          } else {
+            next.addAll(selectedIds);
+          }
+          await _setPinnedMessageIds(next);
+        case MailListActionPreference.delete:
+          for (final message in messages) {
+            await _deleteMessage(message);
+          }
+        case MailListActionPreference.toggleRead:
+          final read = messages.any((message) => !message.read);
+          for (final message in messages) {
+            await _setRead(message, read);
+          }
+        case MailListActionPreference.toggleStar:
+          final starred = messages.any((message) => !message.starred);
+          for (final message in messages) {
+            await _setStarred(message, starred);
+          }
+        case MailListActionPreference.archive:
+          for (final message in messages) {
+            await _archiveMessage(message);
+          }
+        case MailListActionPreference.moveToInbox:
+          for (final message in messages) {
+            await _moveToInboxMessage(message);
+          }
+      }
+      if (!mounted) return;
+      setState(() => _selectedMessageIds = const <String>{});
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _banner = 'Batch mail action failed: $error');
+    }
+  }
+
   void _replaceMessage(MailMessage updated) {
     setState(() {
       final keepInCurrentList = _messageBelongsToCurrentView(updated);
@@ -3143,7 +3544,10 @@ class _MailHomePageState extends State<MailHomePage> {
           messages.add(message);
         }
       }
-      _messages = messages;
+      _messages = _sortMessagesForDisplay(messages);
+      _selectedMessageIds = _selectedMessageIds.intersection(
+        messages.map((message) => message.id).toSet(),
+      );
       if (_selected?.id == updated.id) {
         _selected = updated;
       }
@@ -3163,6 +3567,7 @@ class _MailHomePageState extends State<MailHomePage> {
       _messages =
           _messages.where((message) => message.id != messageId).toList();
       _selected = _messageFor(_messages, _selected?.id);
+      _selectedMessageIds = _selectedMessageIds.difference({messageId});
       _banner = banner;
     });
     _ensureSelectedMessageBody();
@@ -3449,7 +3854,7 @@ class _TopBar extends StatelessWidget {
   Widget _wideRow(BuildContext context) {
     return Row(
       children: [
-        const Icon(Icons.mail_lock_outlined),
+        const _NyaMailLogo(size: 24),
         const SizedBox(width: 10),
         Text('NyaMail', style: Theme.of(context).textTheme.titleLarge),
         const Spacer(),
@@ -3475,7 +3880,7 @@ class _TopBar extends StatelessWidget {
   Widget _compactRow(BuildContext context) {
     return Row(
       children: [
-        const Icon(Icons.mail_lock_outlined),
+        const _NyaMailLogo(size: 24),
         const SizedBox(width: 10),
         Expanded(
           child: Text(
@@ -3505,13 +3910,31 @@ class _TopBar extends StatelessWidget {
   }
 }
 
+class _NyaMailLogo extends StatelessWidget {
+  const _NyaMailLogo({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      'assets/nyamail_tray.png',
+      width: size,
+      height: size,
+      filterQuality: FilterQuality.high,
+    );
+  }
+}
+
 enum _SettingsAction {
   syncAccount,
   checkUpdates,
   addMailbox,
+  mailboxes,
   appThemeSettings,
   localVaultSettings,
   mailSettings,
+  mailInteractionSettings,
   oauthProviderSettings,
   systemSettings,
   clearLocalData,
@@ -3676,6 +4099,16 @@ class _SettingsContent extends StatelessWidget {
                       : '$accountCount mailboxes',
             ),
             _SettingsTile(
+              action: _SettingsAction.mailboxes,
+              icon: Icons.alternate_email,
+              title: 'Mailboxes',
+              subtitle:
+                  accountCount == 0
+                      ? 'No mailbox configured'
+                      : '$accountCount configured',
+              enabled: accountCount > 0,
+            ),
+            _SettingsTile(
               action: _SettingsAction.oauthProviderSettings,
               icon: Icons.vpn_key_outlined,
               title: 'OAuth providers',
@@ -3700,6 +4133,11 @@ class _SettingsContent extends StatelessWidget {
               action: _SettingsAction.mailSettings,
               icon: Icons.tune,
               title: 'Mail rendering',
+            ),
+            _SettingsTile(
+              action: _SettingsAction.mailInteractionSettings,
+              icon: Icons.touch_app_outlined,
+              title: 'Mail list actions',
             ),
           ],
         ),
@@ -3993,6 +4431,7 @@ class _Sidebar extends StatelessWidget {
     required this.folders,
     required this.view,
     required this.onViewChanged,
+    required this.onAccountSettings,
     required this.onDeleteAccount,
   });
 
@@ -4000,6 +4439,7 @@ class _Sidebar extends StatelessWidget {
   final List<MailFolder> folders;
   final MailboxView view;
   final ValueChanged<MailboxView> onViewChanged;
+  final ValueChanged<MailAccount> onAccountSettings;
   final ValueChanged<MailAccount> onDeleteAccount;
 
   @override
@@ -4023,69 +4463,120 @@ class _Sidebar extends StatelessWidget {
           Text('Accounts', style: Theme.of(context).textTheme.labelLarge),
           const SizedBox(height: 8),
           for (final account in accounts)
-            ExpansionTile(
-              initiallyExpanded:
-                  view.folder?.accountId == account.id || accounts.length == 1,
-              leading: const Icon(Icons.alternate_email),
-              title: Row(
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onSecondaryTapDown:
+                  account.id == 'all'
+                      ? null
+                      : (details) => _showAccountContextMenu(
+                        context,
+                        account,
+                        details.globalPosition,
+                      ),
+              onLongPress:
+                  account.id == 'all'
+                      ? null
+                      : () => _showAccountContextMenu(
+                        context,
+                        account,
+                        Offset(
+                          MediaQuery.sizeOf(context).width / 2,
+                          MediaQuery.sizeOf(context).height / 3,
+                        ),
+                      ),
+              child: ExpansionTile(
+                initiallyExpanded:
+                    view.folder?.accountId == account.id ||
+                    accounts.length == 1,
+                leading: const Icon(Icons.alternate_email),
+                title: Text(
+                  account.displayName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: Text(
+                  account.address,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
                 children: [
-                  Expanded(
-                    child: Text(
-                      account.displayName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  if (account.id != 'all')
-                    IconButton(
-                      tooltip: 'Remove mailbox',
-                      onPressed: () => onDeleteAccount(account),
-                      icon: const Icon(Icons.delete_outline),
+                  for (final folder in _foldersForAccount(folders, account.id))
+                    Builder(
+                      builder: (context) {
+                        final folderPathLabel = folder.effectiveDisplayPath;
+                        return ListTile(
+                          contentPadding: const EdgeInsets.only(
+                            left: 56,
+                            right: 12,
+                          ),
+                          selected: view.folder?.key == folder.key,
+                          leading: Icon(_iconForMailbox(folder.kind), size: 18),
+                          title: Text(
+                            folder.displayName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle:
+                              folderPathLabel == folder.displayName
+                                  ? null
+                                  : Text(
+                                    folderPathLabel,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                          dense: true,
+                          onTap:
+                              () => onViewChanged(MailboxView.folder(folder)),
+                        );
+                      },
                     ),
                 ],
               ),
-              subtitle: Text(
-                account.address,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              children: [
-                for (final folder in _foldersForAccount(folders, account.id))
-                  Builder(
-                    builder: (context) {
-                      final folderPathLabel = folder.effectiveDisplayPath;
-                      return ListTile(
-                        contentPadding: const EdgeInsets.only(
-                          left: 56,
-                          right: 12,
-                        ),
-                        selected: view.folder?.key == folder.key,
-                        leading: Icon(_iconForMailbox(folder.kind), size: 18),
-                        title: Text(
-                          folder.displayName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle:
-                            folderPathLabel == folder.displayName
-                                ? null
-                                : Text(
-                                  folderPathLabel,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                        dense: true,
-                        onTap: () => onViewChanged(MailboxView.folder(folder)),
-                      );
-                    },
-                  ),
-              ],
             ),
         ],
       ),
     );
   }
+
+  Future<void> _showAccountContextMenu(
+    BuildContext context,
+    MailAccount account,
+    Offset position,
+  ) async {
+    final action = await showMenu<_AccountContextAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, 0),
+      items: const [
+        PopupMenuItem(
+          value: _AccountContextAction.settings,
+          child: ListTile(
+            leading: Icon(Icons.settings_outlined),
+            title: Text('Settings'),
+            dense: true,
+          ),
+        ),
+        PopupMenuItem(
+          value: _AccountContextAction.delete,
+          child: ListTile(
+            leading: Icon(Icons.delete_outline),
+            title: Text('Remove'),
+            dense: true,
+          ),
+        ),
+      ],
+    );
+    switch (action) {
+      case _AccountContextAction.settings:
+        onAccountSettings(account);
+      case _AccountContextAction.delete:
+        onDeleteAccount(account);
+      case null:
+        break;
+    }
+  }
 }
+
+enum _AccountContextAction { settings, delete }
 
 class _MessageList extends StatefulWidget {
   const _MessageList({
@@ -4093,21 +4584,47 @@ class _MessageList extends StatefulWidget {
     required this.messages,
     required this.selected,
     required this.search,
+    required this.accounts,
+    required this.interactionSettings,
+    required this.pinnedMessageIds,
+    required this.selectedMessageIds,
     required this.onSearch,
     required this.onSelect,
+    required this.onMessageAction,
+    required this.onBatchAction,
+    required this.onMessageSelected,
+    required this.onClearSelection,
+    required this.onSelectAll,
     required this.canLoadMore,
     required this.loadingMore,
     required this.onLoadMore,
+    required this.supportsMobileSwipe,
+    required this.supportsDesktopContextMenu,
   });
 
   final List<MailMessage> messages;
   final MailMessage? selected;
   final TextEditingController search;
+  final List<MailAccount> accounts;
+  final MailInteractionSettings interactionSettings;
+  final Set<String> pinnedMessageIds;
+  final Set<String> selectedMessageIds;
   final VoidCallback onSearch;
   final ValueChanged<MailMessage> onSelect;
+  final Future<void> Function(
+    MailMessage message,
+    MailListActionPreference action,
+  )
+  onMessageAction;
+  final Future<void> Function(MailListActionPreference action) onBatchAction;
+  final void Function(String messageId, bool selected) onMessageSelected;
+  final VoidCallback onClearSelection;
+  final VoidCallback onSelectAll;
   final bool canLoadMore;
   final bool loadingMore;
   final VoidCallback onLoadMore;
+  final bool supportsMobileSwipe;
+  final bool supportsDesktopContextMenu;
 
   @override
   State<_MessageList> createState() => _MessageListState();
@@ -4180,6 +4697,14 @@ class _MessageListState extends State<_MessageList> {
 
   @override
   Widget build(BuildContext context) {
+    final selecting = widget.selectedMessageIds.isNotEmpty;
+    final accountLabels = {
+      for (final account in widget.accounts)
+        account.id:
+            account.displayName.trim().isEmpty
+                ? account.address
+                : account.displayName,
+    };
     return Column(
       children: [
         Padding(
@@ -4191,6 +4716,13 @@ class _MessageListState extends State<_MessageList> {
             onSubmitted: (_) => widget.onSearch(),
           ),
         ),
+        if (selecting)
+          _MessageBatchToolbar(
+            selectedCount: widget.selectedMessageIds.length,
+            onAction: widget.onBatchAction,
+            onClear: widget.onClearSelection,
+            onSelectAll: widget.onSelectAll,
+          ),
         Expanded(
           child: ListView.separated(
             controller: _scrollController,
@@ -4206,34 +4738,376 @@ class _MessageListState extends State<_MessageList> {
                 );
               }
               final message = widget.messages[index];
-              return ListTile(
-                selected: widget.selected?.id == message.id,
-                title: Text(
-                  message.subject,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontWeight:
-                        message.read ? FontWeight.w500 : FontWeight.w700,
-                  ),
-                ),
-                subtitle: Text(
-                  '${message.from} - ${message.preview}',
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                trailing: Icon(
-                  message.hasAttachments
-                      ? Icons.attach_file
-                      : Icons.chevron_right,
-                  size: 18,
-                ),
-                onTap: () => widget.onSelect(message),
+              return _messageItem(
+                context: context,
+                message: message,
+                accountLabel:
+                    accountLabels[message.accountId] ?? message.accountId,
               );
             },
           ),
         ),
       ],
+    );
+  }
+
+  Widget _messageItem({
+    required BuildContext context,
+    required MailMessage message,
+    required String accountLabel,
+  }) {
+    final selecting = widget.selectedMessageIds.isNotEmpty;
+    final selectedForBatch = widget.selectedMessageIds.contains(message.id);
+    Widget child = _MessageListTile(
+      message: message,
+      accountLabel: accountLabel,
+      selected: widget.selected?.id == message.id,
+      selectedForBatch: selectedForBatch,
+      selecting: selecting,
+      pinned: widget.pinnedMessageIds.contains(message.id),
+      multiSelectEnabled: widget.interactionSettings.multiSelectEnabled,
+      onTap:
+          selecting
+              ? () => widget.onMessageSelected(message.id, !selectedForBatch)
+              : () => widget.onSelect(message),
+      onLongPress:
+          widget.interactionSettings.multiSelectEnabled
+              ? () => widget.onMessageSelected(message.id, true)
+              : null,
+      onSelectionChanged:
+          (value) => widget.onMessageSelected(message.id, value),
+    );
+    if (widget.supportsDesktopContextMenu &&
+        widget.interactionSettings.desktopContextMenuEnabled) {
+      child = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onSecondaryTapDown:
+            (details) => _showMessageContextMenu(
+              context,
+              message,
+              details.globalPosition,
+            ),
+        child: child,
+      );
+    }
+    if (widget.supportsMobileSwipe &&
+        widget.interactionSettings.mobileSwipeEnabled &&
+        !selecting) {
+      child = _SwipeActionTile(
+        leftLevel1: widget.interactionSettings.mobileSwipeLeftToRightLevel1,
+        leftLevel2: widget.interactionSettings.mobileSwipeLeftToRightLevel2,
+        rightLevel1: widget.interactionSettings.mobileSwipeRightToLeftLevel1,
+        rightLevel2: widget.interactionSettings.mobileSwipeRightToLeftLevel2,
+        onAction: (action) => widget.onMessageAction(message, action),
+        child: child,
+      );
+    }
+    return child;
+  }
+
+  Future<void> _showMessageContextMenu(
+    BuildContext context,
+    MailMessage message,
+    Offset position,
+  ) async {
+    final actions = widget.interactionSettings.desktopContextMenuActions;
+    if (actions.isEmpty) return;
+    final action = await showMenu<MailListActionPreference>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, 0),
+      items: [
+        for (final action in actions)
+          PopupMenuItem(
+            value: action,
+            child: ListTile(
+              leading: Icon(_mailListActionIcon(action)),
+              title: Text(_mailListActionLabel(action, message: message)),
+              dense: true,
+            ),
+          ),
+      ],
+    );
+    if (action != null) {
+      await widget.onMessageAction(message, action);
+    }
+  }
+}
+
+class _MessageBatchToolbar extends StatelessWidget {
+  const _MessageBatchToolbar({
+    required this.selectedCount,
+    required this.onAction,
+    required this.onClear,
+    required this.onSelectAll,
+  });
+
+  final int selectedCount;
+  final Future<void> Function(MailListActionPreference action) onAction;
+  final VoidCallback onClear;
+  final VoidCallback onSelectAll;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Material(
+      color: colorScheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: 'Clear selection',
+              onPressed: onClear,
+              icon: const Icon(Icons.close),
+            ),
+            Expanded(
+              child: Text(
+                '$selectedCount selected',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelLarge,
+              ),
+            ),
+            IconButton(
+              tooltip: 'Select all visible',
+              onPressed: onSelectAll,
+              icon: const Icon(Icons.select_all),
+            ),
+            for (final action in const [
+              MailListActionPreference.pin,
+              MailListActionPreference.toggleRead,
+              MailListActionPreference.toggleStar,
+              MailListActionPreference.archive,
+              MailListActionPreference.moveToInbox,
+              MailListActionPreference.delete,
+            ])
+              IconButton(
+                tooltip: _mailListActionLabel(action),
+                onPressed: () => onAction(action),
+                icon: Icon(_mailListActionIcon(action)),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MessageListTile extends StatelessWidget {
+  const _MessageListTile({
+    required this.message,
+    required this.accountLabel,
+    required this.selected,
+    required this.selectedForBatch,
+    required this.selecting,
+    required this.pinned,
+    required this.multiSelectEnabled,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onSelectionChanged,
+  });
+
+  final MailMessage message;
+  final String accountLabel;
+  final bool selected;
+  final bool selectedForBatch;
+  final bool selecting;
+  final bool pinned;
+  final bool multiSelectEnabled;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+  final ValueChanged<bool> onSelectionChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final colorScheme = Theme.of(context).colorScheme;
+    final secondary = colorScheme.onSurfaceVariant;
+    return ListTile(
+      selected: selected,
+      leading:
+          selecting
+              ? Checkbox(
+                value: selectedForBatch,
+                onChanged:
+                    multiSelectEnabled
+                        ? (value) => onSelectionChanged(value ?? false)
+                        : null,
+              )
+              : null,
+      title: Row(
+        children: [
+          if (pinned) ...[
+            Icon(Icons.push_pin_outlined, size: 16, color: colorScheme.primary),
+            const SizedBox(width: 6),
+          ],
+          Expanded(
+            child: Text(
+              message.subject,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontWeight: message.read ? FontWeight.w500 : FontWeight.w700,
+              ),
+            ),
+          ),
+          if (message.starred) ...[
+            const SizedBox(width: 6),
+            Icon(Icons.star, size: 16, color: colorScheme.tertiary),
+          ],
+        ],
+      ),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 2),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '${message.from} - ${message.preview}',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Icon(
+                  message.read
+                      ? Icons.mark_email_read_outlined
+                      : Icons.mark_email_unread_outlined,
+                  size: 14,
+                  color: secondary,
+                ),
+                const Spacer(),
+                Flexible(
+                  child: Text(
+                    accountLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: textTheme.labelSmall?.copyWith(color: secondary),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      trailing: Icon(
+        message.hasAttachments ? Icons.attach_file : Icons.chevron_right,
+        size: 18,
+      ),
+      onTap: onTap,
+      onLongPress: onLongPress,
+    );
+  }
+}
+
+class _SwipeActionTile extends StatefulWidget {
+  const _SwipeActionTile({
+    required this.leftLevel1,
+    required this.leftLevel2,
+    required this.rightLevel1,
+    required this.rightLevel2,
+    required this.onAction,
+    required this.child,
+  });
+
+  final MailListActionPreference leftLevel1;
+  final MailListActionPreference leftLevel2;
+  final MailListActionPreference rightLevel1;
+  final MailListActionPreference rightLevel2;
+  final Future<void> Function(MailListActionPreference action) onAction;
+  final Widget child;
+
+  @override
+  State<_SwipeActionTile> createState() => _SwipeActionTileState();
+}
+
+class _SwipeActionTileState extends State<_SwipeActionTile> {
+  static const _level1Threshold = 0.20;
+  static const _level2Threshold = 0.48;
+  static const _maxVisualOffset = 112.0;
+
+  double _dragDx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth <= 0 ? 1.0 : constraints.maxWidth;
+        final action = _currentAction(width);
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onHorizontalDragUpdate:
+              (details) => setState(() {
+                _dragDx += details.primaryDelta ?? 0;
+              }),
+          onHorizontalDragEnd: (_) => _finishDrag(width),
+          onHorizontalDragCancel: () => setState(() => _dragDx = 0),
+          child: Stack(
+            children: [
+              Positioned.fill(child: _SwipeActionBackground(action: action)),
+              Transform.translate(
+                offset: Offset(
+                  _dragDx.clamp(-_maxVisualOffset, _maxVisualOffset),
+                  0,
+                ),
+                child: widget.child,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  MailListActionPreference? _currentAction(double width) {
+    final fraction = (_dragDx.abs() / width).clamp(0, 1);
+    if (fraction < _level1Threshold) return null;
+    final level2 = fraction >= _level2Threshold;
+    if (_dragDx < 0) {
+      return level2 ? widget.rightLevel2 : widget.rightLevel1;
+    }
+    return level2 ? widget.leftLevel2 : widget.leftLevel1;
+  }
+
+  Future<void> _finishDrag(double width) async {
+    final action = _currentAction(width);
+    setState(() => _dragDx = 0);
+    if (action != null) {
+      await widget.onAction(action);
+    }
+  }
+}
+
+class _SwipeActionBackground extends StatelessWidget {
+  const _SwipeActionBackground({required this.action});
+
+  final MailListActionPreference? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final resolvedAction = action ?? MailListActionPreference.pin;
+    return ColoredBox(
+      color:
+          action == null
+              ? Colors.transparent
+              : _mailListActionColor(resolvedAction, colorScheme),
+      child: Align(
+        alignment: Alignment.center,
+        child:
+            action == null
+                ? const SizedBox.shrink()
+                : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(_mailListActionIcon(resolvedAction), size: 18),
+                    const SizedBox(width: 8),
+                    Text(_mailListActionLabel(resolvedAction)),
+                  ],
+                ),
+      ),
     );
   }
 }
@@ -6220,6 +7094,18 @@ class _MobileInbox extends StatelessWidget {
     required this.canLoadMore,
     required this.loadingMore,
     required this.onLoadMore,
+    required this.interactionSettings,
+    required this.pinnedMessageIds,
+    required this.selectedMessageIds,
+    required this.onMessageAction,
+    required this.onBatchAction,
+    required this.onMessageSelected,
+    required this.onClearSelection,
+    required this.onSelectAll,
+    required this.onAccountSettings,
+    required this.onDeleteAccount,
+    required this.supportsMobileSwipe,
+    required this.supportsDesktopContextMenu,
   });
 
   final List<MailMessage> messages;
@@ -6234,74 +7120,121 @@ class _MobileInbox extends StatelessWidget {
   final bool canLoadMore;
   final bool loadingMore;
   final VoidCallback onLoadMore;
+  final MailInteractionSettings interactionSettings;
+  final Set<String> pinnedMessageIds;
+  final Set<String> selectedMessageIds;
+  final Future<void> Function(
+    MailMessage message,
+    MailListActionPreference action,
+  )
+  onMessageAction;
+  final Future<void> Function(MailListActionPreference action) onBatchAction;
+  final void Function(String messageId, bool selected) onMessageSelected;
+  final VoidCallback onClearSelection;
+  final VoidCallback onSelectAll;
+  final ValueChanged<MailAccount> onAccountSettings;
+  final ValueChanged<MailAccount> onDeleteAccount;
+  final bool supportsMobileSwipe;
+  final bool supportsDesktopContextMenu;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        SizedBox(
-          height: 54,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            children: [
-              for (final folder in MailSmartFolder.values)
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                    vertical: 8,
-                  ),
-                  child: ChoiceChip(
-                    selected: view.smartFolder == folder,
-                    label: Text(_labelForSmartFolder(folder)),
-                    onSelected: (_) => onViewChanged(MailboxView.smart(folder)),
+    return Scaffold(
+      drawer: Drawer(
+        child: SafeArea(
+          child: Builder(
+            builder:
+                (drawerContext) => _Sidebar(
+                  accounts: accounts,
+                  folders: folders,
+                  view: view,
+                  onViewChanged: (nextView) {
+                    Navigator.of(drawerContext).pop();
+                    onViewChanged(nextView);
+                  },
+                  onAccountSettings: onAccountSettings,
+                  onDeleteAccount: onDeleteAccount,
+                ),
+          ),
+        ),
+      ),
+      body: Column(
+        children: [
+          Builder(
+            builder:
+                (context) => Material(
+                  color: Theme.of(context).colorScheme.surface,
+                  child: SizedBox(
+                    height: 48,
+                    child: Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'Folders',
+                          onPressed: () => Scaffold.of(context).openDrawer(),
+                          icon: const Icon(Icons.menu),
+                        ),
+                        Expanded(
+                          child: Text(
+                            _labelForView(view),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                      ],
+                    ),
                   ),
                 ),
-            ],
           ),
-        ),
-        if (folders.isNotEmpty)
-          SizedBox(
-            height: 48,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              children: [
-                for (final account in accounts)
-                  for (final folder in _foldersForAccount(folders, account.id))
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 6,
-                      ),
-                      child: ChoiceChip(
-                        selected: view.folder?.key == folder.key,
-                        avatar: Icon(_iconForMailbox(folder.kind), size: 16),
-                        label: Text(
-                          '${account.displayName} / ${folder.displayName}',
-                        ),
-                        onSelected:
-                            (_) => onViewChanged(MailboxView.folder(folder)),
-                      ),
-                    ),
-              ],
+          Expanded(
+            child: _MessageList(
+              key: ValueKey('mobile-${view.key}-${search.text}'),
+              messages: messages,
+              selected: selected,
+              search: search,
+              accounts: accounts,
+              interactionSettings: interactionSettings,
+              pinnedMessageIds: pinnedMessageIds,
+              selectedMessageIds: selectedMessageIds,
+              onSearch: onSearch,
+              onSelect: onSelect,
+              onMessageAction: onMessageAction,
+              onBatchAction: onBatchAction,
+              onMessageSelected: onMessageSelected,
+              onClearSelection: onClearSelection,
+              onSelectAll: onSelectAll,
+              canLoadMore: canLoadMore,
+              loadingMore: loadingMore,
+              onLoadMore: onLoadMore,
+              supportsMobileSwipe: supportsMobileSwipe,
+              supportsDesktopContextMenu: supportsDesktopContextMenu,
             ),
           ),
-        Expanded(
-          child: _MessageList(
-            key: ValueKey('mobile-${view.key}-${search.text}'),
-            messages: messages,
-            selected: selected,
-            search: search,
-            onSearch: onSearch,
-            onSelect: onSelect,
-            canLoadMore: canLoadMore,
-            loadingMore: loadingMore,
-            onLoadMore: onLoadMore,
-          ),
-        ),
-      ],
+        ],
+      ),
     );
+  }
+
+  String _labelForView(MailboxView view) {
+    final smart = view.smartFolder;
+    if (smart != null) return _labelForSmartFolder(smart);
+    final folder = view.folder;
+    if (folder == null) return 'Mail';
+    MailAccount? account;
+    for (final item in accounts) {
+      if (item.id == folder.accountId) {
+        account = item;
+        break;
+      }
+    }
+    final accountLabel =
+        account == null
+            ? folder.accountId
+            : account.displayName.trim().isEmpty
+            ? account.address
+            : account.displayName;
+    return '$accountLabel / ${folder.displayName}';
   }
 }
 
@@ -7575,6 +8508,190 @@ class _MailSettingsDialogState extends State<_MailSettingsDialog> {
   }
 }
 
+class _MailInteractionSettingsDialog extends StatefulWidget {
+  const _MailInteractionSettingsDialog({
+    required this.settings,
+    required this.supportsMobileSwipe,
+    required this.supportsDesktopContextMenu,
+  });
+
+  final MailInteractionSettings settings;
+  final bool supportsMobileSwipe;
+  final bool supportsDesktopContextMenu;
+
+  @override
+  State<_MailInteractionSettingsDialog> createState() =>
+      _MailInteractionSettingsDialogState();
+}
+
+class _MailInteractionSettingsDialogState
+    extends State<_MailInteractionSettingsDialog> {
+  static const _actions = MailListActionPreference.values;
+
+  late bool _mobileSwipeEnabled = widget.settings.mobileSwipeEnabled;
+  late bool _desktopContextMenuEnabled =
+      widget.settings.desktopContextMenuEnabled;
+  late bool _multiSelectEnabled = widget.settings.multiSelectEnabled;
+  late MailListActionPreference _rtlLevel1 =
+      widget.settings.mobileSwipeRightToLeftLevel1;
+  late MailListActionPreference _rtlLevel2 =
+      widget.settings.mobileSwipeRightToLeftLevel2;
+  late MailListActionPreference _ltrLevel1 =
+      widget.settings.mobileSwipeLeftToRightLevel1;
+  late MailListActionPreference _ltrLevel2 =
+      widget.settings.mobileSwipeLeftToRightLevel2;
+  late final Set<MailListActionPreference> _desktopActions =
+      widget.settings.desktopContextMenuActions.toSet();
+
+  @override
+  Widget build(BuildContext context) {
+    final sections = <Widget>[
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        secondary: const Icon(Icons.checklist_outlined),
+        title: const Text('Multi-select'),
+        value: _multiSelectEnabled,
+        onChanged: (value) => setState(() => _multiSelectEnabled = value),
+      ),
+    ];
+    if (widget.supportsMobileSwipe) {
+      sections.addAll([
+        const Divider(height: 24),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          secondary: const Icon(Icons.swipe_outlined),
+          title: const Text('Swipe actions'),
+          value: _mobileSwipeEnabled,
+          onChanged: (value) => setState(() => _mobileSwipeEnabled = value),
+        ),
+        _actionDropdown(
+          label: 'Swipe left level 1',
+          value: _rtlLevel1,
+          onChanged: (value) => setState(() => _rtlLevel1 = value),
+        ),
+        const SizedBox(height: 10),
+        _actionDropdown(
+          label: 'Swipe left level 2',
+          value: _rtlLevel2,
+          onChanged: (value) => setState(() => _rtlLevel2 = value),
+        ),
+        const SizedBox(height: 10),
+        _actionDropdown(
+          label: 'Swipe right level 1',
+          value: _ltrLevel1,
+          onChanged: (value) => setState(() => _ltrLevel1 = value),
+        ),
+        const SizedBox(height: 10),
+        _actionDropdown(
+          label: 'Swipe right level 2',
+          value: _ltrLevel2,
+          onChanged: (value) => setState(() => _ltrLevel2 = value),
+        ),
+      ]);
+    }
+    if (widget.supportsDesktopContextMenu) {
+      sections.addAll([
+        const Divider(height: 24),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          secondary: const Icon(Icons.ads_click_outlined),
+          title: const Text('Right-click menu'),
+          value: _desktopContextMenuEnabled,
+          onChanged:
+              (value) => setState(() => _desktopContextMenuEnabled = value),
+        ),
+        for (final action in _actions)
+          CheckboxListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _desktopActions.contains(action),
+            secondary: Icon(_mailListActionIcon(action)),
+            title: Text(_mailListActionLabel(action)),
+            onChanged:
+                (value) => setState(() {
+                  if (value ?? false) {
+                    _desktopActions.add(action);
+                  } else {
+                    _desktopActions.remove(action);
+                  }
+                }),
+          ),
+      ]);
+    }
+    return AlertDialog(
+      title: const Text('Mail list actions'),
+      content: _DialogContent(
+        width: 460,
+        maxHeight: 680,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: sections,
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: _save,
+          icon: const Icon(Icons.check),
+          label: const Text('Save'),
+        ),
+      ],
+    );
+  }
+
+  Widget _actionDropdown({
+    required String label,
+    required MailListActionPreference value,
+    required ValueChanged<MailListActionPreference> onChanged,
+  }) {
+    return DropdownButtonFormField<MailListActionPreference>(
+      initialValue: value,
+      decoration: InputDecoration(labelText: label),
+      items: [
+        for (final action in _actions)
+          DropdownMenuItem(
+            value: action,
+            child: Row(
+              children: [
+                Icon(_mailListActionIcon(action), size: 18),
+                const SizedBox(width: 8),
+                Text(_mailListActionLabel(action)),
+              ],
+            ),
+          ),
+      ],
+      onChanged: (value) {
+        if (value != null) onChanged(value);
+      },
+    );
+  }
+
+  void _save() {
+    final desktopActions =
+        _desktopActions.isEmpty
+            ? MailInteractionSettings.defaultDesktopContextMenuActions
+            : [
+              for (final action in _actions)
+                if (_desktopActions.contains(action)) action,
+            ];
+    Navigator.of(context).pop(
+      widget.settings.copyWith(
+        mobileSwipeEnabled: _mobileSwipeEnabled,
+        desktopContextMenuEnabled: _desktopContextMenuEnabled,
+        multiSelectEnabled: _multiSelectEnabled,
+        mobileSwipeRightToLeftLevel1: _rtlLevel1,
+        mobileSwipeRightToLeftLevel2: _rtlLevel2,
+        mobileSwipeLeftToRightLevel1: _ltrLevel1,
+        mobileSwipeLeftToRightLevel2: _ltrLevel2,
+        desktopContextMenuActions: desktopActions,
+      ),
+    );
+  }
+}
+
 class _OAuthProviderSettingsDialogState
     extends State<_OAuthProviderSettingsDialog> {
   late final TextEditingController _gmailClientId;
@@ -7655,6 +8772,8 @@ class _OAuthProviderSettingsDialogState
     }
     return null;
   }
+
+  bool get _showAndroidOAuthFields => !kIsWeb && io.Platform.isAndroid;
 
   @override
   Widget build(BuildContext context) {
@@ -7763,6 +8882,11 @@ class _OAuthProviderSettingsDialogState
   }) {
     final textTheme = Theme.of(context).textTheme;
     final colorScheme = Theme.of(context).colorScheme;
+    final showAndroidFields = _showAndroidOAuthFields;
+    final activeFallbackStatus =
+        showAndroidFields
+            ? _fallbackStatus(androidBuildClientId, androidBuildClientSecret)
+            : _fallbackStatus(buildClientId, buildClientSecret);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -7773,13 +8897,17 @@ class _OAuthProviderSettingsDialogState
             Text(title, style: textTheme.titleMedium),
             const Spacer(),
             Tooltip(
-              message: _fallbackStatus(buildClientId, buildClientSecret),
+              message: activeFallbackStatus,
               child: Icon(
-                buildClientId.trim().isEmpty
+                (showAndroidFields ? androidBuildClientId : buildClientId)
+                        .trim()
+                        .isEmpty
                     ? Icons.settings_outlined
                     : Icons.check_circle_outline,
                 color:
-                    buildClientId.trim().isEmpty
+                    (showAndroidFields ? androidBuildClientId : buildClientId)
+                            .trim()
+                            .isEmpty
                         ? colorScheme.onSurfaceVariant
                         : colorScheme.primary,
                 size: 20,
@@ -7788,115 +8916,141 @@ class _OAuthProviderSettingsDialogState
           ],
         ),
         const SizedBox(height: 10),
-        Text(
-          'Desktop',
-          style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
-        ),
-        const SizedBox(height: 8),
-        TextField(
-          controller: clientId,
-          keyboardType: TextInputType.text,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'Client ID',
-            hintText: _clientIdHint(provider),
-            prefixIcon: const Icon(Icons.badge_outlined),
+        if (!showAndroidFields) ...[
+          Text(
+            'Desktop',
+            style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
           ),
-        ),
-        const SizedBox(height: 10),
-        TextField(
-          controller: clientSecret,
-          obscureText: !showSecret,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'Client secret',
-            prefixIcon: const Icon(Icons.key_outlined),
-            suffixIcon: IconButton(
-              tooltip: showSecret ? 'Hide secret' : 'Show secret',
-              onPressed: onToggleSecret,
-              icon: Icon(
-                showSecret
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
+          const SizedBox(height: 8),
+          TextField(
+            controller: clientId,
+            keyboardType: TextInputType.text,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'Client ID',
+              hintText: _clientIdHint(provider),
+              prefixIcon: const Icon(Icons.badge_outlined),
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: clientSecret,
+            obscureText: !showSecret,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'Client secret',
+              prefixIcon: const Icon(Icons.key_outlined),
+              suffixIcon: IconButton(
+                tooltip: showSecret ? 'Hide secret' : 'Show secret',
+                onPressed: onToggleSecret,
+                icon: Icon(
+                  showSecret
+                      ? Icons.visibility_off_outlined
+                      : Icons.visibility_outlined,
+                ),
               ),
             ),
           ),
-        ),
-        const SizedBox(height: 6),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: Text(
-            'Build fallback: ${_fallbackStatus(buildClientId, buildClientSecret)}',
-            style: textTheme.bodySmall?.copyWith(
-              color: colorScheme.onSurfaceVariant,
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Build fallback: ${_fallbackStatus(buildClientId, buildClientSecret)}',
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
-        ),
-        const SizedBox(height: 14),
-        Text(
-          'Android',
-          style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
-        ),
-        const SizedBox(height: 8),
-        TextField(
-          controller: androidClientId,
-          keyboardType: TextInputType.text,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'Android client ID',
-            hintText: _androidClientIdHint(provider),
-            prefixIcon: const Icon(Icons.android_outlined),
+        ],
+        if (showAndroidFields) ...[
+          Text(
+            'Android',
+            style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
           ),
-        ),
-        const SizedBox(height: 10),
-        TextField(
-          controller: androidClientSecret,
-          obscureText: !showAndroidSecret,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'Android client secret',
-            prefixIcon: const Icon(Icons.key_outlined),
-            suffixIcon: IconButton(
-              tooltip:
+          const SizedBox(height: 8),
+          TextField(
+            controller: androidClientId,
+            keyboardType: TextInputType.text,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'Android client ID',
+              hintText: _androidClientIdHint(provider),
+              prefixIcon: const Icon(Icons.android_outlined),
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: androidClientSecret,
+            obscureText: !showAndroidSecret,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'Android client secret',
+              prefixIcon: const Icon(Icons.key_outlined),
+              suffixIcon: IconButton(
+                tooltip:
+                    showAndroidSecret
+                        ? 'Hide Android secret'
+                        : 'Show Android secret',
+                onPressed: onToggleAndroidSecret,
+                icon: Icon(
                   showAndroidSecret
-                      ? 'Hide Android secret'
-                      : 'Show Android secret',
-              onPressed: onToggleAndroidSecret,
-              icon: Icon(
-                showAndroidSecret
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
+                      ? Icons.visibility_off_outlined
+                      : Icons.visibility_outlined,
+                ),
               ),
             ),
           ),
-        ),
-        const SizedBox(height: 10),
-        TextField(
-          controller: androidRedirectUri,
-          keyboardType: TextInputType.url,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'Android redirect URI',
-            hintText: _androidRedirectUriHint(provider),
-            prefixIcon: const Icon(Icons.link_outlined),
-          ),
-        ),
-        const SizedBox(height: 6),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: Text(
-            'Android fallback: ${_fallbackStatus(androidBuildClientId, androidBuildClientSecret)}'
-            '${androidBuildRedirectUri.trim().isEmpty ? '' : ', redirect URI configured'}',
-            style: textTheme.bodySmall?.copyWith(
-              color: colorScheme.onSurfaceVariant,
+          const SizedBox(height: 10),
+          TextField(
+            controller: androidRedirectUri,
+            keyboardType: TextInputType.url,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'Android redirect URI',
+              hintText: _androidRedirectUriHint(provider),
+              prefixIcon: const Icon(Icons.link_outlined),
+              suffixIcon: IconButton(
+                tooltip: 'Copy provider redirect URI',
+                onPressed:
+                    () => _copyAndroidRedirectUri(
+                      provider: provider,
+                      controller: androidRedirectUri,
+                      androidBuildRedirectUri: androidBuildRedirectUri,
+                    ),
+                icon: const Icon(Icons.content_copy),
+              ),
             ),
           ),
-        ),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Android fallback: ${_fallbackStatus(androidBuildClientId, androidBuildClientSecret)}'
+              '${androidBuildRedirectUri.trim().isEmpty ? '' : ', redirect URI configured'}',
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              _androidRedirectProviderNote(
+                provider: provider,
+                androidBuildRedirectUri: androidBuildRedirectUri,
+              ),
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -7919,10 +9073,40 @@ class _OAuthProviderSettingsDialogState
 
   String _androidRedirectUriHint(String provider) {
     return switch (provider) {
-      'gmail' => 'app.nyamail.client:/oauth2redirect',
-      'outlook' => 'app.nyamail.client:/oauth2redirect',
-      _ => 'app.nyamail.client:/oauth2redirect',
+      'gmail' => 'com.nyatori.nyamail:/oauth2redirect',
+      'outlook' => 'com.nyatori.nyamail:/oauth2redirect',
+      _ => 'com.nyatori.nyamail:/oauth2redirect',
     };
+  }
+
+  String _androidRedirectProviderNote({
+    required String provider,
+    required String androidBuildRedirectUri,
+  }) {
+    final redirectUri =
+        androidBuildRedirectUri.trim().isEmpty
+            ? _androidRedirectUriHint(provider)
+            : androidBuildRedirectUri.trim();
+    final providerName = switch (provider) {
+      'gmail' => 'Google Cloud',
+      'outlook' => 'Microsoft Entra',
+      _ => 'Provider console',
+    };
+    return '$providerName redirect URI: $redirectUri';
+  }
+
+  Future<void> _copyAndroidRedirectUri({
+    required String provider,
+    required TextEditingController controller,
+    required String androidBuildRedirectUri,
+  }) async {
+    final redirectUri =
+        controller.text.trim().isNotEmpty
+            ? controller.text.trim()
+            : androidBuildRedirectUri.trim().isNotEmpty
+            ? androidBuildRedirectUri.trim()
+            : _androidRedirectUriHint(provider);
+    await Clipboard.setData(ClipboardData(text: redirectUri));
   }
 
   String _fallbackStatus(String clientId, String clientSecret) {
@@ -8425,6 +9609,362 @@ class _SyncAccountDialog extends StatelessWidget {
   }
 }
 
+enum _MailboxSettingsActionKind { edit, reauthorize, switchToPassword, remove }
+
+class _MailboxSettingsAction {
+  const _MailboxSettingsAction({required this.kind, required this.item});
+
+  final _MailboxSettingsActionKind kind;
+  final VaultMailboxItem item;
+}
+
+class _MailboxSettingsDialog extends StatelessWidget {
+  const _MailboxSettingsDialog({
+    required this.items,
+    required this.selectedMailboxId,
+  });
+
+  final List<VaultMailboxItem> items;
+  final String? selectedMailboxId;
+
+  @override
+  Widget build(BuildContext context) {
+    final sorted = [...items]..sort((a, b) {
+      if (a.id == selectedMailboxId) return -1;
+      if (b.id == selectedMailboxId) return 1;
+      return a.address.compareTo(b.address);
+    });
+    return AlertDialog(
+      title: const Text('Mailboxes'),
+      content: _DialogContent(
+        width: 560,
+        maxHeight: 680,
+        child: ListView.separated(
+          shrinkWrap: true,
+          itemCount: sorted.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (context, index) {
+            final item = sorted[index];
+            final label =
+                item.displayName.trim().isEmpty
+                    ? item.address
+                    : item.displayName;
+            return ListTile(
+              leading: Icon(
+                item.kind == VaultItemKind.oauth
+                    ? Icons.open_in_browser
+                    : Icons.key_outlined,
+              ),
+              title: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text(
+                '${item.address} - ${item.provider}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: PopupMenuButton<_MailboxSettingsActionKind>(
+                tooltip: 'Mailbox actions',
+                onSelected:
+                    (kind) => Navigator.of(
+                      context,
+                    ).pop(_MailboxSettingsAction(kind: kind, item: item)),
+                itemBuilder:
+                    (context) => [
+                      const PopupMenuItem(
+                        value: _MailboxSettingsActionKind.edit,
+                        child: ListTile(
+                          leading: Icon(Icons.settings_outlined),
+                          title: Text('Settings'),
+                          dense: true,
+                        ),
+                      ),
+                      if (item.kind == VaultItemKind.oauth)
+                        const PopupMenuItem(
+                          value: _MailboxSettingsActionKind.reauthorize,
+                          child: ListTile(
+                            leading: Icon(Icons.refresh),
+                            title: Text('Reauthorize OAuth'),
+                            dense: true,
+                          ),
+                        ),
+                      if (item.kind == VaultItemKind.oauth)
+                        const PopupMenuItem(
+                          value: _MailboxSettingsActionKind.switchToPassword,
+                          child: ListTile(
+                            leading: Icon(Icons.key_outlined),
+                            title: Text('Switch to password'),
+                            dense: true,
+                          ),
+                        ),
+                      const PopupMenuItem(
+                        value: _MailboxSettingsActionKind.remove,
+                        child: ListTile(
+                          leading: Icon(Icons.delete_outline),
+                          title: Text('Remove'),
+                          dense: true,
+                        ),
+                      ),
+                    ],
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
+class _MailboxEditDialog extends StatefulWidget {
+  const _MailboxEditDialog({required this.item, required this.forcePassword});
+
+  final VaultMailboxItem item;
+  final bool forcePassword;
+
+  @override
+  State<_MailboxEditDialog> createState() => _MailboxEditDialogState();
+}
+
+class _MailboxEditDialogState extends State<_MailboxEditDialog> {
+  late final TextEditingController _displayName = TextEditingController(
+    text: widget.item.displayName,
+  );
+  late final TextEditingController _username = TextEditingController(
+    text:
+        widget.item.username.trim().isEmpty
+            ? widget.item.address
+            : widget.item.username,
+  );
+  late final TextEditingController _secret = TextEditingController(
+    text:
+        widget.forcePassword && widget.item.kind == VaultItemKind.oauth
+            ? ''
+            : widget.item.secret,
+  );
+  late final TextEditingController _imapHost = TextEditingController(
+    text: widget.item.imapHost,
+  );
+  late final TextEditingController _imapPort = TextEditingController(
+    text: widget.item.imapPort.toString(),
+  );
+  late final TextEditingController _smtpHost = TextEditingController(
+    text: widget.item.smtpHost,
+  );
+  late final TextEditingController _smtpPort = TextEditingController(
+    text: widget.item.smtpPort.toString(),
+  );
+  late String _provider = widget.item.provider;
+  late String _authMode =
+      widget.forcePassword || widget.item.kind != VaultItemKind.oauth
+          ? 'app_password'
+          : 'oauth';
+  late bool _useTls = widget.item.useTls;
+  String? _error;
+
+  @override
+  void dispose() {
+    _displayName.dispose();
+    _username.dispose();
+    _secret.dispose();
+    _imapHost.dispose();
+    _imapPort.dispose();
+    _smtpHost.dispose();
+    _smtpPort.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(
+        widget.forcePassword ? 'Switch to password' : 'Mailbox settings',
+      ),
+      content: _DialogContent(
+        width: 460,
+        maxHeight: 680,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.alternate_email),
+              title: Text(widget.item.address),
+              subtitle: Text(widget.item.id),
+            ),
+            TextField(
+              controller: _displayName,
+              decoration: const InputDecoration(labelText: 'Display name'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _username,
+              decoration: const InputDecoration(labelText: 'Username'),
+            ),
+            const SizedBox(height: 10),
+            DropdownButtonFormField<String>(
+              initialValue: _provider,
+              decoration: const InputDecoration(labelText: 'Provider'),
+              items: const [
+                DropdownMenuItem(
+                  value: 'imap',
+                  child: Text('Generic IMAP/SMTP'),
+                ),
+                DropdownMenuItem(value: 'gmail', child: Text('Gmail')),
+                DropdownMenuItem(value: 'outlook', child: Text('Outlook')),
+                DropdownMenuItem(value: 'icloud', child: Text('iCloud')),
+              ],
+              onChanged: (value) => setState(() => _provider = value ?? 'imap'),
+            ),
+            const SizedBox(height: 10),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(
+                  value: 'app_password',
+                  icon: Icon(Icons.key_outlined),
+                  label: Text('Password'),
+                ),
+                ButtonSegment(
+                  value: 'oauth',
+                  icon: Icon(Icons.open_in_browser),
+                  label: Text('OAuth'),
+                ),
+              ],
+              selected: {_authMode},
+              onSelectionChanged:
+                  widget.forcePassword
+                      ? null
+                      : (values) => setState(() => _authMode = values.single),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _secret,
+              obscureText: true,
+              enabled: _authMode == 'app_password',
+              decoration: InputDecoration(
+                labelText:
+                    _authMode == 'oauth'
+                        ? 'OAuth token is managed by reauthorization'
+                        : 'App password or token',
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _imapHost,
+                    decoration: const InputDecoration(labelText: 'IMAP host'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 96,
+                  child: TextField(
+                    controller: _imapPort,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Port'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _smtpHost,
+                    decoration: const InputDecoration(labelText: 'SMTP host'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 96,
+                  child: TextField(
+                    controller: _smtpPort,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Port'),
+                  ),
+                ),
+              ],
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Use TLS'),
+              value: _useTls,
+              onChanged: (value) => setState(() => _useTls = value),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: _save,
+          icon: const Icon(Icons.check),
+          label: const Text('Save'),
+        ),
+      ],
+    );
+  }
+
+  void _save() {
+    final imapPort = int.tryParse(_imapPort.text.trim());
+    final smtpPort = int.tryParse(_smtpPort.text.trim());
+    if (imapPort == null || smtpPort == null) {
+      setState(() => _error = 'Ports must be numbers.');
+      return;
+    }
+    if (_authMode == 'app_password' && _secret.text.isEmpty) {
+      setState(() => _error = 'Enter the app password or token.');
+      return;
+    }
+    final oauth = _authMode == 'oauth' && !widget.forcePassword;
+    final displayName =
+        _displayName.text.trim().isEmpty
+            ? widget.item.address
+            : _displayName.text.trim();
+    final username =
+        _username.text.trim().isEmpty
+            ? widget.item.address
+            : _username.text.trim();
+    Navigator.of(context).pop(
+      VaultMailboxItem(
+        id: widget.item.id,
+        kind: oauth ? VaultItemKind.oauth : VaultItemKind.imapSmtp,
+        address: widget.item.address,
+        displayName: displayName,
+        provider: _provider,
+        username: username,
+        secret: oauth ? widget.item.secret : _secret.text,
+        refreshToken: oauth ? widget.item.refreshToken : '',
+        tokenExpiresAt: oauth ? widget.item.tokenExpiresAt : null,
+        tokenScope: oauth ? widget.item.tokenScope : '',
+        oauthClientId: oauth ? widget.item.oauthClientId : '',
+        oauthClientSecret: oauth ? widget.item.oauthClientSecret : '',
+        imapHost: _imapHost.text.trim(),
+        imapPort: imapPort,
+        smtpHost: _smtpHost.text.trim(),
+        smtpPort: smtpPort,
+        useTls: _useTls,
+      ),
+    );
+  }
+}
+
 class _AddMailboxDialog extends StatefulWidget {
   const _AddMailboxDialog({
     required this.document,
@@ -8482,6 +10022,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   bool _submitting = false;
   String? _error;
   MailboxCredential? _pendingCredential;
+  String _lastAutoUsername = '';
 
   @override
   void initState() {
@@ -8836,12 +10377,22 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   }
 
   void _prefillHosts() {
-    final parts = _address.text.trim().split('@');
-    if (parts.length != 2 || parts.last.isEmpty) return;
-    if (_username.text.isEmpty) {
-      _username.text = _address.text.trim();
+    final address = _address.text.trim();
+    if (!_looksCompleteEmailAddress(address)) return;
+    if (_username.text.isEmpty || _username.text == _lastAutoUsername) {
+      _lastAutoUsername = address;
+      _username.text = address;
     }
     _applyProviderPreset();
+  }
+
+  bool _looksCompleteEmailAddress(String value) {
+    final parts = value.split('@');
+    if (parts.length != 2) return false;
+    final local = parts.first.trim();
+    final domain = parts.last.trim();
+    if (local.isEmpty || domain.isEmpty || !domain.contains('.')) return false;
+    return domain.split('.').every((part) => part.trim().isNotEmpty);
   }
 
   void _applyProviderPreset() {
@@ -8977,6 +10528,47 @@ bool _canMoveToInbox(MailboxKind kind) {
     MailboxKind.trash ||
     MailboxKind.custom => true,
     MailboxKind.inbox || MailboxKind.sent || MailboxKind.drafts => false,
+  };
+}
+
+IconData _mailListActionIcon(MailListActionPreference action) {
+  return switch (action) {
+    MailListActionPreference.pin => Icons.push_pin_outlined,
+    MailListActionPreference.delete => Icons.delete_outline,
+    MailListActionPreference.toggleRead => Icons.mark_email_read_outlined,
+    MailListActionPreference.toggleStar => Icons.star_outline,
+    MailListActionPreference.archive => Icons.archive_outlined,
+    MailListActionPreference.moveToInbox => Icons.move_to_inbox_outlined,
+  };
+}
+
+String _mailListActionLabel(
+  MailListActionPreference action, {
+  MailMessage? message,
+}) {
+  return switch (action) {
+    MailListActionPreference.pin => 'Pin',
+    MailListActionPreference.delete => 'Delete',
+    MailListActionPreference.toggleRead =>
+      message?.read == true ? 'Mark unread' : 'Mark read',
+    MailListActionPreference.toggleStar =>
+      message?.starred == true ? 'Unstar' : 'Star',
+    MailListActionPreference.archive => 'Archive',
+    MailListActionPreference.moveToInbox => 'Move to inbox',
+  };
+}
+
+Color _mailListActionColor(
+  MailListActionPreference action,
+  ColorScheme colorScheme,
+) {
+  return switch (action) {
+    MailListActionPreference.delete => colorScheme.errorContainer,
+    MailListActionPreference.toggleStar => colorScheme.tertiaryContainer,
+    MailListActionPreference.pin ||
+    MailListActionPreference.toggleRead ||
+    MailListActionPreference.archive ||
+    MailListActionPreference.moveToInbox => colorScheme.primaryContainer,
   };
 }
 

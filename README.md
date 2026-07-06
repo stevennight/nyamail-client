@@ -22,16 +22,16 @@ Android OAuth uses an app callback instead of the desktop `127.0.0.1`
 loopback server. The default redirect URI is:
 
 ```text
-app.nyamail.client:/oauth2redirect
+com.nyatori.nyamail:/oauth2redirect
 ```
 
 The Android manifest registers only the URI scheme. If you need a provider
 specific scheme, pass the same scheme to Gradle and Dart when building:
 
 ```powershell
-$env:NYAMAIL_ANDROID_OAUTH_REDIRECT_SCHEME = "app.nyamail.client"
+$env:NYAMAIL_ANDROID_OAUTH_REDIRECT_SCHEME = "com.nyatori.nyamail"
 flutter run -d android `
-  --dart-define NYAMAIL_OAUTH_REDIRECT_SCHEME=app.nyamail.client `
+  --dart-define NYAMAIL_OAUTH_REDIRECT_SCHEME=com.nyatori.nyamail `
   --dart-define NYAMAIL_OAUTH_REDIRECT_PATH=/oauth2redirect
 ```
 

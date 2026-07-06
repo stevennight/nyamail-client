@@ -15,7 +15,7 @@ enum OAuthAuthorizationRedirectMode { loopback, browserCallback }
 
 class OAuthMobileRedirectConfig {
   const OAuthMobileRedirectConfig({
-    this.scheme = 'app.nyamail.client',
+    this.scheme = 'com.nyatori.nyamail',
     this.host = '',
     this.path = '/oauth2redirect',
   });
@@ -55,7 +55,8 @@ abstract interface class OAuthCallbackReceiver {
 class MethodChannelOAuthCallbackReceiver implements OAuthCallbackReceiver {
   MethodChannelOAuthCallbackReceiver({MethodChannel? channel})
     : _channel =
-          channel ?? const MethodChannel('app.nyamail.client/oauth_callback');
+          channel ??
+          const MethodChannel('com.nyatori.nyamail/oauth_callback');
 
   final MethodChannel _channel;
   final List<Uri> _pendingCallbacks = [];

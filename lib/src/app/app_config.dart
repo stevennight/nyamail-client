@@ -61,7 +61,7 @@ class AppConfig {
       ),
       oauthRedirectScheme: String.fromEnvironment(
         'NYAMAIL_OAUTH_REDIRECT_SCHEME',
-        defaultValue: 'app.nyamail.client',
+        defaultValue: 'com.nyatori.nyamail',
       ),
       oauthRedirectHost: String.fromEnvironment('NYAMAIL_OAUTH_REDIRECT_HOST'),
       oauthRedirectPath: String.fromEnvironment(

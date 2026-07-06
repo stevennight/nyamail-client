@@ -1,4 +1,4 @@
-package app.nyamail.client
+package com.nyatori.nyamail
 
 import android.content.Intent
 import android.net.Uri
@@ -17,7 +17,7 @@ class MainActivity : FlutterFragmentActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "app.nyamail.client/update_installer"
+            "com.nyatori.nyamail/update_installer"
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "installApk" -> {
@@ -42,7 +42,7 @@ class MainActivity : FlutterFragmentActivity() {
         }
         oauthCallbackChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "app.nyamail.client/oauth_callback"
+            "com.nyatori.nyamail/oauth_callback"
         ).also { channel ->
             channel.setMethodCallHandler { call, result ->
                 when (call.method) {

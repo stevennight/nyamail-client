@@ -137,7 +137,10 @@ void main() {
           server.authorizationUri = uri;
           final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
           final state = uri.queryParameters['state']!;
-          expect(redirectUri.toString(), 'app.nyamail.client:/oauth2redirect');
+          expect(
+            redirectUri.toString(),
+            'com.nyatori.nyamail:/oauth2redirect',
+          );
           callbackReceiver.complete(
             redirectUri.replace(
               queryParameters: {'code': 'mobile-auth-code', 'state': state},
@@ -147,7 +150,7 @@ void main() {
       ).authorize(
         provider: provider,
         clientId: 'android-client-id',
-        mobileRedirectUri: Uri.parse('app.nyamail.client:/oauth2redirect'),
+        mobileRedirectUri: Uri.parse('com.nyatori.nyamail:/oauth2redirect'),
       );
 
       expect(tokenSet.accessToken, 'access-token');
@@ -155,7 +158,7 @@ void main() {
       expect(server.tokenBody['code'], 'mobile-auth-code');
       expect(
         server.tokenBody['redirect_uri'],
-        'app.nyamail.client:/oauth2redirect',
+        'com.nyatori.nyamail:/oauth2redirect',
       );
       expect(server.tokenBody['code_verifier'], isNotEmpty);
     } finally {
