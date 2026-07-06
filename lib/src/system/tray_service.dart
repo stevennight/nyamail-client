@@ -2,13 +2,16 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 typedef AsyncVoidCallback = Future<void> Function();
 
 class NyaMailTrayService with TrayListener, WindowListener {
-  static const _trayIconAsset = 'assets/nyamail_tray.png';
+  static const _trayIconPngAsset = 'assets/nyamail_tray.png';
+  static const _trayIconIcoAsset = 'assets/nyamail_tray.ico';
   static const _showKey = 'show';
   static const _refreshKey = 'refresh';
   static const _updatesKey = 'updates';
@@ -93,7 +96,7 @@ class NyaMailTrayService with TrayListener, WindowListener {
   }
 
   Future<void> _installTray() async {
-    await trayManager.setIcon(_trayIconAsset);
+    await trayManager.setIcon(await _trayIconPath());
     await trayManager.setToolTip('NyaMail');
     await trayManager.setContextMenu(
       Menu(
@@ -106,6 +109,23 @@ class NyaMailTrayService with TrayListener, WindowListener {
         ],
       ),
     );
+  }
+
+  Future<String> _trayIconPath() async {
+    final asset = Platform.isWindows ? _trayIconIcoAsset : _trayIconPngAsset;
+    final extension = Platform.isWindows ? '.ico' : '.png';
+    final bytes = await rootBundle.load(asset);
+    final directory = await getApplicationSupportDirectory();
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}nyamail_tray$extension',
+    );
+    final payload = bytes.buffer.asUint8List();
+    final existing =
+        await file.exists() ? await file.readAsBytes() : const <int>[];
+    if (!listEquals(existing, payload)) {
+      await file.writeAsBytes(payload, flush: true);
+    }
+    return file.path;
   }
 
   @override

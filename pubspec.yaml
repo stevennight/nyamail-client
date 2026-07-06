@@ -38,3 +38,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/nyamail_tray.png
+    - assets/nyamail_tray.ico
