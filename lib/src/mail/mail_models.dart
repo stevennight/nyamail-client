@@ -11,12 +11,22 @@ const standardMailboxKinds = [
   MailboxKind.trash,
 ];
 
-enum MailSmartFolder { allIncoming, inbox, sent, drafts, archive, spam, trash }
+enum MailSmartFolder {
+  allIncoming,
+  unread,
+  inbox,
+  sent,
+  drafts,
+  archive,
+  spam,
+  trash,
+}
 
 extension MailSmartFolderMailbox on MailSmartFolder {
   MailboxKind? get mailbox {
     return switch (this) {
       MailSmartFolder.allIncoming => null,
+      MailSmartFolder.unread => null,
       MailSmartFolder.inbox => MailboxKind.inbox,
       MailSmartFolder.sent => MailboxKind.sent,
       MailSmartFolder.drafts => MailboxKind.drafts,
@@ -256,15 +266,22 @@ bool mailMessageMatchesSmartFolder(
   MailSmartFolder folder,
 ) {
   final effectiveMailbox = message.effectiveMailbox;
+  if (folder == MailSmartFolder.unread) {
+    return !message.read && _isIncomingMailbox(effectiveMailbox);
+  }
   final mailbox = folder.mailbox;
   if (mailbox != null) return effectiveMailbox == mailbox;
+  return _isIncomingMailbox(effectiveMailbox);
+}
+
+bool _isIncomingMailbox(MailboxKind mailbox) {
   return !const {
     MailboxKind.sent,
     MailboxKind.drafts,
     MailboxKind.archive,
     MailboxKind.spam,
     MailboxKind.trash,
-  }.contains(effectiveMailbox);
+  }.contains(mailbox);
 }
 
 bool mailMessageMatchesFolder(MailMessage message, MailFolder folder) {
@@ -291,7 +308,9 @@ MailboxKind? inferMailboxKindFromFolderName(String name) {
 }
 
 String normalizeMailboxFolderName(String value) {
-  return decodeImapMailboxName(value).replaceAll('\\', '/').trim().toLowerCase();
+  return decodeImapMailboxName(
+    value,
+  ).replaceAll('\\', '/').trim().toLowerCase();
 }
 
 String decodeImapMailboxName(String value) {
@@ -347,21 +366,8 @@ const Map<MailboxKind, List<String>> _commonMailboxNames = {
     '发件箱',
   ],
   MailboxKind.drafts: ['drafts', 'draft', '草稿', '草稿箱'],
-  MailboxKind.archive: [
-    'archive',
-    'archives',
-    'all mail',
-    '存档',
-    '归档',
-    '所有邮件',
-  ],
-  MailboxKind.spam: [
-    'spam',
-    'junk',
-    'junk mail',
-    'junk email',
-    '垃圾邮件',
-  ],
+  MailboxKind.archive: ['archive', 'archives', 'all mail', '存档', '归档', '所有邮件'],
+  MailboxKind.spam: ['spam', 'junk', 'junk mail', 'junk email', '垃圾邮件'],
   MailboxKind.trash: [
     'trash',
     'deleted',

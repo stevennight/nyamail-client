@@ -43,6 +43,10 @@ import '../security/vault_record_crypto.dart';
 import '../security/vault_record_sync_engine.dart';
 import '../security/vault_records.dart';
 import '../security/vault_share_crypto.dart';
+import '../system/notification_service.dart';
+import '../system/startup_service.dart';
+import '../system/system_behavior_settings.dart';
+import '../system/tray_service.dart';
 import 'mail_html_view.dart';
 
 const _maxOutgoingAttachmentBytes = 25 * 1024 * 1024;
@@ -121,9 +125,18 @@ class _MailHomePageState extends State<MailHomePage> {
   bool _claimingVaultShare = false;
   String? _banner;
   String? _pendingPairingPackage;
+  final _startupService = const StartupService();
+  final _systemSettingsStore = const SystemBehaviorSettingsStore();
+  final _trayService = NyaMailTrayService();
+  final _notificationService = NyaMailNotificationService();
   final _search = TextEditingController();
   bool _hasMoreMessages = true;
   int _messageLoadGeneration = 0;
+  SystemBehaviorSettings _systemSettings = SystemBehaviorSettings.defaults;
+  Timer? _newMailPollTimer;
+  bool _pollingNewMail = false;
+  bool _notificationBaselineReady = false;
+  final Set<String> _knownIncomingUnreadMessageIds = <String>{};
   late final LocalVaultAuthenticator _vaultAuthenticator =
       LocalVaultAuthenticator();
 
@@ -131,13 +144,57 @@ class _MailHomePageState extends State<MailHomePage> {
   void initState() {
     super.initState();
     _mailRepository = widget.mailRepository;
+    unawaited(_loadSystemBehaviorSettings());
     _bootstrap();
   }
 
   @override
   void dispose() {
+    _newMailPollTimer?.cancel();
+    unawaited(_trayService.dispose());
     _search.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadSystemBehaviorSettings() async {
+    try {
+      final settings = await _systemSettingsStore.load();
+      if (!mounted) return;
+      setState(() => _systemSettings = settings);
+      await _applySystemBehaviorSettings(settings);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _banner = 'Could not load system settings: $error');
+    }
+  }
+
+  Future<void> _setSystemBehaviorSettings(
+    SystemBehaviorSettings settings,
+  ) async {
+    await _systemSettingsStore.save(settings);
+    if (!mounted) return;
+    setState(() => _systemSettings = settings);
+    await _applySystemBehaviorSettings(settings);
+  }
+
+  Future<void> _applySystemBehaviorSettings(
+    SystemBehaviorSettings settings,
+  ) async {
+    await _trayService.configure(
+      enabled: settings.minimizeToTray,
+      onShow: _showMainWindowFromSystemSurface,
+      onRefresh: () => _loadMessages(resetLimit: true),
+      onCheckUpdates: () => _checkUpdates(),
+    );
+    await _notificationService.configure(
+      enabled: settings.newMailNotifications,
+      onNotificationSelected: _showMainWindowFromSystemSurface,
+    );
+    _syncNewMailPolling(settings.newMailNotifications);
+  }
+
+  Future<void> _showMainWindowFromSystemSurface() async {
+    await _trayService.showWindow();
   }
 
   Future<void> _bootstrap() async {
@@ -157,43 +214,56 @@ class _MailHomePageState extends State<MailHomePage> {
     final renderSettings = await const MailRenderSettingsStore().load();
     var profile = await widget.secureStore.readLocalProfile();
     if (profile == null) {
-      profile = await _createLocalVault();
-      if (profile == null) {
-        if (!mounted) return;
-        setState(() {
-          _renderSettings = renderSettings;
-          _loading = false;
-          _banner = 'Create a local encrypted vault before using NyaMail.';
-        });
-        return;
-      }
-    } else {
-      _profile = profile;
-      _draftCache = _draftCacheForProfile(profile);
-      final unlocked = await _tryUnlockLocalVault(
-        profile,
-        promptIfNeeded: true,
-      );
-      if (!unlocked) {
-        if (!mounted) return;
-        setState(() {
-          _renderSettings = renderSettings;
-          _loading = false;
-          _banner ??= 'Unlock the local vault before using NyaMail.';
-        });
-        return;
-      }
+      if (!mounted) return;
+      setState(() {
+        _renderSettings = renderSettings;
+        _loading = false;
+        _vaultUnlocking = false;
+        _banner = 'Create a local encrypted vault before using NyaMail.';
+      });
+      return;
     }
+
+    _profile = profile;
+    _draftCache = _draftCacheForProfile(profile);
+    final unlocked = await _tryUnlockLocalVault(profile, promptIfNeeded: false);
+    if (!unlocked) {
+      if (!mounted) return;
+      setState(() {
+        _renderSettings = renderSettings;
+        _loading = false;
+        _vaultUnlocking = false;
+        _banner ??= 'Unlock the local vault before using NyaMail.';
+      });
+      return;
+    }
+    await _finishLocalBootstrap(
+      renderSettings: renderSettings,
+      profile: profile,
+    );
+  }
+
+  Future<void> _finishLocalBootstrap({
+    required MailRenderSettings renderSettings,
+    required LocalProfile profile,
+    String? banner,
+  }) async {
+    _debugVault('finish bootstrap: start');
     final session = await widget.secureStore.readSession();
     if (session != null) {
       _session = session;
     }
-    final accounts = await _mailRepository.accounts();
-    final folders = await _mailRepository.folders();
+    final document = _vaultDocument;
+    final accounts = _localAccountsForDocument(document);
+    final folders = _locallyAvailableFoldersForDocument(document);
     final activeView = _activeViewFor(folders);
+    _debugVault('finish bootstrap: loading cached page');
     final page = await _mailRepository.cachedViewPage(
       view: activeView,
       limit: _messagePageSize,
+    );
+    _debugVault(
+      'finish bootstrap: cached page ready (${page.messages.length} messages)',
     );
     if (!mounted) return;
     final activeProfile = _profile ?? profile;
@@ -213,8 +283,16 @@ class _MailHomePageState extends State<MailHomePage> {
       _renderSettings = renderSettings;
       _hasMoreMessages = page.hasMore;
       _loading = false;
+      _vaultUnlocking = false;
+      if (banner != null) {
+        _banner = banner;
+      }
     });
+    _debugVault('finish bootstrap: unlocked frame ready');
+    _resetNewMailNotificationBaseline();
+    _syncNewMailPolling(_systemSettings.newMailNotifications);
     final requestId = _nextMessageLoadGeneration();
+    unawaited(_discoverFoldersInBackground());
     // Keep the first unlocked frame local-only; network work continues behind it.
     unawaited(_refreshMessagesInBackground(requestId: requestId));
     if (session != null) {
@@ -223,17 +301,106 @@ class _MailHomePageState extends State<MailHomePage> {
     unawaited(_checkUpdates(silent: true));
   }
 
+  void _syncNewMailPolling(bool enabled) {
+    _newMailPollTimer?.cancel();
+    _newMailPollTimer = null;
+    if (!enabled || !_hasUnlockedLocalVault || _accounts.isEmpty) return;
+    _newMailPollTimer = Timer.periodic(
+      const Duration(minutes: 5),
+      (_) => unawaited(_pollNewMailForNotifications()),
+    );
+    unawaited(_pollNewMailForNotifications());
+  }
+
+  Future<void> _pollNewMailForNotifications() async {
+    if (_pollingNewMail ||
+        !_systemSettings.newMailNotifications ||
+        !_hasUnlockedLocalVault ||
+        _accounts.isEmpty) {
+      return;
+    }
+    _pollingNewMail = true;
+    try {
+      await _refreshOAuthVaultIfNeeded();
+      final page = await _mailRepository.viewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+        limit: _messagePageSize,
+      );
+      await _notifyForNewIncomingMail(page.messages);
+    } catch (error) {
+      debugPrint('[NyaMail notifications] new mail poll failed: $error');
+    } finally {
+      _pollingNewMail = false;
+    }
+  }
+
+  void _primeNewMailNotificationBaseline(Iterable<MailMessage> messages) {
+    for (final message in messages.where(_isNotifiableIncomingUnread)) {
+      _knownIncomingUnreadMessageIds.add(message.id);
+    }
+    _notificationBaselineReady = true;
+  }
+
+  void _resetNewMailNotificationBaseline() {
+    _knownIncomingUnreadMessageIds.clear();
+    _notificationBaselineReady = false;
+  }
+
+  Future<void> _notifyForNewIncomingMail(List<MailMessage> messages) async {
+    final incomingUnread = messages.where(_isNotifiableIncomingUnread).toList();
+    if (!_notificationBaselineReady) {
+      _primeNewMailNotificationBaseline(incomingUnread);
+      return;
+    }
+    final fresh = <MailMessage>[];
+    for (final message in incomingUnread) {
+      if (_knownIncomingUnreadMessageIds.add(message.id)) {
+        fresh.add(message);
+      }
+    }
+    if (!_systemSettings.newMailNotifications || fresh.isEmpty) return;
+    final title =
+        fresh.length == 1
+            ? 'New mail from ${fresh.first.from}'
+            : '${fresh.length} new messages';
+    final body =
+        fresh.length == 1
+            ? _notificationLineFor(fresh.first)
+            : fresh.take(3).map(_notificationLineFor).join('\n');
+    await _notificationService.showNewMail(
+      title: title,
+      body: body,
+      payload: fresh.first.id,
+    );
+  }
+
+  bool _isNotifiableIncomingUnread(MailMessage message) {
+    return !message.read &&
+        mailMessageMatchesSmartFolder(message, MailSmartFolder.allIncoming);
+  }
+
+  String _notificationLineFor(MailMessage message) {
+    final subject =
+        message.subject.trim().isEmpty ? '(No subject)' : message.subject;
+    final preview = message.preview.trim();
+    if (preview.isEmpty) return subject;
+    return '$subject - $preview';
+  }
+
   Future<bool> _tryUnlockLocalVault(
     LocalProfile profile, {
     bool promptIfNeeded = false,
   }) async {
     try {
+      _debugVault(
+        'local unlock: start (${promptIfNeeded ? 'prompt' : 'silent'})',
+      );
       final vaultSecret = await _unlockVaultSecretForProfile(
         profile,
         promptIfNeeded: promptIfNeeded,
       );
       if (vaultSecret == null || vaultSecret.trim().isEmpty) {
-        if (mounted) {
+        if (promptIfNeeded && mounted) {
           final currentBanner = _banner;
           if (currentBanner == null ||
               currentBanner == 'Preparing local vault...' ||
@@ -247,20 +414,32 @@ class _MailHomePageState extends State<MailHomePage> {
         }
         return false;
       }
+      _debugVault('local unlock: secret ready');
       final recordSnapshot = await widget.localVaultRecordStore.read(
         profile.id,
       );
       if (recordSnapshot != null) {
+        _debugVault(
+          'local unlock: decrypting record snapshot r${recordSnapshot.revision}',
+        );
         final records = await widget.vaultRecordCrypto.decryptRecordSet(
           records: recordSnapshot.records,
           vaultSecret: vaultSecret,
         );
         _vaultRecordRevision = recordSnapshot.revision;
         final document = records.toVaultDocument();
-        await _applyVaultDocument(document, loadMessages: false);
-        await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
+        await _applyVaultDocument(
+          document,
+          loadMessages: false,
+          discoverFolders: false,
+        );
+        _debugVault('local unlock: record vault applied');
+        if (promptIfNeeded) {
+          await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
+        }
         return true;
       }
+      _debugVault('local unlock: reading legacy vault snapshot');
       var snapshot = await widget.localVaultStore.read(profile.id);
       snapshot ??= await widget.localVaultStore.write(
         profileId: profile.id,
@@ -286,8 +465,12 @@ class _MailHomePageState extends State<MailHomePage> {
         document,
         revision: snapshot.revision,
         loadMessages: false,
+        discoverFolders: false,
       );
-      await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
+      _debugVault('local unlock: legacy vault applied');
+      if (promptIfNeeded) {
+        await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
+      }
       return true;
     } on VaultCryptoException catch (error) {
       if (mounted) {
@@ -330,6 +513,7 @@ class _MailHomePageState extends State<MailHomePage> {
         document,
         revision: revision,
         loadMessages: false,
+        discoverFolders: false,
       );
       await _syncVaultRecordsWithServer(silent: true);
       await _refreshOAuthVaultIfNeeded();
@@ -641,6 +825,7 @@ class _MailHomePageState extends State<MailHomePage> {
       document,
       revision: snapshot.revision,
       loadMessages: false,
+      discoverFolders: false,
     );
     if (mounted) {
       setState(
@@ -899,6 +1084,9 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
+      if (_notificationBaselineReady) {
+        unawaited(_notifyForNewIncomingMail(page.messages));
+      }
       setState(() {
         _messages = page.messages;
         _selected = _messageFor(
@@ -1002,8 +1190,8 @@ class _MailHomePageState extends State<MailHomePage> {
                   _pendingPairingPackage == null
                       ? null
                       : () => _showPairingQr(_pendingPairingPackage!),
+              onCompose: _accounts.isEmpty ? null : _showCompose,
               onRefresh: _loadMessages,
-              onCheckUpdates: () => _checkUpdates(),
               onSettings: _showSettings,
             ),
             Expanded(
@@ -1105,9 +1293,14 @@ class _MailHomePageState extends State<MailHomePage> {
         }
         final created = await _createLocalVault();
         if (!mounted) return;
-        setState(() => _vaultUnlocking = false);
-        if (created == null) return;
-        unawaited(_loadMessages());
+        if (created == null) {
+          setState(() => _vaultUnlocking = false);
+          return;
+        }
+        await _finishLocalBootstrap(
+          renderSettings: _renderSettings,
+          profile: created,
+        );
         return;
       }
       _profile = profile;
@@ -1123,12 +1316,11 @@ class _MailHomePageState extends State<MailHomePage> {
         setState(() => _vaultUnlocking = false);
         return;
       }
-      setState(() {
-        _profile = profile;
-        _vaultUnlocking = false;
-        _banner = 'Local vault unlocked.';
-      });
-      unawaited(_loadMessages());
+      await _finishLocalBootstrap(
+        renderSettings: _renderSettings,
+        profile: profile,
+        banner: 'Local vault unlocked.',
+      );
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -1155,6 +1347,88 @@ class _MailHomePageState extends State<MailHomePage> {
     return folders.any((item) => item.key == folder.key)
         ? _view
         : const MailboxView.smart(MailSmartFolder.allIncoming);
+  }
+
+  List<MailAccount> _localAccountsForDocument(VaultDocument? document) {
+    final credentials = document?.toCredentials() ?? const [];
+    return [
+      for (final credential in credentials)
+        MailAccount(
+          id: credential.accountId,
+          address: credential.address,
+          displayName: credential.displayName,
+          provider:
+              credential.authType == MailboxAuthType.oauth2 ? 'oauth2' : 'imap',
+        ),
+    ];
+  }
+
+  List<MailFolder> _localFoldersForDocument(VaultDocument? document) {
+    final credentials = document?.toCredentials() ?? const [];
+    return [
+      for (final credential in credentials)
+        for (final mailbox in standardMailboxKinds)
+          MailFolder(
+            accountId: credential.accountId,
+            path: _localFolderPathFor(mailbox),
+            displayName: _localFolderPathFor(mailbox),
+            kind: mailbox,
+          ),
+    ];
+  }
+
+  List<MailFolder> _locallyAvailableFoldersForDocument(
+    VaultDocument? document,
+  ) {
+    final fallbackFolders = _localFoldersForDocument(document);
+    if (document == null || _folders.isEmpty) return fallbackFolders;
+    final accountIds =
+        document
+            .toCredentials()
+            .map((credential) => credential.accountId)
+            .toSet();
+    final existingFolders =
+        _folders
+            .where((folder) => accountIds.contains(folder.accountId))
+            .toList();
+    if (existingFolders.isEmpty) return fallbackFolders;
+    final existingMailboxKeys = {
+      for (final folder in existingFolders)
+        if (folder.kind != MailboxKind.custom)
+          '${folder.accountId}:${folder.kind.name}',
+    };
+    final missingFallbackFolders =
+        fallbackFolders
+            .where(
+              (folder) =>
+                  !existingMailboxKeys.contains(
+                    '${folder.accountId}:${folder.kind.name}',
+                  ),
+            )
+            .toList();
+    return [...existingFolders, ...missingFallbackFolders];
+  }
+
+  Future<void> _discoverFoldersInBackground() async {
+    final document = _vaultDocument;
+    if (document == null || document.toCredentials().isEmpty) return;
+    try {
+      _debugVault('folder discovery: start');
+      final folders = await _mailRepository.folders();
+      if (!mounted || !identical(document, _vaultDocument)) return;
+      final nextFolders =
+          folders.isEmpty ? _localFoldersForDocument(document) : folders;
+      final activeView = _activeViewFor(nextFolders);
+      setState(() {
+        _accounts = _localAccountsForDocument(document);
+        _folders = nextFolders;
+        _view = activeView;
+        _selectedAccountId = activeView.folder?.accountId;
+      });
+      _debugVault('folder discovery: ready (${nextFolders.length} folders)');
+    } catch (error) {
+      _debugVault('folder discovery failed', error);
+    }
   }
 
   Future<void> _showSettings() async {
@@ -1193,8 +1467,8 @@ class _MailHomePageState extends State<MailHomePage> {
     switch (action) {
       case _SettingsAction.syncAccount:
         await _showLogin();
-      case _SettingsAction.compose:
-        if (_accounts.isNotEmpty) await _showCompose();
+      case _SettingsAction.checkUpdates:
+        await _checkUpdates();
       case _SettingsAction.addMailbox:
         await _showAddMailbox();
       case _SettingsAction.appThemeSettings:
@@ -1205,6 +1479,8 @@ class _MailHomePageState extends State<MailHomePage> {
         await _showMailSettings();
       case _SettingsAction.oauthProviderSettings:
         await _showOAuthProviderSettings();
+      case _SettingsAction.systemSettings:
+        await _showSystemSettings();
       case _SettingsAction.clearLocalData:
         await _clearLocalData();
       case _SettingsAction.devices:
@@ -1225,6 +1501,18 @@ class _MailHomePageState extends State<MailHomePage> {
     );
     if (next == null || next == widget.appThemeSetting) return;
     await widget.onAppThemeSettingChanged(next);
+  }
+
+  Future<void> _showSystemSettings() async {
+    await showDialog<void>(
+      context: context,
+      builder:
+          (context) => _SystemSettingsDialog(
+            service: _startupService,
+            settings: _systemSettings,
+            onSettingsChanged: _setSystemBehaviorSettings,
+          ),
+    );
   }
 
   Future<void> _showServerSettings() async {
@@ -1362,6 +1650,7 @@ class _MailHomePageState extends State<MailHomePage> {
         updatedDocument,
         revision: revision,
         loadMessages: false,
+        discoverFolders: false,
       );
       final synced = await _syncVaultRecordsWithServer(silent: true);
       if (!mounted) return;
@@ -1837,6 +2126,7 @@ class _MailHomePageState extends State<MailHomePage> {
         document,
         revision: revision,
         loadMessages: false,
+        discoverFolders: false,
       );
       await _loadMessages();
     } catch (error) {
@@ -1928,6 +2218,7 @@ class _MailHomePageState extends State<MailHomePage> {
       document,
       revision: revision,
       loadMessages: false,
+      discoverFolders: false,
     );
     await _loadMessages();
     return true;
@@ -2298,7 +2589,12 @@ class _MailHomePageState extends State<MailHomePage> {
     VaultDocument document, {
     int? revision,
     bool loadMessages = true,
+    bool discoverFolders = true,
   }) async {
+    _debugVault(
+      'apply vault: start (loadMessages=$loadMessages, discoverFolders=$discoverFolders)',
+    );
+    final previousAccountIds = _accounts.map((account) => account.id).toSet();
     _vaultDocument = document;
     if (revision != null) {
       _vaultRevision = revision;
@@ -2318,8 +2614,20 @@ class _MailHomePageState extends State<MailHomePage> {
         localCacheSecret: localCacheSecret,
       );
     }
-    final accounts = await _mailRepository.accounts();
-    final folders = await _mailRepository.folders();
+    final accounts = _localAccountsForDocument(document);
+    final List<MailFolder> folders;
+    if (discoverFolders && document.toCredentials().isNotEmpty) {
+      _debugVault('apply vault: discovering folders');
+      final discoveredFolders = await _mailRepository.folders();
+      folders =
+          discoveredFolders.isEmpty
+              ? _localFoldersForDocument(document)
+              : discoveredFolders;
+      _debugVault('apply vault: folders ready (${folders.length})');
+    } else {
+      folders = _locallyAvailableFoldersForDocument(document);
+      _debugVault('apply vault: using local folders (${folders.length})');
+    }
     final activeView = _activeViewFor(folders);
     final requestId = loadMessages ? _nextMessageLoadGeneration() : null;
     final page =
@@ -2346,6 +2654,12 @@ class _MailHomePageState extends State<MailHomePage> {
         _hasMoreMessages = page.hasMore;
       }
     });
+    final nextAccountIds = accounts.map((account) => account.id).toSet();
+    if (!setEquals(previousAccountIds, nextAccountIds)) {
+      _resetNewMailNotificationBaseline();
+      _syncNewMailPolling(_systemSettings.newMailNotifications);
+    }
+    _debugVault('apply vault: state updated');
     if (requestId != null) {
       unawaited(
         _refreshMessagesInBackground(
@@ -2447,6 +2761,7 @@ class _MailHomePageState extends State<MailHomePage> {
           result.document,
           revision: nextRevision,
           loadMessages: false,
+          discoverFolders: false,
         );
         await _syncVaultRecordsWithServer(silent: true);
       }
@@ -2492,12 +2807,14 @@ class _MailHomePageState extends State<MailHomePage> {
     MailMessage message,
     String textBody, {
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     await _refreshOAuthVaultIfNeeded();
     await _mailRepository.sendReply(
       original: message,
       textBody: textBody,
       htmlBody: htmlBody,
+      attachments: attachments,
     );
     if (!mounted) return;
     setState(() => _banner = 'Reply sent.');
@@ -2507,12 +2824,14 @@ class _MailHomePageState extends State<MailHomePage> {
     MailMessage message,
     String textBody, {
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     await _refreshOAuthVaultIfNeeded();
     await _mailRepository.sendReplyAll(
       original: message,
       textBody: textBody,
       htmlBody: htmlBody,
+      attachments: attachments,
     );
     if (!mounted) return;
     setState(() => _banner = 'Reply all sent.');
@@ -2635,6 +2954,7 @@ class _MailHomePageState extends State<MailHomePage> {
 
   void _selectMessage(MailMessage message) {
     setState(() => _selected = message);
+    _markReadWhenOpened(message);
     unawaited(_ensureMessageBody(message));
   }
 
@@ -2651,8 +2971,9 @@ class _MailHomePageState extends State<MailHomePage> {
       await _refreshOAuthVaultIfNeeded();
       final loaded = await _mailRepository.loadMessageBody(message);
       if (!mounted) return loaded;
-      _replaceMessage(loaded);
-      return loaded;
+      final updated = _preserveLocalReadState(loaded);
+      _replaceMessage(updated);
+      return updated;
     } catch (error) {
       if (mounted) {
         setState(() => _banner = 'Could not load message body: $error');
@@ -2663,7 +2984,8 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Future<void> _openMobileMessage(MailMessage message) async {
     setState(() => _selected = message);
-    final notifier = ValueNotifier<MailMessage>(message);
+    _markReadWhenOpened(message);
+    final notifier = ValueNotifier<MailMessage>(_selected ?? message);
     var disposed = false;
     unawaited(
       _ensureMessageBody(message).then((loaded) {
@@ -2712,6 +3034,41 @@ class _MailHomePageState extends State<MailHomePage> {
     final updated = await _mailRepository.setRead(message: message, read: read);
     if (!mounted) return;
     _replaceMessage(updated);
+  }
+
+  void _markReadWhenOpened(MailMessage message) {
+    if (message.read) return;
+    final optimistic = message.copyWith(read: true);
+    _replaceMessage(optimistic);
+    unawaited(_setReadRemoteAfterOpen(message));
+  }
+
+  Future<void> _setReadRemoteAfterOpen(MailMessage message) async {
+    try {
+      await _refreshOAuthVaultIfNeeded();
+      final updated = await _mailRepository.setRead(
+        message: message,
+        read: true,
+      );
+      if (!mounted) return;
+      _replaceMessage(_preserveLocalReadState(updated));
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _banner = 'Could not mark message as read: $error');
+    }
+  }
+
+  MailMessage _preserveLocalReadState(MailMessage message) {
+    final selected = _selected;
+    if (selected?.id == message.id && selected!.read && !message.read) {
+      return message.copyWith(read: true);
+    }
+    for (final cached in _messages) {
+      if (cached.id == message.id && cached.read && !message.read) {
+        return message.copyWith(read: true);
+      }
+    }
+    return message;
   }
 
   Future<void> _setStarred(MailMessage message, bool starred) async {
@@ -2779,14 +3136,30 @@ class _MailHomePageState extends State<MailHomePage> {
 
   void _replaceMessage(MailMessage updated) {
     setState(() {
-      _messages = [
-        for (final message in _messages)
-          if (message.id == updated.id) updated else message,
-      ];
+      final keepInCurrentList = _messageBelongsToCurrentView(updated);
+      final messages = <MailMessage>[];
+      for (final message in _messages) {
+        if (message.id == updated.id) {
+          if (keepInCurrentList) {
+            messages.add(updated);
+          }
+        } else {
+          messages.add(message);
+        }
+      }
+      _messages = messages;
       if (_selected?.id == updated.id) {
         _selected = updated;
       }
     });
+  }
+
+  bool _messageBelongsToCurrentView(MailMessage message) {
+    if (!mailMessageMatchesQuery(message, _search.text)) return false;
+    final smart = _view.smartFolder;
+    if (smart != null) return mailMessageMatchesSmartFolder(message, smart);
+    final folder = _view.folder;
+    return folder == null || mailMessageMatchesFolder(message, folder);
   }
 
   void _removeMessage(String messageId, String banner) {
@@ -3010,8 +3383,8 @@ class _TopBar extends StatelessWidget {
     required this.profile,
     required this.banner,
     required this.onShowPairingQr,
+    required this.onCompose,
     required this.onRefresh,
-    required this.onCheckUpdates,
     required this.onSettings,
   });
 
@@ -3019,8 +3392,8 @@ class _TopBar extends StatelessWidget {
   final LocalProfile? profile;
   final String? banner;
   final VoidCallback? onShowPairingQr;
+  final VoidCallback? onCompose;
   final VoidCallback onRefresh;
-  final VoidCallback onCheckUpdates;
   final VoidCallback onSettings;
 
   @override
@@ -3085,14 +3458,14 @@ class _TopBar extends StatelessWidget {
         Text('NyaMail', style: Theme.of(context).textTheme.titleLarge),
         const Spacer(),
         IconButton(
+          tooltip: 'New message',
+          onPressed: onCompose,
+          icon: const Icon(Icons.edit_outlined),
+        ),
+        IconButton(
           tooltip: 'Refresh mail',
           onPressed: onRefresh,
           icon: const Icon(Icons.refresh),
-        ),
-        IconButton(
-          tooltip: 'Check for updates',
-          onPressed: onCheckUpdates,
-          icon: const Icon(Icons.system_update_alt),
         ),
         IconButton(
           tooltip: 'Settings',
@@ -3117,14 +3490,14 @@ class _TopBar extends StatelessWidget {
           ),
         ),
         IconButton(
+          tooltip: 'New message',
+          onPressed: onCompose,
+          icon: const Icon(Icons.edit_outlined),
+        ),
+        IconButton(
           tooltip: 'Refresh mail',
           onPressed: onRefresh,
           icon: const Icon(Icons.refresh),
-        ),
-        IconButton(
-          tooltip: 'Check for updates',
-          onPressed: onCheckUpdates,
-          icon: const Icon(Icons.system_update_alt),
         ),
         IconButton(
           tooltip: 'Settings',
@@ -3138,12 +3511,13 @@ class _TopBar extends StatelessWidget {
 
 enum _SettingsAction {
   syncAccount,
-  compose,
+  checkUpdates,
   addMailbox,
   appThemeSettings,
   localVaultSettings,
   mailSettings,
   oauthProviderSettings,
+  systemSettings,
   clearLocalData,
   devices,
   receiveVaultShare,
@@ -3311,11 +3685,9 @@ class _SettingsContent extends StatelessWidget {
               title: 'OAuth providers',
             ),
             _SettingsTile(
-              action: _SettingsAction.compose,
-              icon: Icons.edit_outlined,
-              title: 'Compose',
-              subtitle: accountCount == 0 ? 'Add a mailbox first' : null,
-              enabled: accountCount > 0,
+              action: _SettingsAction.checkUpdates,
+              icon: Icons.system_update_alt,
+              title: 'Check for updates',
             ),
           ],
         ),
@@ -3332,6 +3704,17 @@ class _SettingsContent extends StatelessWidget {
               action: _SettingsAction.mailSettings,
               icon: Icons.tune,
               title: 'Mail rendering',
+            ),
+          ],
+        ),
+        SizedBox(height: spacing),
+        _SettingsSection(
+          title: 'System',
+          children: [
+            _SettingsTile(
+              action: _SettingsAction.systemSettings,
+              icon: Icons.power_settings_new_outlined,
+              title: 'Startup, tray, notifications',
             ),
           ],
         ),
@@ -3444,6 +3827,165 @@ class _SettingsTile extends StatelessWidget {
         onTap: enabled ? () => Navigator.of(context).pop(action) : null,
       ),
     );
+  }
+}
+
+class _SystemSettingsDialog extends StatefulWidget {
+  const _SystemSettingsDialog({
+    required this.service,
+    required this.settings,
+    required this.onSettingsChanged,
+  });
+
+  final StartupService service;
+  final SystemBehaviorSettings settings;
+  final Future<void> Function(SystemBehaviorSettings settings)
+  onSettingsChanged;
+
+  @override
+  State<_SystemSettingsDialog> createState() => _SystemSettingsDialogState();
+}
+
+class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
+  bool _loading = true;
+  late SystemBehaviorSettings _settings = widget.settings;
+  bool _launchAtStartup = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final enabled =
+          widget.service.isSupported ? await widget.service.isEnabled() : false;
+      if (!mounted) return;
+      setState(() {
+        _launchAtStartup = enabled;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('System behavior'),
+      content: _DialogContent(
+        width: 520,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Launch at startup'),
+              subtitle: Text(widget.service.platformLabel),
+              value: _launchAtStartup,
+              onChanged:
+                  _loading || !widget.service.isSupported
+                      ? null
+                      : _setLaunchAtStartup,
+            ),
+            const Divider(height: 20),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.move_to_inbox_outlined),
+              title: const Text('Tray and background mode'),
+              subtitle: Text(NyaMailTrayService.platformLabel),
+              value: _settings.minimizeToTray,
+              onChanged:
+                  _loading || !NyaMailTrayService.isSupported
+                      ? null
+                      : _setMinimizeToTray,
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.notifications_outlined),
+              title: const Text('New mail notifications'),
+              subtitle: Text(NyaMailNotificationService.platformLabel),
+              value: _settings.newMailNotifications,
+              onChanged:
+                  _loading || !NyaMailNotificationService.isSupported
+                      ? null
+                      : _setNewMailNotifications,
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _setLaunchAtStartup(bool enabled) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await widget.service.setEnabled(enabled);
+      if (!mounted) return;
+      setState(() {
+        _launchAtStartup = enabled;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _setMinimizeToTray(bool enabled) async {
+    await _setBehaviorSetting(_settings.copyWith(minimizeToTray: enabled));
+  }
+
+  Future<void> _setNewMailNotifications(bool enabled) async {
+    await _setBehaviorSetting(
+      _settings.copyWith(newMailNotifications: enabled),
+    );
+  }
+
+  Future<void> _setBehaviorSetting(SystemBehaviorSettings settings) async {
+    setState(() {
+      _settings = settings;
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await widget.onSettingsChanged(settings);
+      if (!mounted) return;
+      setState(() => _loading = false);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error.toString();
+        _settings = widget.settings;
+        _loading = false;
+      });
+    }
   }
 }
 
@@ -3781,12 +4323,14 @@ class _Reader extends StatelessWidget {
     MailMessage message,
     String textBody, {
     String htmlBody,
+    List<OutgoingAttachment> attachments,
   })
   onSendReply;
   final Future<void> Function(
     MailMessage message,
     String textBody, {
     String htmlBody,
+    List<OutgoingAttachment> attachments,
   })
   onSendReplyAll;
   final Future<void> Function(MailMessage message) onForward;
@@ -3875,6 +4419,8 @@ class _ComposeDialogState extends State<_ComposeDialog> {
   late final TextEditingController _subject;
   late final TextEditingController _body;
   final _attachments = <OutgoingAttachment>[];
+  InAppWebViewController? _bodyWebController;
+  bool _bodyEditorReady = false;
   Timer? _draftSaveTimer;
   bool _sending = false;
   String? _error;
@@ -3891,7 +4437,9 @@ class _ComposeDialogState extends State<_ComposeDialog> {
     _cc.addListener(_scheduleDraftSave);
     _bcc.addListener(_scheduleDraftSave);
     _subject.addListener(_scheduleDraftSave);
-    _body.addListener(_scheduleDraftSave);
+    if (!_supportsReplyRichEditor) {
+      _body.addListener(_scheduleDraftSave);
+    }
   }
 
   @override
@@ -3972,12 +4520,7 @@ class _ComposeDialogState extends State<_ComposeDialog> {
               decoration: const InputDecoration(labelText: 'Subject'),
             ),
             const SizedBox(height: 10),
-            TextField(
-              controller: _body,
-              minLines: 8,
-              maxLines: 12,
-              decoration: const InputDecoration(labelText: 'Message'),
-            ),
+            _composeBodyEditor(context),
             const SizedBox(height: 12),
             Row(
               children: [
@@ -4055,6 +4598,178 @@ class _ComposeDialogState extends State<_ComposeDialog> {
     );
   }
 
+  Widget _composeBodyEditor(BuildContext context) {
+    if (!_supportsReplyRichEditor) {
+      return TextField(
+        controller: _body,
+        minLines: 8,
+        maxLines: 12,
+        decoration: const InputDecoration(labelText: 'Message'),
+      );
+    }
+    final colorScheme = Theme.of(context).colorScheme;
+    final dark = colorScheme.brightness == Brightness.dark;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _ReplyComposerToolbar(
+          enabled: _bodyEditorReady && !_sending,
+          onCommand: _execBodyEditorCommand,
+          onInsertLink: _insertBodyLink,
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 240,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              border: Border.all(color: colorScheme.outlineVariant),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: InAppWebView(
+                initialData: InAppWebViewInitialData(
+                  data: _replyEditorHtml(
+                    dark: dark,
+                    initialText: widget.initialBody,
+                    placeholderText: 'Write a message',
+                  ),
+                  mimeType: 'text/html',
+                  encoding: 'utf8',
+                  baseUrl: WebUri('about:blank'),
+                ),
+                initialSettings: InAppWebViewSettings(
+                  javaScriptEnabled: true,
+                  javaScriptCanOpenWindowsAutomatically: false,
+                  mediaPlaybackRequiresUserGesture: true,
+                  useShouldOverrideUrlLoading: true,
+                  useShouldInterceptRequest: true,
+                  cacheEnabled: false,
+                  clearCache: true,
+                  incognito: true,
+                  transparentBackground: false,
+                  supportZoom: false,
+                ),
+                onWebViewCreated: (controller) {
+                  _bodyWebController = controller;
+                  controller.addJavaScriptHandler(
+                    handlerName: 'nyamailComposeChanged',
+                    callback: (_) {
+                      _scheduleDraftSave();
+                      return null;
+                    },
+                  );
+                },
+                onLoadStop: (controller, _) async {
+                  if (!mounted) return;
+                  setState(() => _bodyEditorReady = true);
+                  await controller.evaluateJavascript(
+                    source:
+                        "document.getElementById('editor')?.addEventListener('input', "
+                        "() => window.flutter_inappwebview.callHandler('nyamailComposeChanged'));",
+                  );
+                  unawaited(_focusBodyEditor());
+                },
+                shouldOverrideUrlLoading: (controller, action) async {
+                  final uri = Uri.tryParse(
+                    action.request.url?.toString() ?? '',
+                  );
+                  if (uri != null && uri.scheme == 'about') {
+                    return NavigationActionPolicy.ALLOW;
+                  }
+                  return NavigationActionPolicy.CANCEL;
+                },
+                shouldInterceptRequest: (controller, request) async {
+                  final uri = Uri.tryParse(request.url.toString());
+                  if (uri == null || !_isRemoteHttpUri(uri)) return null;
+                  return WebResourceResponse(
+                    contentType: 'text/plain',
+                    contentEncoding: 'utf-8',
+                    data: Uint8List.fromList(utf8.encode('')),
+                    headers: const {},
+                    statusCode: 204,
+                    reasonPhrase: 'No Content',
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _focusBodyEditor() async {
+    try {
+      await _bodyWebController?.evaluateJavascript(
+        source: 'window.nyamailFocusEditor && window.nyamailFocusEditor();',
+      );
+    } catch (_) {
+      // Focusing is best-effort.
+    }
+  }
+
+  Future<void> _execBodyEditorCommand(String command) async {
+    await _evaluateBodyEditorCommand(command);
+  }
+
+  Future<void> _evaluateBodyEditorCommand(
+    String command, [
+    String value = '',
+  ]) async {
+    final controller = _bodyWebController;
+    if (controller == null || !_bodyEditorReady) return;
+    try {
+      await controller.evaluateJavascript(
+        source:
+            'window.nyamailExecCommand && '
+            'window.nyamailExecCommand(${jsonEncode(command)}, ${jsonEncode(value)});',
+      );
+      _scheduleDraftSave();
+      await _focusBodyEditor();
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
+  Future<void> _insertBodyLink() async {
+    final controller = TextEditingController();
+    try {
+      final raw = await showDialog<String>(
+        context: context,
+        builder:
+            (context) => AlertDialog(
+              title: const Text('Insert link'),
+              content: TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'URL',
+                  hintText: 'https://example.com',
+                ),
+                keyboardType: TextInputType.url,
+                onSubmitted: (value) => Navigator.of(context).pop(value),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop(controller.text),
+                  child: const Text('Insert'),
+                ),
+              ],
+            ),
+      );
+      final url = _normalizeComposerLink(raw);
+      if (url == null) return;
+      await _evaluateBodyEditorCommand('createLink', url);
+    } finally {
+      controller.dispose();
+    }
+  }
+
   void _scheduleDraftSave() {
     if (widget.onDraftChanged == null || _sending) return;
     _draftSaveTimer?.cancel();
@@ -4067,6 +4782,7 @@ class _ComposeDialogState extends State<_ComposeDialog> {
     final onDraftChanged = widget.onDraftChanged;
     if (onDraftChanged == null) return;
     try {
+      final body = await _currentComposeContent();
       await onDraftChanged(
         MailDraft(
           accountId: _accountId,
@@ -4074,7 +4790,7 @@ class _ComposeDialogState extends State<_ComposeDialog> {
           cc: _cc.text,
           bcc: _bcc.text,
           subject: _subject.text,
-          body: _body.text,
+          body: body.textBody,
           updatedAt: DateTime.now(),
         ),
       );
@@ -4142,10 +4858,11 @@ class _ComposeDialogState extends State<_ComposeDialog> {
   }
 
   Future<void> _send() async {
+    final body = await _currentComposeContent();
     if ((_to.text.trim().isEmpty &&
             _cc.text.trim().isEmpty &&
             _bcc.text.trim().isEmpty) ||
-        _body.text.trim().isEmpty) {
+        body.textBody.trim().isEmpty) {
       setState(() => _error = 'Recipient and message are required.');
       return;
     }
@@ -4162,8 +4879,8 @@ class _ComposeDialogState extends State<_ComposeDialog> {
         cc: _cc.text.trim(),
         bcc: _bcc.text.trim(),
         subject: _subject.text.trim(),
-        textBody: _body.text.trim(),
-        htmlBody: '',
+        textBody: body.textBody,
+        htmlBody: body.htmlBody,
         attachments: List<OutgoingAttachment>.unmodifiable(_attachments),
       );
       if (mounted) Navigator.of(context).pop(true);
@@ -4175,6 +4892,31 @@ class _ComposeDialogState extends State<_ComposeDialog> {
         });
       }
     }
+  }
+
+  Future<_ReplyComposerResult> _currentComposeContent() async {
+    if (!_supportsReplyRichEditor) {
+      final text = _body.text.trim();
+      return _ReplyComposerResult(
+        textBody: text,
+        htmlBody: _plainTextToOutgoingHtml(text),
+      );
+    }
+    final controller = _bodyWebController;
+    if (controller == null || !_bodyEditorReady) {
+      final text = _body.text.trim();
+      return _ReplyComposerResult(
+        textBody: text,
+        htmlBody: _plainTextToOutgoingHtml(text),
+      );
+    }
+    final raw = await controller.evaluateJavascript(
+      source: 'JSON.stringify(window.nyamailGetContent());',
+    );
+    final decoded = _decodeReplyEditorContent(raw);
+    final text = _normalizeReplyText(decoded['text'] as String? ?? '');
+    final html = _normalizeReplyHtml(decoded['html'] as String? ?? '', text);
+    return _ReplyComposerResult(textBody: text, htmlBody: html);
   }
 }
 
@@ -4201,12 +4943,14 @@ class _ReaderBody extends StatefulWidget {
     MailMessage message,
     String textBody, {
     String htmlBody,
+    List<OutgoingAttachment> attachments,
   })
   onSendReply;
   final Future<void> Function(
     MailMessage message,
     String textBody, {
     String htmlBody,
+    List<OutgoingAttachment> attachments,
   })
   onSendReplyAll;
   final Future<void> Function(MailMessage message) onForward;
@@ -4638,12 +5382,14 @@ class _ReaderBodyState extends State<_ReaderBody> {
           widget.message,
           result.textBody,
           htmlBody: result.htmlBody,
+          attachments: result.attachments,
         );
       } else {
         await widget.onSendReply(
           widget.message,
           result.textBody,
           htmlBody: result.htmlBody,
+          attachments: result.attachments,
         );
       }
       if (mounted) setState(() => _sending = false);
@@ -4755,10 +5501,15 @@ class _MailResourceWarning extends StatelessWidget {
 }
 
 class _ReplyComposerResult {
-  const _ReplyComposerResult({required this.textBody, required this.htmlBody});
+  const _ReplyComposerResult({
+    required this.textBody,
+    required this.htmlBody,
+    this.attachments = const [],
+  });
 
   final String textBody;
   final String htmlBody;
+  final List<OutgoingAttachment> attachments;
 }
 
 class _ReplyComposerSurface extends StatefulWidget {
@@ -4773,6 +5524,7 @@ class _ReplyComposerSurface extends StatefulWidget {
 
 class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
   final _plainText = TextEditingController();
+  final _attachments = <OutgoingAttachment>[];
   InAppWebViewController? _webController;
   bool _editorReady = false;
   bool _finishing = false;
@@ -4839,6 +5591,61 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
                     ),
                   ),
         ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            OutlinedButton.icon(
+              onPressed: _finishing ? null : _pickAttachments,
+              icon: const Icon(Icons.attach_file),
+              label: const Text('Attach'),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                _attachments.isEmpty
+                    ? 'No attachments'
+                    : '${_attachments.length} attached - '
+                        '${_formatBytes(_attachmentTotalBytes)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        if (_attachments.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 108),
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: _attachments.length,
+              itemBuilder: (context, index) {
+                final attachment = _attachments[index];
+                return ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.insert_drive_file_outlined),
+                  title: Text(
+                    attachment.filename,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(_outgoingAttachmentSubtitle(attachment)),
+                  trailing: IconButton(
+                    tooltip: 'Remove attachment',
+                    onPressed:
+                        _finishing
+                            ? null
+                            : () {
+                              setState(() => _attachments.removeAt(index));
+                            },
+                    icon: const Icon(Icons.close),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
         if (_error != null) ...[
           const SizedBox(height: 8),
           Text(
@@ -5008,6 +5815,58 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
     }
   }
 
+  int get _attachmentTotalBytes {
+    return _attachments.fold<int>(
+      0,
+      (total, attachment) => total + attachment.bytes.length,
+    );
+  }
+
+  Future<void> _pickAttachments() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        withData: true,
+      );
+      if (result == null) return;
+      final selected = <OutgoingAttachment>[];
+      for (final file in result.files) {
+        final bytes = file.bytes;
+        if (bytes == null) {
+          setState(() => _error = 'Could not read ${file.name}.');
+          return;
+        }
+        selected.add(
+          OutgoingAttachment(
+            filename: file.name,
+            contentType: _contentTypeForFilename(file.name),
+            bytes: bytes,
+          ),
+        );
+      }
+      final total =
+          _attachmentTotalBytes +
+          selected.fold<int>(
+            0,
+            (sum, attachment) => sum + attachment.bytes.length,
+          );
+      if (total > _maxOutgoingAttachmentBytes) {
+        setState(
+          () =>
+              _error =
+                  'Attachments must be ${_formatBytes(_maxOutgoingAttachmentBytes)} or less.',
+        );
+        return;
+      }
+      setState(() {
+        _attachments.addAll(selected);
+        _error = null;
+      });
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
   Future<void> _finish() async {
     setState(() {
       _finishing = true;
@@ -5041,11 +5900,16 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
       return _ReplyComposerResult(
         textBody: text,
         htmlBody: _plainTextToOutgoingHtml(text),
+        attachments: List<OutgoingAttachment>.unmodifiable(_attachments),
       );
     }
     final controller = _webController;
     if (controller == null || !_editorReady) {
-      return const _ReplyComposerResult(textBody: '', htmlBody: '');
+      return _ReplyComposerResult(
+        textBody: '',
+        htmlBody: '',
+        attachments: List<OutgoingAttachment>.unmodifiable(_attachments),
+      );
     }
     final raw = await controller.evaluateJavascript(
       source: 'JSON.stringify(window.nyamailGetContent());',
@@ -5053,7 +5917,11 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
     final decoded = _decodeReplyEditorContent(raw);
     final text = _normalizeReplyText(decoded['text'] as String? ?? '');
     final html = _normalizeReplyHtml(decoded['html'] as String? ?? '', text);
-    return _ReplyComposerResult(textBody: text, htmlBody: html);
+    return _ReplyComposerResult(
+      textBody: text,
+      htmlBody: html,
+      attachments: List<OutgoingAttachment>.unmodifiable(_attachments),
+    );
   }
 }
 
@@ -5141,11 +6009,19 @@ bool get _supportsReplyRichEditor {
   };
 }
 
-String _replyEditorHtml({required bool dark}) {
+String _replyEditorHtml({
+  required bool dark,
+  String initialText = '',
+  String placeholderText = 'Write a reply',
+}) {
   final background = dark ? '#111315' : '#FFFFFF';
   final text = dark ? '#E8EAED' : '#202124';
   final caret = dark ? '#8AB4F8' : '#0B57D0';
   final placeholder = dark ? '#9AA0A6' : '#5F6368';
+  final initialHtml =
+      initialText.trim().isEmpty ? '' : _plainTextToOutgoingHtml(initialText);
+  final initialHtmlJson = jsonEncode(initialHtml);
+  final placeholderJson = jsonEncode(placeholderText);
   return '''
 <!doctype html>
 <html>
@@ -5175,7 +6051,7 @@ html, body {
   line-height: 1.55;
 }
 #editor:empty::before {
-  content: "Write a reply";
+  content: $placeholderJson;
   color: $placeholder;
 }
 a { color: $caret; }
@@ -5191,6 +6067,7 @@ blockquote {
 <script>
 (function () {
   const editor = document.getElementById('editor');
+  editor.innerHTML = $initialHtmlJson;
   function safeHref(value) {
     const normalized = String(value || '').trim().toLowerCase();
     return normalized.startsWith('http://') ||
@@ -7834,6 +8711,18 @@ String _labelForMailbox(MailboxKind kind) {
   };
 }
 
+String _localFolderPathFor(MailboxKind mailbox) {
+  return switch (mailbox) {
+    MailboxKind.inbox => 'INBOX',
+    MailboxKind.sent => 'Sent',
+    MailboxKind.drafts => 'Drafts',
+    MailboxKind.archive => 'Archive',
+    MailboxKind.spam => 'Spam',
+    MailboxKind.trash => 'Trash',
+    MailboxKind.custom => 'Folder',
+  };
+}
+
 bool _canMoveToInbox(MailboxKind kind) {
   return switch (kind) {
     MailboxKind.archive ||
@@ -7847,6 +8736,7 @@ bool _canMoveToInbox(MailboxKind kind) {
 IconData _iconForSmartFolder(MailSmartFolder folder) {
   return switch (folder) {
     MailSmartFolder.allIncoming => Icons.all_inbox_outlined,
+    MailSmartFolder.unread => Icons.mark_email_unread_outlined,
     MailSmartFolder.inbox => Icons.inbox_outlined,
     MailSmartFolder.sent => Icons.send_outlined,
     MailSmartFolder.drafts => Icons.drafts_outlined,
@@ -7859,6 +8749,7 @@ IconData _iconForSmartFolder(MailSmartFolder folder) {
 String _labelForSmartFolder(MailSmartFolder folder) {
   return switch (folder) {
     MailSmartFolder.allIncoming => 'All incoming',
+    MailSmartFolder.unread => 'Unread',
     MailSmartFolder.inbox => 'Inbox',
     MailSmartFolder.sent => 'Sent',
     MailSmartFolder.drafts => 'Drafts',

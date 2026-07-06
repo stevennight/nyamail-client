@@ -65,11 +65,13 @@ abstract class MailRepository {
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   });
   Future<void> sendReplyAll({
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   });
   Future<void> sendMessage({
     required String accountId,
@@ -298,6 +300,7 @@ class DemoMailRepository implements MailRepository {
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     throw const MailTransportException(
       'Connect a mailbox before sending mail.',
@@ -309,6 +312,7 @@ class DemoMailRepository implements MailRepository {
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     throw const MailTransportException(
       'Connect a mailbox before sending mail.',
@@ -675,6 +679,7 @@ class CachedTransportMailRepository implements MailRepository {
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     final credential =
         _credentials
@@ -699,6 +704,7 @@ class CachedTransportMailRepository implements MailRepository {
         subject: _replySubject(original.subject),
         textBody: textBody,
         htmlBody: htmlBody,
+        attachments: attachments,
       ),
     );
     await _cache.saveMessages([
@@ -708,6 +714,7 @@ class CachedTransportMailRepository implements MailRepository {
         subject: _replySubject(original.subject),
         textBody: textBody,
         htmlBody: htmlBody,
+        attachments: attachments,
       ),
     ]);
   }
@@ -717,6 +724,7 @@ class CachedTransportMailRepository implements MailRepository {
     required MailMessage original,
     required String textBody,
     String htmlBody = '',
+    List<OutgoingAttachment> attachments = const [],
   }) async {
     final credential =
         _credentials
@@ -742,6 +750,7 @@ class CachedTransportMailRepository implements MailRepository {
         subject: _replySubject(original.subject),
         textBody: textBody,
         htmlBody: htmlBody,
+        attachments: attachments,
       ),
     );
     await _cache.saveMessages([
@@ -751,6 +760,7 @@ class CachedTransportMailRepository implements MailRepository {
         subject: _replySubject(original.subject),
         textBody: textBody,
         htmlBody: htmlBody,
+        attachments: attachments,
       ),
     ]);
   }
@@ -1137,7 +1147,9 @@ class CachedTransportMailRepository implements MailRepository {
       final key = _remoteLocationKey(message);
       final existing = byRemoteLocation[key];
       byRemoteLocation[key] =
-          existing == null ? message : _preferredCachedMessage(existing, message);
+          existing == null
+              ? message
+              : _preferredCachedMessage(existing, message);
     }
     return byRemoteLocation.values.toList();
   }
@@ -1204,7 +1216,10 @@ class CachedTransportMailRepository implements MailRepository {
       folders.addAll(
         accountFolders.where((folder) {
           if (!folder.selectable) return false;
-          if (smart == MailSmartFolder.allIncoming) return folder.isIncoming;
+          if (smart == MailSmartFolder.allIncoming ||
+              smart == MailSmartFolder.unread) {
+            return folder.isIncoming;
+          }
           return folder.kind == smart.mailbox;
         }),
       );

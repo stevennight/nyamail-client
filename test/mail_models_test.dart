@@ -69,4 +69,36 @@ void main() {
     expect(mailMessageMatchesQuery(message, 'roadmap'), isTrue);
     expect(mailMessageMatchesQuery(message, 'missing'), isFalse);
   });
+
+  test('unread smart folder matches unread incoming mail only', () {
+    final unreadInbox = MailMessage(
+      id: 'work:inbox:4',
+      accountId: 'work',
+      from: 'Alice <alice@example.com>',
+      subject: 'Unread',
+      preview: 'Preview',
+      body: 'Body',
+      receivedAt: DateTime.utc(2026, 7, 1, 8, 30),
+      read: false,
+    );
+    final readInbox = unreadInbox.copyWith(id: 'work:inbox:5', read: true);
+    final unreadTrash = unreadInbox.copyWith(
+      id: 'work:trash:6',
+      mailbox: MailboxKind.trash,
+      folderPath: 'Trash',
+    );
+
+    expect(
+      mailMessageMatchesSmartFolder(unreadInbox, MailSmartFolder.unread),
+      isTrue,
+    );
+    expect(
+      mailMessageMatchesSmartFolder(readInbox, MailSmartFolder.unread),
+      isFalse,
+    );
+    expect(
+      mailMessageMatchesSmartFolder(unreadTrash, MailSmartFolder.unread),
+      isFalse,
+    );
+  });
 }
