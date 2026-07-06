@@ -66,140 +66,136 @@ class _MailHtmlViewState extends State<MailHtmlView> {
       widget.onLoadRemoteImageOnce(imageId);
     }
 
-    return ColoredBox(
-      color: Color(widget.rendered.canvasColor),
-      child: SizedBox(
-        height: _height,
-        child: ClipRect(
-          child: InAppWebView(
-            key: ValueKey(
-              Object.hash(
-                widget.rendered.html,
-                widget.policy.loadRemoteImages,
-                widget.policy.loadExternalStylesAndFonts,
+    return RepaintBoundary(
+      child: ColoredBox(
+        color: Color(widget.rendered.canvasColor),
+        child: SizedBox(
+          height: _height,
+          child: ClipRect(
+            child: InAppWebView(
+              key: ValueKey(widget.rendered.documentKey),
+              initialData: InAppWebViewInitialData(
+                data: widget.rendered.html,
+                mimeType: 'text/html',
+                encoding: 'utf8',
+                baseUrl: WebUri('about:blank'),
               ),
-            ),
-            initialData: InAppWebViewInitialData(
-              data: widget.rendered.html,
-              mimeType: 'text/html',
-              encoding: 'utf8',
-              baseUrl: WebUri('about:blank'),
-            ),
-            initialSettings: InAppWebViewSettings(
-              javaScriptEnabled: true,
-              javaScriptCanOpenWindowsAutomatically: false,
-              mediaPlaybackRequiresUserGesture: true,
-              useShouldOverrideUrlLoading: true,
-              useShouldInterceptRequest:
-                  !widget.policy.loadRemoteImages ||
-                  !widget.policy.loadExternalStylesAndFonts,
-              cacheEnabled: false,
-              clearCache: true,
-              incognito: true,
-              transparentBackground: true,
-              disableContextMenu: true,
-              supportZoom: true,
-              verticalScrollBarEnabled: false,
-            ),
-            onWebViewCreated: (controller) {
-              controller.addJavaScriptHandler(
-                handlerName: 'nyamailHeight',
-                callback: (arguments) {
-                  if (arguments.isEmpty) return null;
-                  final raw = arguments.first;
-                  final next =
-                      raw is num ? raw.toDouble() : double.tryParse('$raw');
-                  if (next == null || !mounted) return null;
-                  final clamped =
-                      next.clamp(_minimumHeight, _maximumHeight).toDouble();
-                  if ((clamped - _height).abs() < 2) return null;
-                  setState(() => _height = clamped);
-                  return null;
-                },
-              );
-            },
-            onLoadStop: (controller, url) async {
-              await _installHeightObserver(controller);
-            },
-            shouldOverrideUrlLoading: (controller, action) async {
-              final url = action.request.url;
-              if (url == null) return NavigationActionPolicy.CANCEL;
-              final uri = Uri.tryParse(url.toString());
-              if (uri == null) return NavigationActionPolicy.CANCEL;
-              final imageId = _loadImageIdFromUri(uri);
-              if (imageId != null) {
-                triggerLoadImageOnce(imageId);
+              initialSettings: InAppWebViewSettings(
+                javaScriptEnabled: true,
+                javaScriptCanOpenWindowsAutomatically: false,
+                mediaPlaybackRequiresUserGesture: true,
+                useShouldOverrideUrlLoading: true,
+                useShouldInterceptRequest:
+                    !widget.policy.loadRemoteImages ||
+                    !widget.policy.loadExternalStylesAndFonts,
+                cacheEnabled: false,
+                clearCache: true,
+                incognito: true,
+                transparentBackground: true,
+                disableContextMenu: true,
+                supportZoom: true,
+                verticalScrollBarEnabled: false,
+              ),
+              onWebViewCreated: (controller) {
+                controller.addJavaScriptHandler(
+                  handlerName: 'nyamailHeight',
+                  callback: (arguments) {
+                    if (arguments.isEmpty) return null;
+                    final raw = arguments.first;
+                    final next =
+                        raw is num ? raw.toDouble() : double.tryParse('$raw');
+                    if (next == null || !mounted) return null;
+                    final clamped =
+                        next.clamp(_minimumHeight, _maximumHeight).toDouble();
+                    if ((clamped - _height).abs() < 2) return null;
+                    setState(() => _height = clamped);
+                    return null;
+                  },
+                );
+              },
+              onLoadStop: (controller, url) async {
+                await _installHeightObserver(controller);
+              },
+              shouldOverrideUrlLoading: (controller, action) async {
+                final url = action.request.url;
+                if (url == null) return NavigationActionPolicy.CANCEL;
+                final uri = Uri.tryParse(url.toString());
+                if (uri == null) return NavigationActionPolicy.CANCEL;
+                final imageId = _loadImageIdFromUri(uri);
+                if (imageId != null) {
+                  triggerLoadImageOnce(imageId);
+                  return NavigationActionPolicy.CANCEL;
+                }
+                if (_isLoadImagesUri(uri)) {
+                  triggerLoadImagesOnce();
+                  return NavigationActionPolicy.CANCEL;
+                }
+                if (uri.scheme == 'about' || uri.scheme == 'data') {
+                  return NavigationActionPolicy.ALLOW;
+                }
+                if (_shouldOpenExternally(uri)) {
+                  await launchUrl(uri, mode: LaunchMode.externalApplication);
+                }
                 return NavigationActionPolicy.CANCEL;
-              }
-              if (_isLoadImagesUri(uri)) {
+              },
+              onLoadStart: (controller, url) async {
+                final uri = Uri.tryParse(url?.toString() ?? '');
+                if (uri == null) return;
+                final imageId = _loadImageIdFromUri(uri);
+                if (imageId != null) {
+                  triggerLoadImageOnce(imageId);
+                  await controller.stopLoading();
+                  return;
+                }
+                if (!_isLoadImagesUri(uri)) return;
                 triggerLoadImagesOnce();
-                return NavigationActionPolicy.CANCEL;
-              }
-              if (uri.scheme == 'about' || uri.scheme == 'data') {
-                return NavigationActionPolicy.ALLOW;
-              }
-              if (_shouldOpenExternally(uri)) {
-                await launchUrl(uri, mode: LaunchMode.externalApplication);
-              }
-              return NavigationActionPolicy.CANCEL;
-            },
-            onLoadStart: (controller, url) async {
-              final uri = Uri.tryParse(url?.toString() ?? '');
-              if (uri == null) return;
-              final imageId = _loadImageIdFromUri(uri);
-              if (imageId != null) {
-                triggerLoadImageOnce(imageId);
                 await controller.stopLoading();
-                return;
-              }
-              if (!_isLoadImagesUri(uri)) return;
-              triggerLoadImagesOnce();
-              await controller.stopLoading();
-            },
-            shouldInterceptRequest: (controller, request) async {
-              final uri = Uri.tryParse(request.url.toString());
-              if (uri == null) return null;
-              final imageId = _loadImageIdFromUri(uri);
-              if (imageId != null) {
-                triggerLoadImageOnce(imageId);
+              },
+              shouldInterceptRequest: (controller, request) async {
+                final uri = Uri.tryParse(request.url.toString());
+                if (uri == null) return null;
+                final imageId = _loadImageIdFromUri(uri);
+                if (imageId != null) {
+                  triggerLoadImageOnce(imageId);
+                  return WebResourceResponse(
+                    contentType: 'text/html',
+                    contentEncoding: 'utf-8',
+                    data: Uint8List.fromList(utf8.encode('')),
+                    headers: const {},
+                    statusCode: 204,
+                    reasonPhrase: 'No Content',
+                  );
+                }
+                if (_isLoadImagesUri(uri)) {
+                  triggerLoadImagesOnce();
+                  return WebResourceResponse(
+                    contentType: 'text/html',
+                    contentEncoding: 'utf-8',
+                    data: Uint8List.fromList(utf8.encode('')),
+                    headers: const {},
+                    statusCode: 204,
+                    reasonPhrase: 'No Content',
+                  );
+                }
+                if (!_isRemoteHttpUri(uri)) return null;
+                if (widget.policy.loadRemoteImages ||
+                    _isAllowedRemoteImageUri(
+                      uri,
+                      widget.rendered.allowedRemoteImageUrls,
+                    ) ||
+                    widget.policy.loadExternalStylesAndFonts) {
+                  return null;
+                }
                 return WebResourceResponse(
-                  contentType: 'text/html',
+                  contentType: 'text/plain',
                   contentEncoding: 'utf-8',
                   data: Uint8List.fromList(utf8.encode('')),
                   headers: const {},
                   statusCode: 204,
                   reasonPhrase: 'No Content',
                 );
-              }
-              if (_isLoadImagesUri(uri)) {
-                triggerLoadImagesOnce();
-                return WebResourceResponse(
-                  contentType: 'text/html',
-                  contentEncoding: 'utf-8',
-                  data: Uint8List.fromList(utf8.encode('')),
-                  headers: const {},
-                  statusCode: 204,
-                  reasonPhrase: 'No Content',
-                );
-              }
-              if (!_isRemoteHttpUri(uri)) return null;
-              if (widget.policy.loadRemoteImages ||
-                  _isAllowedRemoteImageUri(
-                    uri,
-                    widget.rendered.allowedRemoteImageUrls,
-                  ) ||
-                  widget.policy.loadExternalStylesAndFonts) {
-                return null;
-              }
-              return WebResourceResponse(
-                contentType: 'text/plain',
-                contentEncoding: 'utf-8',
-                data: Uint8List.fromList(utf8.encode('')),
-                headers: const {},
-                statusCode: 204,
-                reasonPhrase: 'No Content',
-              );
-            },
+              },
+            ),
           ),
         ),
       ),

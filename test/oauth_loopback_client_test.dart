@@ -34,6 +34,7 @@ void main() {
           tokenEndpoint: server.tokenEndpoint,
           scopes: const ['mail.read', 'offline_access'],
         );
+        final progress = <OAuthAuthorizationProgress>[];
         final tokenSet = await OAuthLoopbackClient(
           timeout: const Duration(seconds: 5),
           openAuthorizationUrl: (uri) async {
@@ -51,8 +52,14 @@ void main() {
           provider: provider,
           clientId: 'client-123',
           loginHint: 'me@example.com',
+          onProgress: progress.add,
         );
 
+        expect(progress, [
+          OAuthAuthorizationProgress.waitingForAuthorization,
+          OAuthAuthorizationProgress.callbackReceived,
+          OAuthAuthorizationProgress.exchangingToken,
+        ]);
         expect(tokenSet.accessToken, 'access-token');
         expect(tokenSet.refreshToken, 'refresh-token');
         expect(tokenSet.toRedactedJson()['access_token'], 'redacted');
@@ -128,6 +135,7 @@ void main() {
         tokenEndpoint: server.tokenEndpoint,
         scopes: const ['mail.read'],
       );
+      final progress = <OAuthAuthorizationProgress>[];
       final tokenSet = await OAuthLoopbackClient(
         timeout: const Duration(seconds: 5),
         redirectModeResolver:
@@ -137,10 +145,7 @@ void main() {
           server.authorizationUri = uri;
           final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
           final state = uri.queryParameters['state']!;
-          expect(
-            redirectUri.toString(),
-            'com.nyatori.nyamail:/oauth2redirect',
-          );
+          expect(redirectUri.toString(), 'com.nyatori.nyamail:/oauth2redirect');
           callbackReceiver.complete(
             redirectUri.replace(
               queryParameters: {'code': 'mobile-auth-code', 'state': state},
@@ -151,8 +156,14 @@ void main() {
         provider: provider,
         clientId: 'android-client-id',
         mobileRedirectUri: Uri.parse('com.nyatori.nyamail:/oauth2redirect'),
+        onProgress: progress.add,
       );
 
+      expect(progress, [
+        OAuthAuthorizationProgress.waitingForAuthorization,
+        OAuthAuthorizationProgress.callbackReceived,
+        OAuthAuthorizationProgress.exchangingToken,
+      ]);
       expect(tokenSet.accessToken, 'access-token');
       expect(server.tokenBody['client_id'], 'android-client-id');
       expect(server.tokenBody['code'], 'mobile-auth-code');

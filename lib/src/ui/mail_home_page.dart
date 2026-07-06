@@ -1815,12 +1815,25 @@ class _MailHomePageState extends State<MailHomePage> {
           'OAuth client id is not configured for ${item.provider}.',
         );
       }
+      setState(
+        () =>
+            _banner = _oauthProgressMessage(
+              OAuthAuthorizationProgress.waitingForAuthorization,
+              provider.provider,
+            ),
+      );
       final tokenSet = await widget.oauthClient.authorize(
         provider: provider,
         clientId: clientId,
         clientSecret: _oauthClientSecretForProvider(item.provider),
         loginHint: item.address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(item.provider),
+        onProgress: (progress) {
+          if (!mounted) return;
+          setState(
+            () => _banner = _oauthProgressMessage(progress, provider.provider),
+          );
+        },
       );
       final updated = VaultMailboxItem(
         id: item.id,
@@ -5906,6 +5919,10 @@ class _ReaderBodyState extends State<_ReaderBody> {
   bool _loadExternalStylesAndFontsOnce = false;
   final _allowedRemoteImageIds = <String>{};
   MailAppearance? _appearanceOverride;
+  MailHtmlRenderResult? _cachedRendered;
+  String? _cachedRenderedHtmlBody;
+  String? _cachedRenderedTextBody;
+  MailHtmlRenderPolicy? _cachedRenderPolicy;
   String? _downloadingAttachment;
   String? _error;
 
@@ -5917,6 +5934,7 @@ class _ReaderBodyState extends State<_ReaderBody> {
       _loadExternalStylesAndFontsOnce = false;
       _allowedRemoteImageIds.clear();
       _appearanceOverride = null;
+      _clearRenderedCache();
     }
   }
 
@@ -5944,7 +5962,7 @@ class _ReaderBodyState extends State<_ReaderBody> {
       appearance: effectiveAppearance,
       hostIsDark: hostIsDark,
     );
-    final rendered = buildMailHtmlDocument(
+    final rendered = _renderedFor(
       htmlBody: message.htmlBody,
       textBody: message.body.isEmpty ? message.preview : message.body,
       policy: renderPolicy,
@@ -6270,6 +6288,50 @@ class _ReaderBodyState extends State<_ReaderBody> {
         ],
       ),
     );
+  }
+
+  MailHtmlRenderResult _renderedFor({
+    required String htmlBody,
+    required String textBody,
+    required MailHtmlRenderPolicy policy,
+  }) {
+    final cached = _cachedRendered;
+    if (cached != null &&
+        _cachedRenderedHtmlBody == htmlBody &&
+        _cachedRenderedTextBody == textBody &&
+        _sameRenderPolicy(_cachedRenderPolicy, policy)) {
+      return cached;
+    }
+    final rendered = buildMailHtmlDocument(
+      htmlBody: htmlBody,
+      textBody: textBody,
+      policy: policy,
+    );
+    _cachedRendered = rendered;
+    _cachedRenderedHtmlBody = htmlBody;
+    _cachedRenderedTextBody = textBody;
+    _cachedRenderPolicy = policy;
+    return rendered;
+  }
+
+  bool _sameRenderPolicy(
+    MailHtmlRenderPolicy? previous,
+    MailHtmlRenderPolicy next,
+  ) {
+    return previous != null &&
+        previous.loadRemoteImages == next.loadRemoteImages &&
+        previous.loadExternalStylesAndFonts ==
+            next.loadExternalStylesAndFonts &&
+        previous.appearance == next.appearance &&
+        previous.hostIsDark == next.hostIsDark &&
+        setEquals(previous.allowedRemoteImageIds, next.allowedRemoteImageIds);
+  }
+
+  void _clearRenderedCache() {
+    _cachedRendered = null;
+    _cachedRenderedHtmlBody = null;
+    _cachedRenderedTextBody = null;
+    _cachedRenderPolicy = null;
   }
 
   void _setMessageAppearance(_MessageAppearanceAction action) {
@@ -9804,7 +9866,7 @@ class _MailboxEditDialogState extends State<_MailboxEditDialog> {
               decoration: const InputDecoration(
                 labelText: 'Username',
                 helperText:
-                    'Defaults to the part before @. Some providers require the full email address.',
+                    'Defaults to the mailbox address. Edit only if your provider uses a different login name.',
               ),
             ),
             const SizedBox(height: 10),
@@ -10039,18 +10101,23 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   bool _useTls = true;
   bool _submitting = false;
   String? _error;
+  String? _status;
   MailboxCredential? _pendingCredential;
   String _lastAutoUsername = '';
+  bool _syncingUsernameFromAddress = false;
+  bool _usernameManuallyEdited = false;
 
   @override
   void initState() {
     super.initState();
     _address.addListener(_prefillHosts);
+    _username.addListener(_handleUsernameChanged);
   }
 
   @override
   void dispose() {
     _address.removeListener(_prefillHosts);
+    _username.removeListener(_handleUsernameChanged);
     _address.dispose();
     _displayName.dispose();
     _username.dispose();
@@ -10087,7 +10154,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
               decoration: const InputDecoration(
                 labelText: 'Username',
                 helperText:
-                    'Defaults to the part before @. Some providers require the full email address.',
+                    'Defaults to the mailbox address. Edit only if your provider uses a different login name.',
               ),
             ),
             const SizedBox(height: 10),
@@ -10237,6 +10304,27 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
                 style: TextStyle(color: Theme.of(context).colorScheme.error),
               ),
             ],
+            if (_status != null) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _status!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
@@ -10264,6 +10352,8 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
     setState(() {
       _submitting = true;
       _error = null;
+      _status =
+          _authMode == 'oauth' ? 'Waiting for provider authorization...' : null;
     });
     if (_authMode == 'oauth') {
       await _submitOAuth();
@@ -10321,6 +10411,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
                   error: error,
                 );
         _submitting = false;
+        _status = null;
       });
     } finally {
       _pendingCredential = null;
@@ -10343,6 +10434,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
         clientSecret: clientSecret,
         loginHint: address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(_provider),
+        onProgress: _setOAuthProgress,
       );
       final item = oauthMailboxItem(
         id: vaultItemId,
@@ -10385,6 +10477,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
                     error: error,
                   );
           _submitting = false;
+          _status = null;
         });
       }
     } finally {
@@ -10419,13 +10512,31 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   void _prefillHosts() {
     final address = _address.text.trim();
     final defaultUsername = _defaultUsernameForAddress(address);
-    if (defaultUsername.isNotEmpty &&
-        (_username.text.isEmpty || _username.text == _lastAutoUsername)) {
-      _lastAutoUsername = defaultUsername;
-      _username.text = defaultUsername;
+    if (!_usernameManuallyEdited) {
+      _setAutoUsername(defaultUsername);
     }
     if (!_looksCompleteEmailAddress(address)) return;
     _applyProviderPreset();
+  }
+
+  void _handleUsernameChanged() {
+    if (_syncingUsernameFromAddress) return;
+    if (_username.text != _lastAutoUsername) {
+      _usernameManuallyEdited = true;
+    }
+  }
+
+  void _setAutoUsername(String value) {
+    if (_username.text == value && _lastAutoUsername == value) return;
+    _syncingUsernameFromAddress = true;
+    _lastAutoUsername = value;
+    _username.text = value;
+    _syncingUsernameFromAddress = false;
+  }
+
+  void _setOAuthProgress(OAuthAuthorizationProgress progress) {
+    if (!mounted) return;
+    setState(() => _status = _oauthProgressMessage(progress, _provider));
   }
 
   bool _looksCompleteEmailAddress(String value) {
@@ -10662,16 +10773,35 @@ String _labelForMailboxView(MailboxView view, List<MailAccount> accounts) {
 }
 
 String _defaultUsernameForAddress(String address) {
-  final trimmed = address.trim();
-  final at = trimmed.indexOf('@');
-  if (at <= 0) return trimmed;
-  return trimmed.substring(0, at).trim();
+  return address.trim();
 }
 
 bool _providerSupportsOAuth(String provider) {
   return switch (provider.trim().toLowerCase()) {
     'gmail' || 'google' || 'outlook' || 'microsoft' => true,
     _ => false,
+  };
+}
+
+String _oauthProgressMessage(
+  OAuthAuthorizationProgress progress,
+  String provider,
+) {
+  final label = _providerLabel(provider);
+  return switch (progress) {
+    OAuthAuthorizationProgress.waitingForAuthorization =>
+      'Waiting for $label authorization...',
+    OAuthAuthorizationProgress.callbackReceived =>
+      '$label callback received. Requesting token...',
+    OAuthAuthorizationProgress.exchangingToken => 'Requesting $label token...',
+  };
+}
+
+String _providerLabel(String provider) {
+  return switch (provider.trim().toLowerCase()) {
+    'gmail' || 'google' => 'Google OAuth',
+    'outlook' || 'microsoft' => 'Outlook OAuth',
+    _ => '${provider.trim().isEmpty ? 'OAuth' : provider.trim()} OAuth',
   };
 }
 

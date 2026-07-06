@@ -30,6 +30,7 @@ class MailHtmlRenderPolicy {
 class MailHtmlRenderResult {
   const MailHtmlRenderResult({
     required this.html,
+    required this.documentKey,
     required this.textFallback,
     required this.summary,
     required this.canvasColor,
@@ -37,6 +38,7 @@ class MailHtmlRenderResult {
   });
 
   final String html;
+  final String documentKey;
   final String textFallback;
   final MailHtmlResourceSummary summary;
   final int canvasColor;
@@ -165,11 +167,27 @@ table { max-width: 100%; border-collapse: collapse; }
 ''';
   return MailHtmlRenderResult(
     html: html,
+    documentKey: _documentKeyFor(html: html, policy: policy),
     textFallback: fallback,
     summary: sanitizer.summary,
     canvasColor: palette.canvasColor,
     allowedRemoteImageUrls: Set.unmodifiable(sanitizer.allowedRemoteImageUrls),
   );
+}
+
+String _documentKeyFor({
+  required String html,
+  required MailHtmlRenderPolicy policy,
+}) {
+  final allowedImageIds = policy.allowedRemoteImageIds.toList()..sort();
+  return Object.hash(
+    html,
+    policy.loadRemoteImages,
+    policy.loadExternalStylesAndFonts,
+    policy.appearance,
+    policy.hostIsDark,
+    Object.hashAll(allowedImageIds),
+  ).toString();
 }
 
 _MailHtmlPalette _paletteFor(MailHtmlRenderPolicy policy) {

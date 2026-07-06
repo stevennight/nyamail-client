@@ -10,8 +10,16 @@ import 'oauth_provider.dart';
 
 typedef OpenAuthorizationUrl = Future<void> Function(Uri uri);
 typedef OAuthRedirectModeResolver = OAuthAuthorizationRedirectMode Function();
+typedef OAuthAuthorizationProgressCallback =
+    void Function(OAuthAuthorizationProgress progress);
 
 enum OAuthAuthorizationRedirectMode { loopback, browserCallback }
+
+enum OAuthAuthorizationProgress {
+  waitingForAuthorization,
+  callbackReceived,
+  exchangingToken,
+}
 
 class OAuthMobileRedirectConfig {
   const OAuthMobileRedirectConfig({
@@ -55,8 +63,7 @@ abstract interface class OAuthCallbackReceiver {
 class MethodChannelOAuthCallbackReceiver implements OAuthCallbackReceiver {
   MethodChannelOAuthCallbackReceiver({MethodChannel? channel})
     : _channel =
-          channel ??
-          const MethodChannel('com.nyatori.nyamail/oauth_callback');
+          channel ?? const MethodChannel('com.nyatori.nyamail/oauth_callback');
 
   final MethodChannel _channel;
   final List<Uri> _pendingCallbacks = [];
@@ -161,6 +168,7 @@ class OAuthLoopbackClient {
     String? clientSecret,
     String? loginHint,
     Uri? mobileRedirectUri,
+    OAuthAuthorizationProgressCallback? onProgress,
   }) async {
     return switch (_redirectModeResolver()) {
       OAuthAuthorizationRedirectMode.browserCallback =>
@@ -170,12 +178,14 @@ class OAuthLoopbackClient {
           clientSecret: clientSecret,
           loginHint: loginHint,
           redirectUri: mobileRedirectUri ?? _mobileRedirectConfig.redirectUri,
+          onProgress: onProgress,
         ),
       OAuthAuthorizationRedirectMode.loopback => _authorizeWithLoopback(
         provider: provider,
         clientId: clientId,
         clientSecret: clientSecret,
         loginHint: loginHint,
+        onProgress: onProgress,
       ),
     };
   }
@@ -185,6 +195,7 @@ class OAuthLoopbackClient {
     required String clientId,
     String? clientSecret,
     String? loginHint,
+    OAuthAuthorizationProgressCallback? onProgress,
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     try {
@@ -197,8 +208,10 @@ class OAuthLoopbackClient {
       );
 
       final requestFuture = server.first.timeout(_timeout);
+      onProgress?.call(OAuthAuthorizationProgress.waitingForAuthorization);
       final openFuture = _openAuthorizationUrl(requestData.authUri);
       final request = await requestFuture;
+      onProgress?.call(OAuthAuthorizationProgress.callbackReceived);
       final query = request.uri.queryParameters;
       await _writeBrowserResponse(request, query['error'] == null);
       await openFuture;
@@ -206,6 +219,7 @@ class OAuthLoopbackClient {
         query,
         expectedState: requestData.state,
       );
+      onProgress?.call(OAuthAuthorizationProgress.exchangingToken);
       return _exchangeAuthorizationCode(
         provider: provider,
         clientId: clientId,
@@ -225,6 +239,7 @@ class OAuthLoopbackClient {
     String? clientSecret,
     String? loginHint,
     required Uri redirectUri,
+    OAuthAuthorizationProgressCallback? onProgress,
   }) async {
     final requestData = _buildAuthorizationRequest(
       provider: provider,
@@ -233,8 +248,10 @@ class OAuthLoopbackClient {
       redirectUri: redirectUri,
     );
     final callbackFuture = _callbackReceiver.waitForCallback(timeout: _timeout);
+    onProgress?.call(OAuthAuthorizationProgress.waitingForAuthorization);
     final openFuture = _openAuthorizationUrl(requestData.authUri);
     final callbackUri = await callbackFuture;
+    onProgress?.call(OAuthAuthorizationProgress.callbackReceived);
     await openFuture;
     final expectedRedirect = OAuthMobileRedirectConfig(
       scheme: redirectUri.scheme,
@@ -250,6 +267,7 @@ class OAuthLoopbackClient {
       callbackUri.queryParameters,
       expectedState: requestData.state,
     );
+    onProgress?.call(OAuthAuthorizationProgress.exchangingToken);
     return _exchangeAuthorizationCode(
       provider: provider,
       clientId: clientId,
