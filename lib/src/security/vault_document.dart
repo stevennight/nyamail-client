@@ -137,6 +137,9 @@ class VaultOAuthProviderConfig {
     required this.provider,
     required this.clientId,
     this.clientSecret = '',
+    this.androidClientId = '',
+    this.androidClientSecret = '',
+    this.androidRedirectUri = '',
   });
 
   factory VaultOAuthProviderConfig.fromJson(Map<String, Object?> json) {
@@ -144,18 +147,27 @@ class VaultOAuthProviderConfig {
       provider: normalizeOAuthProviderKey(json['provider'] as String? ?? ''),
       clientId: json['client_id'] as String? ?? '',
       clientSecret: json['client_secret'] as String? ?? '',
+      androidClientId: json['android_client_id'] as String? ?? '',
+      androidClientSecret: json['android_client_secret'] as String? ?? '',
+      androidRedirectUri: json['android_redirect_uri'] as String? ?? '',
     ).normalized();
   }
 
   final String provider;
   final String clientId;
   final String clientSecret;
+  final String androidClientId;
+  final String androidClientSecret;
+  final String androidRedirectUri;
 
   VaultOAuthProviderConfig normalized() {
     return VaultOAuthProviderConfig(
       provider: normalizeOAuthProviderKey(provider),
       clientId: clientId.trim(),
       clientSecret: clientSecret.trim(),
+      androidClientId: androidClientId.trim(),
+      androidClientSecret: androidClientSecret.trim(),
+      androidRedirectUri: androidRedirectUri.trim(),
     );
   }
 
@@ -163,20 +175,32 @@ class VaultOAuthProviderConfig {
     String? provider,
     String? clientId,
     String? clientSecret,
+    String? androidClientId,
+    String? androidClientSecret,
+    String? androidRedirectUri,
   }) {
     return VaultOAuthProviderConfig(
       provider: provider ?? this.provider,
       clientId: clientId ?? this.clientId,
       clientSecret: clientSecret ?? this.clientSecret,
+      androidClientId: androidClientId ?? this.androidClientId,
+      androidClientSecret: androidClientSecret ?? this.androidClientSecret,
+      androidRedirectUri: androidRedirectUri ?? this.androidRedirectUri,
     ).normalized();
   }
 
-  bool get hasClientId => clientId.trim().isNotEmpty;
+  bool get hasClientId =>
+      clientId.trim().isNotEmpty || androidClientId.trim().isNotEmpty;
 
   Map<String, Object?> toJson() => {
     'provider': provider,
     'client_id': clientId,
     if (clientSecret.isNotEmpty) 'client_secret': clientSecret,
+    if (androidClientId.isNotEmpty) 'android_client_id': androidClientId,
+    if (androidClientSecret.isNotEmpty)
+      'android_client_secret': androidClientSecret,
+    if (androidRedirectUri.isNotEmpty)
+      'android_redirect_uri': androidRedirectUri,
   };
 }
 
@@ -202,6 +226,8 @@ class VaultMailboxItem {
     this.refreshToken = '',
     this.tokenExpiresAt,
     this.tokenScope = '',
+    this.oauthClientId = '',
+    this.oauthClientSecret = '',
     required this.imapHost,
     required this.imapPort,
     required this.smtpHost,
@@ -227,6 +253,8 @@ class VaultMailboxItem {
               ? null
               : DateTime.parse(json['token_expires_at'] as String),
       tokenScope: json['token_scope'] as String? ?? '',
+      oauthClientId: json['oauth_client_id'] as String? ?? '',
+      oauthClientSecret: json['oauth_client_secret'] as String? ?? '',
       imapHost: json['imap_host'] as String? ?? '',
       imapPort: (json['imap_port'] as num?)?.toInt() ?? 993,
       smtpHost: json['smtp_host'] as String? ?? '',
@@ -245,6 +273,8 @@ class VaultMailboxItem {
   final String refreshToken;
   final DateTime? tokenExpiresAt;
   final String tokenScope;
+  final String oauthClientId;
+  final String oauthClientSecret;
   final String imapHost;
   final int imapPort;
   final String smtpHost;
@@ -262,6 +292,8 @@ class VaultMailboxItem {
     String? refreshToken,
     DateTime? tokenExpiresAt,
     String? tokenScope,
+    String? oauthClientId,
+    String? oauthClientSecret,
     String? imapHost,
     int? imapPort,
     String? smtpHost,
@@ -279,6 +311,8 @@ class VaultMailboxItem {
       refreshToken: refreshToken ?? this.refreshToken,
       tokenExpiresAt: tokenExpiresAt ?? this.tokenExpiresAt,
       tokenScope: tokenScope ?? this.tokenScope,
+      oauthClientId: oauthClientId ?? this.oauthClientId,
+      oauthClientSecret: oauthClientSecret ?? this.oauthClientSecret,
       imapHost: imapHost ?? this.imapHost,
       imapPort: imapPort ?? this.imapPort,
       smtpHost: smtpHost ?? this.smtpHost,
@@ -318,6 +352,8 @@ class VaultMailboxItem {
     if (tokenExpiresAt != null)
       'token_expires_at': tokenExpiresAt!.toUtc().toIso8601String(),
     if (tokenScope.isNotEmpty) 'token_scope': tokenScope,
+    if (oauthClientId.isNotEmpty) 'oauth_client_id': oauthClientId,
+    if (oauthClientSecret.isNotEmpty) 'oauth_client_secret': oauthClientSecret,
     'imap_host': imapHost,
     'imap_port': imapPort,
     'smtp_host': smtpHost,

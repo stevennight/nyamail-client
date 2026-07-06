@@ -8,6 +8,8 @@ VaultMailboxItem oauthMailboxItem({
   required String displayName,
   required OAuthProviderConfig provider,
   required OAuthTokenSet tokenSet,
+  String oauthClientId = '',
+  String oauthClientSecret = '',
 }) {
   return VaultMailboxItem(
     id: id,
@@ -18,10 +20,15 @@ VaultMailboxItem oauthMailboxItem({
     username: address,
     secret: tokenSet.accessToken,
     refreshToken: tokenSet.refreshToken ?? '',
-    tokenExpiresAt: tokenSet.expiresIn == null
-        ? null
-        : DateTime.now().toUtc().add(Duration(seconds: tokenSet.expiresIn!)),
+    tokenExpiresAt:
+        tokenSet.expiresIn == null
+            ? null
+            : DateTime.now().toUtc().add(
+              Duration(seconds: tokenSet.expiresIn!),
+            ),
     tokenScope: tokenSet.scope ?? provider.scopes.join(' '),
+    oauthClientId: oauthClientId,
+    oauthClientSecret: oauthClientSecret,
     imapHost: provider.imapHost,
     imapPort: provider.imapPort,
     smtpHost: provider.smtpHost,

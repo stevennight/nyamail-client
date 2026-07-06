@@ -99,6 +99,88 @@ void main() {
     expect(refreshCalled, isFalse);
   });
 
+  test('refreshes oauth items with missing expiry metadata', () async {
+    final now = DateTime.utc(2026, 7, 1, 12);
+    final document = VaultDocument(
+      version: 1,
+      items: [
+        _oauthItem(
+          secret: 'old-access-token',
+          refreshToken: 'refresh-token',
+          tokenExpiresAt: null,
+        ),
+      ],
+    );
+
+    final result = await OAuthVaultRefresher(
+      clock: () => now,
+      refreshTokens: ({
+        required OAuthProviderConfig provider,
+        required String clientId,
+        String? clientSecret,
+        required String refreshToken,
+      }) async {
+        return const OAuthTokenSet(
+          accessToken: 'new-access-token',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+        );
+      },
+    ).refreshExpiring(
+      document: document,
+      clientIdForProvider: (_) => 'client-id',
+    );
+
+    expect(result.changed, isTrue);
+    expect(result.document.items.single.secret, 'new-access-token');
+    expect(
+      result.document.items.single.tokenExpiresAt,
+      now.add(const Duration(hours: 1)),
+    );
+  });
+
+  test('uses item oauth client for synced refresh tokens', () async {
+    final now = DateTime.utc(2026, 7, 1, 12);
+    final document = VaultDocument(
+      version: 1,
+      items: [
+        _oauthItem(
+          secret: 'old-access-token',
+          refreshToken: 'refresh-token',
+          tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
+        ).copyWith(
+          oauthClientId: 'android-client-id',
+          oauthClientSecret: 'android-client-secret',
+        ),
+      ],
+    );
+
+    final result = await OAuthVaultRefresher(
+      clock: () => now,
+      refreshTokens: ({
+        required OAuthProviderConfig provider,
+        required String clientId,
+        String? clientSecret,
+        required String refreshToken,
+      }) async {
+        expect(clientId, 'android-client-id');
+        expect(clientSecret, 'android-client-secret');
+        return const OAuthTokenSet(
+          accessToken: 'new-access-token',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+        );
+      },
+    ).refreshExpiring(
+      document: document,
+      clientIdForProvider: (_) => 'desktop-client-id',
+      clientSecretForProvider: (_) => 'desktop-client-secret',
+    );
+
+    expect(result.changed, isTrue);
+    expect(result.document.items.single.secret, 'new-access-token');
+  });
+
   test('records a failure when client id is missing', () async {
     final now = DateTime.utc(2026, 7, 1, 12);
     final document = VaultDocument(
@@ -134,7 +216,7 @@ void main() {
 VaultMailboxItem _oauthItem({
   required String secret,
   required String refreshToken,
-  required DateTime tokenExpiresAt,
+  required DateTime? tokenExpiresAt,
 }) {
   return VaultMailboxItem(
     id: 'vault_oauth',

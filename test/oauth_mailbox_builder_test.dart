@@ -19,6 +19,8 @@ void main() {
         expiresIn: 3600,
         scope: 'https://mail.google.com/',
       ),
+      oauthClientId: 'android-client-id',
+      oauthClientSecret: 'android-client-secret',
     );
 
     expect(item.kind, VaultItemKind.oauth);
@@ -27,6 +29,8 @@ void main() {
     expect(item.refreshToken, 'refresh-token');
     expect(item.tokenExpiresAt, isNotNull);
     expect(item.tokenScope, 'https://mail.google.com/');
+    expect(item.oauthClientId, 'android-client-id');
+    expect(item.oauthClientSecret, 'android-client-secret');
     expect(item.imapHost, 'imap.gmail.com');
     expect(item.smtpPort, 465);
   });
@@ -57,6 +61,9 @@ void main() {
             provider: 'google',
             clientId: 'client-id',
             clientSecret: 'client-secret',
+            androidClientId: 'android-client-id',
+            androidClientSecret: 'android-client-secret',
+            androidRedirectUri: 'app.nyamail.client:/oauth2redirect',
           ),
         )
         .upsertMailbox(
@@ -71,6 +78,7 @@ void main() {
             refreshToken: 'refresh-token',
             tokenExpiresAt: expiresAt,
             tokenScope: 'https://mail.google.com/',
+            oauthClientId: 'android-client-id',
             imapHost: 'imap.gmail.com',
             imapPort: 993,
             smtpHost: 'smtp.gmail.com',
@@ -85,8 +93,12 @@ void main() {
     expect(item.refreshToken, 'refresh-token');
     expect(item.tokenExpiresAt, expiresAt);
     expect(item.tokenScope, 'https://mail.google.com/');
+    expect(item.oauthClientId, 'android-client-id');
     expect(provider?.clientId, 'client-id');
     expect(provider?.clientSecret, 'client-secret');
+    expect(provider?.androidClientId, 'android-client-id');
+    expect(provider?.androidClientSecret, 'android-client-secret');
+    expect(provider?.androidRedirectUri, 'app.nyamail.client:/oauth2redirect');
     expect(decoded.toCredentials().single.authType, MailboxAuthType.oauth2);
   });
 }

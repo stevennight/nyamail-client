@@ -38,7 +38,10 @@ class OAuthVaultRefresher {
     for (final item in document.items) {
       var next = item;
       if (_shouldRefresh(item, threshold)) {
-        final clientId = clientIdForProvider(item.provider).trim();
+        final clientId =
+            item.oauthClientId.trim().isNotEmpty
+                ? item.oauthClientId.trim()
+                : clientIdForProvider(item.provider).trim();
         if (clientId.isEmpty) {
           failures.add(
             OAuthVaultRefreshFailure(
@@ -54,7 +57,10 @@ class OAuthVaultRefresher {
             final tokenSet = await _refreshTokens(
               provider: provider,
               clientId: clientId,
-              clientSecret: clientSecretForProvider(item.provider),
+              clientSecret:
+                  item.oauthClientId.trim().isNotEmpty
+                      ? item.oauthClientSecret
+                      : clientSecretForProvider(item.provider),
               refreshToken: item.refreshToken,
             );
             next = item.copyWith(
@@ -98,7 +104,8 @@ class OAuthVaultRefresher {
     }
     if (item.secret.isEmpty) return true;
     final expiresAt = item.tokenExpiresAt;
-    return expiresAt != null && !expiresAt.toUtc().isAfter(threshold);
+    if (expiresAt == null) return true;
+    return !expiresAt.toUtc().isAfter(threshold);
   }
 }
 

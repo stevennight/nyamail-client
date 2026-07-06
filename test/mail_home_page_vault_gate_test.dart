@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:nyamail/src/api/models.dart';
 import 'package:nyamail/src/api/nyamail_api.dart';
 import 'package:nyamail/src/app/app_theme_settings.dart';
 import 'package:nyamail/src/mail/mail_models.dart';
@@ -65,6 +66,10 @@ void main() {
 
 Widget _mailHomePage({
   LocalSecureStore secureStore = const LocalSecureStore(),
+  LocalVaultStore localVaultStore = const LocalVaultStore(),
+  LocalVaultRecordStore localVaultRecordStore = const LocalVaultRecordStore(),
+  VaultCrypto vaultCrypto = const VaultCrypto(),
+  VaultRecordCrypto vaultRecordCrypto = const VaultRecordCrypto(),
 }) {
   final api = NyaMailApi(baseUrl: 'http://localhost:8080');
   return MaterialApp(
@@ -75,25 +80,37 @@ Widget _mailHomePage({
       onApiBaseUrlChanged: (_) async {},
       appThemeSetting: AppThemeSetting.system,
       onAppThemeSettingChanged: (_) async {},
-      releaseService: ReleaseService(
-        api: api,
-        channel: 'dev',
-        verifier: ReleaseVerifier(publicKey: ''),
-      ),
+      releaseService: _NoopReleaseService(api: api),
       secureStore: secureStore,
-      localVaultStore: const LocalVaultStore(),
-      localVaultRecordStore: const LocalVaultRecordStore(),
+      localVaultStore: localVaultStore,
+      localVaultRecordStore: localVaultRecordStore,
       localVaultSyncStateStore: const LocalVaultSyncStateStore(),
-      vaultCrypto: const VaultCrypto(),
-      vaultRecordCrypto: const VaultRecordCrypto(),
+      vaultCrypto: vaultCrypto,
+      vaultRecordCrypto: vaultRecordCrypto,
       oauthClient: OAuthLoopbackClient(openAuthorizationUrl: (_) async {}),
       gmailOAuthClientId: '',
       gmailOAuthClientSecret: '',
+      gmailAndroidOAuthClientId: '',
+      gmailAndroidOAuthClientSecret: '',
+      gmailAndroidOAuthRedirectUri: '',
       outlookOAuthClientId: '',
       outlookOAuthClientSecret: '',
+      outlookAndroidOAuthClientId: '',
+      outlookAndroidOAuthClientSecret: '',
+      outlookAndroidOAuthRedirectUri: '',
       mailRepository: const _EmptyMailRepository(),
     ),
   );
+}
+
+class _NoopReleaseService extends ReleaseService {
+  _NoopReleaseService({required super.api})
+    : super(channel: 'dev', verifier: ReleaseVerifier(publicKey: ''));
+
+  @override
+  Future<ReleaseCheckResult> check() async {
+    return const ReleaseCheckResult(updateAvailable: false);
+  }
 }
 
 class _EmptyMailRepository implements MailRepository {

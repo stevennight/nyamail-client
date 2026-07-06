@@ -122,11 +122,27 @@ class _NyaMailAppState extends State<NyaMailApp> {
                 vaultRecordCrypto: const VaultRecordCrypto(),
                 oauthClient: OAuthLoopbackClient(
                   openAuthorizationUrl: _openAuthorizationUrl,
+                  mobileRedirectConfig: OAuthMobileRedirectConfig(
+                    scheme: _config.oauthRedirectScheme,
+                    host: _config.oauthRedirectHost,
+                    path: _config.oauthRedirectPath,
+                  ),
                 ),
                 gmailOAuthClientId: _config.gmailOAuthClientId,
                 gmailOAuthClientSecret: _config.gmailOAuthClientSecret,
+                gmailAndroidOAuthClientId: _config.gmailAndroidOAuthClientId,
+                gmailAndroidOAuthClientSecret:
+                    _config.gmailAndroidOAuthClientSecret,
+                gmailAndroidOAuthRedirectUri:
+                    _config.gmailAndroidOAuthRedirectUri,
                 outlookOAuthClientId: _config.outlookOAuthClientId,
                 outlookOAuthClientSecret: _config.outlookOAuthClientSecret,
+                outlookAndroidOAuthClientId:
+                    _config.outlookAndroidOAuthClientId,
+                outlookAndroidOAuthClientSecret:
+                    _config.outlookAndroidOAuthClientSecret,
+                outlookAndroidOAuthRedirectUri:
+                    _config.outlookAndroidOAuthRedirectUri,
                 mailRepository: const CachedTransportMailRepository(
                   cache: MailCache(),
                   transport: SocketMailTransport(),

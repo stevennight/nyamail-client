@@ -20,120 +20,174 @@ void main() {
       outlook.scopes,
       contains('https://outlook.office.com/IMAP.AccessAsUser.All'),
     );
-    expect(
-      outlook.scopes,
-      contains('https://outlook.office.com/SMTP.Send'),
-    );
+    expect(outlook.scopes, contains('https://outlook.office.com/SMTP.Send'));
   });
 
-  test('loopback client exchanges authorization code with pkce verifier',
-      () async {
+  test(
+    'loopback client exchanges authorization code with pkce verifier',
+    () async {
+      final server = await _FakeOAuthServer.start();
+      try {
+        final provider = OAuthProviderConfig(
+          provider: 'test',
+          authorizationEndpoint: server.authorizationEndpoint,
+          tokenEndpoint: server.tokenEndpoint,
+          scopes: const ['mail.read', 'offline_access'],
+        );
+        final tokenSet = await OAuthLoopbackClient(
+          timeout: const Duration(seconds: 5),
+          openAuthorizationUrl: (uri) async {
+            server.authorizationUri = uri;
+            final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
+            final state = uri.queryParameters['state']!;
+            final response = await http.get(
+              redirectUri.replace(
+                queryParameters: {'code': 'auth-code', 'state': state},
+              ),
+            );
+            expect(response.statusCode, 200);
+          },
+        ).authorize(
+          provider: provider,
+          clientId: 'client-123',
+          loginHint: 'me@example.com',
+        );
+
+        expect(tokenSet.accessToken, 'access-token');
+        expect(tokenSet.refreshToken, 'refresh-token');
+        expect(tokenSet.toRedactedJson()['access_token'], 'redacted');
+        expect(server.tokenBody['client_id'], 'client-123');
+        expect(server.tokenBody.containsKey('client_secret'), isFalse);
+        expect(server.tokenBody['code'], 'auth-code');
+        expect(server.tokenBody['grant_type'], 'authorization_code');
+        expect(server.tokenBody['code_verifier'], isNotEmpty);
+        expect(
+          server.authorizationUri?.queryParameters['code_challenge'],
+          isNotEmpty,
+        );
+        expect(
+          server.authorizationUri?.queryParameters['code_challenge_method'],
+          'S256',
+        );
+        expect(
+          server.authorizationUri?.queryParameters['scope'],
+          'mail.read offline_access',
+        );
+        expect(
+          server.authorizationUri?.queryParameters['login_hint'],
+          'me@example.com',
+        );
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
+  test(
+    'loopback client sends optional client secret for token requests',
+    () async {
+      final server = await _FakeOAuthServer.start();
+      try {
+        final provider = OAuthProviderConfig(
+          provider: 'test',
+          authorizationEndpoint: server.authorizationEndpoint,
+          tokenEndpoint: server.tokenEndpoint,
+          scopes: const ['mail.read'],
+        );
+        await OAuthLoopbackClient(
+          timeout: const Duration(seconds: 5),
+          openAuthorizationUrl: (uri) async {
+            final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
+            final state = uri.queryParameters['state']!;
+            await http.get(
+              redirectUri.replace(
+                queryParameters: {'code': 'auth-code', 'state': state},
+              ),
+            );
+          },
+        ).authorize(
+          provider: provider,
+          clientId: 'desktop-client-id',
+          clientSecret: 'desktop-client-secret',
+        );
+
+        expect(server.tokenBody['client_secret'], 'desktop-client-secret');
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
+  test('browser callback client exchanges authorization code', () async {
     final server = await _FakeOAuthServer.start();
+    final callbackReceiver = _FakeOAuthCallbackReceiver();
     try {
       final provider = OAuthProviderConfig(
         provider: 'test',
         authorizationEndpoint: server.authorizationEndpoint,
         tokenEndpoint: server.tokenEndpoint,
-        scopes: const ['mail.read', 'offline_access'],
+        scopes: const ['mail.read'],
       );
       final tokenSet = await OAuthLoopbackClient(
         timeout: const Duration(seconds: 5),
+        redirectModeResolver:
+            () => OAuthAuthorizationRedirectMode.browserCallback,
+        callbackReceiver: callbackReceiver,
         openAuthorizationUrl: (uri) async {
           server.authorizationUri = uri;
           final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
           final state = uri.queryParameters['state']!;
-          final response = await http.get(
-            redirectUri.replace(queryParameters: {
-              'code': 'auth-code',
-              'state': state,
-            }),
+          expect(redirectUri.toString(), 'app.nyamail.client:/oauth2redirect');
+          callbackReceiver.complete(
+            redirectUri.replace(
+              queryParameters: {'code': 'mobile-auth-code', 'state': state},
+            ),
           );
-          expect(response.statusCode, 200);
         },
       ).authorize(
         provider: provider,
-        clientId: 'client-123',
-        loginHint: 'me@example.com',
+        clientId: 'android-client-id',
+        mobileRedirectUri: Uri.parse('app.nyamail.client:/oauth2redirect'),
       );
 
       expect(tokenSet.accessToken, 'access-token');
-      expect(tokenSet.refreshToken, 'refresh-token');
-      expect(tokenSet.toRedactedJson()['access_token'], 'redacted');
-      expect(server.tokenBody['client_id'], 'client-123');
-      expect(server.tokenBody.containsKey('client_secret'), isFalse);
-      expect(server.tokenBody['code'], 'auth-code');
-      expect(server.tokenBody['grant_type'], 'authorization_code');
+      expect(server.tokenBody['client_id'], 'android-client-id');
+      expect(server.tokenBody['code'], 'mobile-auth-code');
+      expect(
+        server.tokenBody['redirect_uri'],
+        'app.nyamail.client:/oauth2redirect',
+      );
       expect(server.tokenBody['code_verifier'], isNotEmpty);
-      expect(server.authorizationUri?.queryParameters['code_challenge'],
-          isNotEmpty);
-      expect(server.authorizationUri?.queryParameters['code_challenge_method'],
-          'S256');
-      expect(server.authorizationUri?.queryParameters['scope'],
-          'mail.read offline_access');
-      expect(server.authorizationUri?.queryParameters['login_hint'],
-          'me@example.com');
     } finally {
       await server.close();
     }
   });
 
-  test('loopback client sends optional client secret for token requests',
-      () async {
-    final server = await _FakeOAuthServer.start();
-    try {
-      final provider = OAuthProviderConfig(
-        provider: 'test',
-        authorizationEndpoint: server.authorizationEndpoint,
-        tokenEndpoint: server.tokenEndpoint,
-        scopes: const ['mail.read'],
-      );
-      await OAuthLoopbackClient(
-        timeout: const Duration(seconds: 5),
-        openAuthorizationUrl: (uri) async {
-          final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
-          final state = uri.queryParameters['state']!;
-          await http.get(
-            redirectUri.replace(queryParameters: {
-              'code': 'auth-code',
-              'state': state,
-            }),
-          );
-        },
-      ).authorize(
-        provider: provider,
-        clientId: 'desktop-client-id',
-        clientSecret: 'desktop-client-secret',
-      );
+  test(
+    'loopback client sends optional client secret for refresh requests',
+    () async {
+      final server = await _FakeOAuthServer.start();
+      try {
+        final provider = OAuthProviderConfig(
+          provider: 'test',
+          authorizationEndpoint: server.authorizationEndpoint,
+          tokenEndpoint: server.tokenEndpoint,
+          scopes: const ['mail.read'],
+        );
+        await OAuthLoopbackClient().refresh(
+          provider: provider,
+          clientId: 'desktop-client-id',
+          clientSecret: 'desktop-client-secret',
+          refreshToken: 'refresh-token',
+        );
 
-      expect(server.tokenBody['client_secret'], 'desktop-client-secret');
-    } finally {
-      await server.close();
-    }
-  });
-
-  test('loopback client sends optional client secret for refresh requests',
-      () async {
-    final server = await _FakeOAuthServer.start();
-    try {
-      final provider = OAuthProviderConfig(
-        provider: 'test',
-        authorizationEndpoint: server.authorizationEndpoint,
-        tokenEndpoint: server.tokenEndpoint,
-        scopes: const ['mail.read'],
-      );
-      await OAuthLoopbackClient().refresh(
-        provider: provider,
-        clientId: 'desktop-client-id',
-        clientSecret: 'desktop-client-secret',
-        refreshToken: 'refresh-token',
-      );
-
-      expect(server.tokenBody['client_secret'], 'desktop-client-secret');
-      expect(server.tokenBody['grant_type'], 'refresh_token');
-    } finally {
-      await server.close();
-    }
-  });
+        expect(server.tokenBody['client_secret'], 'desktop-client-secret');
+        expect(server.tokenBody['grant_type'], 'refresh_token');
+      } finally {
+        await server.close();
+      }
+    },
+  );
 
   test('loopback client rejects state mismatch', () async {
     final server = await _FakeOAuthServer.start();
@@ -151,10 +205,9 @@ void main() {
           openAuthorizationUrl: (uri) async {
             final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
             await http.get(
-              redirectUri.replace(queryParameters: {
-                'code': 'auth-code',
-                'state': 'wrong-state',
-              }),
+              redirectUri.replace(
+                queryParameters: {'code': 'auth-code', 'state': 'wrong-state'},
+              ),
             );
           },
         ).authorize(provider: provider, clientId: 'client-123'),
@@ -188,10 +241,9 @@ void main() {
             final redirectUri = Uri.parse(uri.queryParameters['redirect_uri']!);
             final state = uri.queryParameters['state']!;
             await http.get(
-              redirectUri.replace(queryParameters: {
-                'code': 'auth-code',
-                'state': state,
-              }),
+              redirectUri.replace(
+                queryParameters: {'code': 'auth-code', 'state': state},
+              ),
             );
           },
         ).authorize(provider: provider, clientId: 'web-client-123'),
@@ -211,6 +263,20 @@ void main() {
       await server.close();
     }
   });
+}
+
+class _FakeOAuthCallbackReceiver implements OAuthCallbackReceiver {
+  Completer<Uri>? _completer;
+
+  @override
+  Future<Uri> waitForCallback({required Duration timeout}) {
+    _completer = Completer<Uri>();
+    return _completer!.future.timeout(timeout);
+  }
+
+  void complete(Uri uri) {
+    _completer!.complete(uri);
+  }
 }
 
 class _FakeOAuthServer {

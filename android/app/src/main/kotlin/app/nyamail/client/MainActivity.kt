@@ -10,6 +10,9 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 
 class MainActivity : FlutterFragmentActivity() {
+    private var oauthCallbackChannel: MethodChannel? = null
+    private var pendingOAuthRedirect: String? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(
@@ -37,6 +40,27 @@ class MainActivity : FlutterFragmentActivity() {
                 else -> result.notImplemented()
             }
         }
+        oauthCallbackChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "app.nyamail.client/oauth_callback"
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "takeInitialOAuthRedirect" -> {
+                        result.success(pendingOAuthRedirect)
+                        pendingOAuthRedirect = null
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+        handleOAuthRedirect(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleOAuthRedirect(intent)
     }
 
     private fun installApk(path: String) {
@@ -55,5 +79,16 @@ class MainActivity : FlutterFragmentActivity() {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         startActivity(intent)
+    }
+
+    private fun handleOAuthRedirect(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val redirect = intent.dataString ?: return
+        val channel = oauthCallbackChannel
+        if (channel == null) {
+            pendingOAuthRedirect = redirect
+            return
+        }
+        channel.invokeMethod("onOAuthRedirect", redirect)
     }
 }

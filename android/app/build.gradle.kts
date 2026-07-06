@@ -17,10 +17,23 @@ fun signingValue(propertyName: String, environmentName: String): String? {
     return value?.trim()?.takeIf { it.isNotEmpty() }
 }
 
+fun configValue(propertyName: String, environmentName: String, defaultValue: String): String {
+    return (project.findProperty(propertyName) as String?)
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: System.getenv(environmentName)?.trim()?.takeIf { it.isNotEmpty() }
+        ?: defaultValue
+}
+
 val releaseStoreFilePath = signingValue("storeFile", "NYAMAIL_ANDROID_STORE_FILE")
 val releaseStorePassword = signingValue("storePassword", "NYAMAIL_ANDROID_STORE_PASSWORD")
 val releaseKeyAlias = signingValue("keyAlias", "NYAMAIL_ANDROID_KEY_ALIAS")
 val releaseKeyPassword = signingValue("keyPassword", "NYAMAIL_ANDROID_KEY_PASSWORD")
+val oauthRedirectScheme = configValue(
+    "nyamail.oauthRedirectScheme",
+    "NYAMAIL_ANDROID_OAUTH_REDIRECT_SCHEME",
+    "app.nyamail.client"
+)
 val hasReleaseSigning = listOf(
     releaseStoreFilePath,
     releaseStorePassword,
@@ -47,6 +60,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["nyamailOAuthRedirectScheme"] = oauthRedirectScheme
     }
 
     signingConfigs {

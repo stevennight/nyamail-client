@@ -18,6 +18,30 @@ Android can be run the same way when a device or emulator is available:
 flutter run -d android --dart-define NYAMAIL_API_BASE_URL=http://localhost:8080
 ```
 
+Android OAuth uses an app callback instead of the desktop `127.0.0.1`
+loopback server. The default redirect URI is:
+
+```text
+app.nyamail.client:/oauth2redirect
+```
+
+The Android manifest registers only the URI scheme. If you need a provider
+specific scheme, pass the same scheme to Gradle and Dart when building:
+
+```powershell
+$env:NYAMAIL_ANDROID_OAUTH_REDIRECT_SCHEME = "app.nyamail.client"
+flutter run -d android `
+  --dart-define NYAMAIL_OAUTH_REDIRECT_SCHEME=app.nyamail.client `
+  --dart-define NYAMAIL_OAUTH_REDIRECT_PATH=/oauth2redirect
+```
+
+You can also put `nyamail.oauthRedirectScheme=...` in
+`android/gradle.properties` for local builds.
+
+Provider client IDs and secrets can be stored from the in-app OAuth providers
+settings. Android can use separate Android client values and an optional
+provider-specific Android redirect URI.
+
 ## Check
 
 ```powershell

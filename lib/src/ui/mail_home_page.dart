@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' as io;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -32,6 +33,7 @@ import '../security/device_approval_crypto.dart';
 import '../security/device_pairing_code.dart';
 import '../security/device_pairing_request.dart';
 import '../security/local_cache_crypto.dart';
+import '../security/local_vault_migration.dart';
 import '../security/local_secure_store.dart';
 import '../security/local_vault_auth.dart';
 import '../security/local_vault_record_store.dart';
@@ -69,8 +71,14 @@ class MailHomePage extends StatefulWidget {
     required this.oauthClient,
     required this.gmailOAuthClientId,
     required this.gmailOAuthClientSecret,
+    required this.gmailAndroidOAuthClientId,
+    required this.gmailAndroidOAuthClientSecret,
+    required this.gmailAndroidOAuthRedirectUri,
     required this.outlookOAuthClientId,
     required this.outlookOAuthClientSecret,
+    required this.outlookAndroidOAuthClientId,
+    required this.outlookAndroidOAuthClientSecret,
+    required this.outlookAndroidOAuthRedirectUri,
     required this.mailRepository,
     super.key,
   });
@@ -91,8 +99,14 @@ class MailHomePage extends StatefulWidget {
   final OAuthLoopbackClient oauthClient;
   final String gmailOAuthClientId;
   final String gmailOAuthClientSecret;
+  final String gmailAndroidOAuthClientId;
+  final String gmailAndroidOAuthClientSecret;
+  final String gmailAndroidOAuthRedirectUri;
   final String outlookOAuthClientId;
   final String outlookOAuthClientSecret;
+  final String outlookAndroidOAuthClientId;
+  final String outlookAndroidOAuthClientSecret;
+  final String outlookAndroidOAuthRedirectUri;
   final MailRepository mailRepository;
 
   @override
@@ -110,7 +124,6 @@ class _MailHomePageState extends State<MailHomePage> {
   late MailRepository _mailRepository;
   MailDraftCache? _draftCache;
   VaultDocument? _vaultDocument;
-  int? _vaultRevision;
   int? _vaultRecordRevision;
   String? _unlockedVaultSecret;
   String? _unlockedVaultPassword;
@@ -121,7 +134,7 @@ class _MailHomePageState extends State<MailHomePage> {
   bool _loading = true;
   bool _vaultUnlocking = false;
   bool _loadingMore = false;
-  bool _refreshingOAuth = false;
+  Future<void>? _oauthRefreshFuture;
   bool _claimingVaultShare = false;
   String? _banner;
   String? _pendingPairingPackage;
@@ -415,59 +428,28 @@ class _MailHomePageState extends State<MailHomePage> {
         return false;
       }
       _debugVault('local unlock: secret ready');
-      final recordSnapshot = await widget.localVaultRecordStore.read(
-        profile.id,
-      );
-      if (recordSnapshot != null) {
-        _debugVault(
-          'local unlock: decrypting record snapshot r${recordSnapshot.revision}',
-        );
-        final records = await widget.vaultRecordCrypto.decryptRecordSet(
-          records: recordSnapshot.records,
-          vaultSecret: vaultSecret,
-        );
-        _vaultRecordRevision = recordSnapshot.revision;
-        final document = records.toVaultDocument();
-        await _applyVaultDocument(
-          document,
-          loadMessages: false,
-          discoverFolders: false,
-        );
-        _debugVault('local unlock: record vault applied');
-        if (promptIfNeeded) {
-          await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
-        }
-        return true;
-      }
-      _debugVault('local unlock: reading legacy vault snapshot');
-      var snapshot = await widget.localVaultStore.read(profile.id);
-      snapshot ??= await widget.localVaultStore.write(
+      final result = await loadOrMigrateLocalVaultDocument(
         profileId: profile.id,
-        expectedRevision: 0,
-        blob: await widget.vaultCrypto.createInitialVault(
-          email: profile.email,
-          password: '',
-          vaultSecret: vaultSecret,
-        ),
-      );
-      final document = await widget.vaultCrypto.decryptDocument(
-        blob: snapshot.blob,
-        email: profile.email,
-        password: '',
+        profileEmail: profile.email,
         vaultSecret: vaultSecret,
+        recordStore: widget.localVaultRecordStore,
+        legacyStore: widget.localVaultStore,
+        recordCrypto: widget.vaultRecordCrypto,
+        vaultCrypto: widget.vaultCrypto,
       );
-      await _saveLocalVaultRecords(
-        profile: profile,
-        document: document,
-        vaultSecret: vaultSecret,
-      );
+      _vaultRecordRevision = result.recordRevision;
       await _applyVaultDocument(
-        document,
-        revision: snapshot.revision,
+        result.document,
         loadMessages: false,
         discoverFolders: false,
       );
-      _debugVault('local unlock: legacy vault applied');
+      _debugVault(
+        result.migratedLegacyVault
+            ? 'local unlock: legacy vault migrated to records'
+            : result.createdRecordVault
+            ? 'local unlock: empty record vault created'
+            : 'local unlock: record vault applied',
+      );
       if (promptIfNeeded) {
         await _migrateLegacyVaultSecretIfNeeded(vaultSecret);
       }
@@ -502,16 +484,11 @@ class _MailHomePageState extends State<MailHomePage> {
         vaultSecret: vaultSecret,
       );
       final profile = _profile ?? await _ensureLocalProfile();
-      final revision =
-          profile == null
-              ? vault.revision
-              : await _saveLocalVaultDocument(
-                profile: profile,
-                document: document,
-              );
+      if (profile != null) {
+        await _saveLocalVaultDocument(profile: profile, document: document);
+      }
       await _applyVaultDocument(
         document,
-        revision: revision,
         loadMessages: false,
         discoverFolders: false,
       );
@@ -798,22 +775,12 @@ class _MailHomePageState extends State<MailHomePage> {
     _draftCache = _draftCacheForProfile(profile, localCacheSecret: vaultSecret);
 
     final document = VaultDocument.empty();
-    final snapshot = await widget.localVaultStore.write(
-      profileId: profile.id,
-      expectedRevision: 0,
-      blob: await widget.vaultCrypto.createInitialVault(
-        email: profile.email,
-        password: '',
-        vaultSecret: vaultSecret,
-      ),
-    );
     await _saveLocalVaultRecords(
       profile: profile,
       document: document,
       vaultSecret: vaultSecret,
     );
     _vaultDocument = document;
-    _vaultRevision = snapshot.revision;
 
     final quickUnlockEnabled =
         input.enableQuickUnlock &&
@@ -823,7 +790,6 @@ class _MailHomePageState extends State<MailHomePage> {
         );
     await _applyVaultDocument(
       document,
-      revision: snapshot.revision,
       loadMessages: false,
       discoverFolders: false,
     );
@@ -1634,21 +1600,28 @@ class _MailHomePageState extends State<MailHomePage> {
             providers: document.oauthProviders,
             gmailBuildClientId: widget.gmailOAuthClientId,
             gmailBuildClientSecret: widget.gmailOAuthClientSecret,
+            gmailAndroidBuildClientId: widget.gmailAndroidOAuthClientId,
+            gmailAndroidBuildClientSecret: widget.gmailAndroidOAuthClientSecret,
+            gmailAndroidBuildRedirectUri: widget.gmailAndroidOAuthRedirectUri,
             outlookBuildClientId: widget.outlookOAuthClientId,
             outlookBuildClientSecret: widget.outlookOAuthClientSecret,
+            outlookAndroidBuildClientId: widget.outlookAndroidOAuthClientId,
+            outlookAndroidBuildClientSecret:
+                widget.outlookAndroidOAuthClientSecret,
+            outlookAndroidBuildRedirectUri:
+                widget.outlookAndroidOAuthRedirectUri,
           ),
     );
     if (nextProviders == null || !mounted) return;
 
     final updatedDocument = document.copyWith(oauthProviders: nextProviders);
     try {
-      final revision = await _saveLocalVaultDocument(
+      await _saveLocalVaultDocument(
         profile: profile,
         document: updatedDocument,
       );
       await _applyVaultDocument(
         updatedDocument,
-        revision: revision,
         loadMessages: false,
         discoverFolders: false,
       );
@@ -1743,7 +1716,6 @@ class _MailHomePageState extends State<MailHomePage> {
       _profile = null;
       _draftCache = null;
       _vaultDocument = null;
-      _vaultRevision = null;
       _vaultRecordRevision = null;
       _unlockedVaultSecret = null;
       _unlockedVaultPassword = null;
@@ -2115,16 +2087,11 @@ class _MailHomePageState extends State<MailHomePage> {
         vaultSecret: vaultSecret,
       );
       final profile = _profile ?? await _ensureLocalProfile();
-      final revision =
-          profile == null
-              ? vault.revision
-              : await _saveLocalVaultDocument(
-                profile: profile,
-                document: document,
-              );
+      if (profile != null) {
+        await _saveLocalVaultDocument(profile: profile, document: document);
+      }
       await _applyVaultDocument(
         document,
-        revision: revision,
         loadMessages: false,
         discoverFolders: false,
       );
@@ -2207,16 +2174,11 @@ class _MailHomePageState extends State<MailHomePage> {
       vaultSecret: vaultSecret,
     );
     final profile = _profile ?? await _ensureLocalProfile();
-    final revision =
-        profile == null
-            ? vault.revision
-            : await _saveLocalVaultDocument(
-              profile: profile,
-              document: document,
-            );
+    if (profile != null) {
+      await _saveLocalVaultDocument(profile: profile, document: document);
+    }
     await _applyVaultDocument(
       document,
-      revision: revision,
       loadMessages: false,
       discoverFolders: false,
     );
@@ -2387,33 +2349,19 @@ class _MailHomePageState extends State<MailHomePage> {
     return profile.id;
   }
 
-  Future<int> _saveLocalVaultDocument({
+  Future<void> _saveLocalVaultDocument({
     required LocalProfile profile,
     required VaultDocument document,
   }) async {
     final vaultSecret = await _readUnlockedVaultSecret();
-    final current = await widget.localVaultStore.read(profile.id);
     if (vaultSecret == null || vaultSecret.trim().isEmpty) {
       throw StateError('Local vault unlock material is not available.');
     }
-    final expectedRevision = _vaultRevision ?? current?.revision ?? 0;
-    final snapshot = await widget.localVaultStore.write(
-      profileId: profile.id,
-      expectedRevision: expectedRevision,
-      blob: await widget.vaultCrypto.encryptDocument(
-        document: document,
-        email: profile.email,
-        password: '',
-        vaultSecret: vaultSecret,
-      ),
-    );
     await _saveLocalVaultRecords(
       profile: profile,
       document: document,
       vaultSecret: vaultSecret,
     );
-    _vaultRevision = snapshot.revision;
-    return snapshot.revision;
   }
 
   Future<bool> _syncVaultRecordsWithServer({
@@ -2504,16 +2452,21 @@ class _MailHomePageState extends State<MailHomePage> {
             oauthClient: widget.oauthClient,
             gmailOAuthClientId: widget.gmailOAuthClientId,
             gmailOAuthClientSecret: widget.gmailOAuthClientSecret,
+            gmailAndroidOAuthClientId: widget.gmailAndroidOAuthClientId,
+            gmailAndroidOAuthClientSecret: widget.gmailAndroidOAuthClientSecret,
+            gmailAndroidOAuthRedirectUri: widget.gmailAndroidOAuthRedirectUri,
             outlookOAuthClientId: widget.outlookOAuthClientId,
             outlookOAuthClientSecret: widget.outlookOAuthClientSecret,
+            outlookAndroidOAuthClientId: widget.outlookAndroidOAuthClientId,
+            outlookAndroidOAuthClientSecret:
+                widget.outlookAndroidOAuthClientSecret,
+            outlookAndroidOAuthRedirectUri:
+                widget.outlookAndroidOAuthRedirectUri,
           ),
     );
     if (added == null) return;
-    final revision = await _saveLocalVaultDocument(
-      profile: profile,
-      document: added.document,
-    );
-    await _applyVaultDocument(added.document, revision: revision);
+    await _saveLocalVaultDocument(profile: profile, document: added.document);
+    await _applyVaultDocument(added.document);
     final synced = await _syncVaultRecordsWithServer(silent: true);
     if (!mounted) return;
     setState(() {
@@ -2528,14 +2481,30 @@ class _MailHomePageState extends State<MailHomePage> {
     final profile = _profile;
     final session = _session;
     final document = _vaultDocument;
-    final revision = _vaultRevision;
-    if ((profile == null && session == null) ||
-        document == null ||
-        revision == null ||
-        account.id == 'all') {
-      setState(() => _banner = 'Mailbox account data is not available.');
+    if (account.id == 'all') {
+      setState(() => _banner = 'Select a mailbox account before removing it.');
       return;
     }
+    if (document == null) {
+      setState(() => _banner = 'Mailbox account data is not loaded yet.');
+      return;
+    }
+    if (profile == null && session == null) {
+      setState(
+        () => _banner = 'Unlock the local vault before removing a mailbox.',
+      );
+      return;
+    }
+    final localProfile = profile ?? await _ensureLocalProfile();
+    if (localProfile == null) {
+      if (mounted) {
+        setState(
+          () => _banner = 'Unlock the local vault before removing a mailbox.',
+        );
+      }
+      return;
+    }
+    if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder:
@@ -2560,15 +2529,11 @@ class _MailHomePageState extends State<MailHomePage> {
     if (confirmed != true) return;
     try {
       final updatedDocument = document.removeMailbox(account.id);
-      final localProfile = profile ?? await _ensureLocalProfile();
-      final localRevision =
-          localProfile == null
-              ? revision
-              : await _saveLocalVaultDocument(
-                profile: localProfile,
-                document: updatedDocument,
-              );
-      await _applyVaultDocument(updatedDocument, revision: localRevision);
+      await _saveLocalVaultDocument(
+        profile: localProfile,
+        document: updatedDocument,
+      );
+      await _applyVaultDocument(updatedDocument);
       final synced = await _syncVaultRecordsWithServer(silent: true);
       if (!mounted) return;
       setState(
@@ -2587,7 +2552,6 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Future<void> _applyVaultDocument(
     VaultDocument document, {
-    int? revision,
     bool loadMessages = true,
     bool discoverFolders = true,
   }) async {
@@ -2596,9 +2560,6 @@ class _MailHomePageState extends State<MailHomePage> {
     );
     final previousAccountIds = _accounts.map((account) => account.id).toSet();
     _vaultDocument = document;
-    if (revision != null) {
-      _vaultRevision = revision;
-    }
     final localCacheSecret = await _localCacheSecretForActiveVault();
     _configureMailRepository(document, localCacheSecret: localCacheSecret);
     final profile = _profile;
@@ -2713,11 +2674,23 @@ class _MailHomePageState extends State<MailHomePage> {
     return null;
   }
 
-  Future<void> _refreshOAuthVaultIfNeeded() async {
+  Future<void> _refreshOAuthVaultIfNeeded() {
+    final current = _oauthRefreshFuture;
+    if (current != null) return current;
+    late final Future<void> refresh;
+    refresh = _refreshOAuthVaultIfNeededUnshared().whenComplete(() {
+      if (identical(_oauthRefreshFuture, refresh)) {
+        _oauthRefreshFuture = null;
+      }
+    });
+    _oauthRefreshFuture = refresh;
+    return refresh;
+  }
+
+  Future<void> _refreshOAuthVaultIfNeededUnshared() async {
     final profile = _profile;
     final session = _session;
     final document = _vaultDocument;
-    final revision = _vaultRevision;
     final contextUserId = profile?.id ?? session?.userId;
     final contextSessionToken = session?.accessToken;
     bool isCurrentVaultContext() {
@@ -2728,13 +2701,14 @@ class _MailHomePageState extends State<MailHomePage> {
           identical(_vaultDocument, document);
     }
 
-    if (_refreshingOAuth ||
-        document == null ||
-        revision == null ||
-        (profile == null && session == null)) {
+    if (document == null) {
+      _debugVault('oauth refresh: skipped, vault document is not loaded');
       return;
     }
-    _refreshingOAuth = true;
+    if (profile == null && session == null) {
+      _debugVault('oauth refresh: skipped, no local or sync account context');
+      return;
+    }
     try {
       final result = await OAuthVaultRefresher(
         refreshTokens: widget.oauthClient.refresh,
@@ -2745,21 +2719,22 @@ class _MailHomePageState extends State<MailHomePage> {
       );
       if (!isCurrentVaultContext()) return;
       if (result.changed) {
+        _debugVault(
+          'oauth refresh: refreshed ${result.refreshedCount} token(s)',
+        );
         final localProfile = profile ?? await _ensureLocalProfile();
         if (!isCurrentVaultContext()) return;
-        final int nextRevision;
         if (localProfile != null) {
-          nextRevision = await _saveLocalVaultDocument(
+          await _saveLocalVaultDocument(
             profile: localProfile,
             document: result.document,
           );
         } else {
-          nextRevision = revision;
+          _debugVault('oauth refresh: refreshed token kept in memory only');
         }
         if (!isCurrentVaultContext()) return;
         await _applyVaultDocument(
           result.document,
-          revision: nextRevision,
           loadMessages: false,
           discoverFolders: false,
         );
@@ -2775,13 +2750,20 @@ class _MailHomePageState extends State<MailHomePage> {
       if (isCurrentVaultContext()) {
         setState(() => _banner = 'OAuth token refresh failed: $error');
       }
-    } finally {
-      _refreshingOAuth = false;
     }
   }
 
   String _oauthClientIdForProvider(String provider) {
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
+    if (io.Platform.isAndroid) {
+      final vaultAndroidClientId = vaultConfig?.androidClientId.trim() ?? '';
+      if (vaultAndroidClientId.isNotEmpty) return vaultAndroidClientId;
+      return switch (provider) {
+        'gmail' => widget.gmailAndroidOAuthClientId.trim(),
+        'outlook' => widget.outlookAndroidOAuthClientId.trim(),
+        _ => '',
+      };
+    }
     final vaultClientId = vaultConfig?.clientId.trim() ?? '';
     if (vaultClientId.isNotEmpty) return vaultClientId;
     return switch (provider) {
@@ -2793,6 +2775,16 @@ class _MailHomePageState extends State<MailHomePage> {
 
   String _oauthClientSecretForProvider(String provider) {
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
+    if (io.Platform.isAndroid) {
+      if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
+        return vaultConfig!.androidClientSecret.trim();
+      }
+      return switch (provider) {
+        'gmail' => widget.gmailAndroidOAuthClientSecret.trim(),
+        'outlook' => widget.outlookAndroidOAuthClientSecret.trim(),
+        _ => '',
+      };
+    }
     if (vaultConfig?.clientId.trim().isNotEmpty == true) {
       return vaultConfig!.clientSecret.trim();
     }
@@ -3054,7 +3046,11 @@ class _MailHomePageState extends State<MailHomePage> {
       _replaceMessage(_preserveLocalReadState(updated));
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = 'Could not mark message as read: $error');
+      setState(
+        () =>
+            _banner =
+                'Marked read locally. Could not sync read state to the mailbox: $error',
+      );
     }
   }
 
@@ -7377,15 +7373,27 @@ class _OAuthProviderSettingsDialog extends StatefulWidget {
     required this.providers,
     required this.gmailBuildClientId,
     required this.gmailBuildClientSecret,
+    required this.gmailAndroidBuildClientId,
+    required this.gmailAndroidBuildClientSecret,
+    required this.gmailAndroidBuildRedirectUri,
     required this.outlookBuildClientId,
     required this.outlookBuildClientSecret,
+    required this.outlookAndroidBuildClientId,
+    required this.outlookAndroidBuildClientSecret,
+    required this.outlookAndroidBuildRedirectUri,
   });
 
   final List<VaultOAuthProviderConfig> providers;
   final String gmailBuildClientId;
   final String gmailBuildClientSecret;
+  final String gmailAndroidBuildClientId;
+  final String gmailAndroidBuildClientSecret;
+  final String gmailAndroidBuildRedirectUri;
   final String outlookBuildClientId;
   final String outlookBuildClientSecret;
+  final String outlookAndroidBuildClientId;
+  final String outlookAndroidBuildClientSecret;
+  final String outlookAndroidBuildRedirectUri;
 
   @override
   State<_OAuthProviderSettingsDialog> createState() =>
@@ -7571,11 +7579,19 @@ class _OAuthProviderSettingsDialogState
     extends State<_OAuthProviderSettingsDialog> {
   late final TextEditingController _gmailClientId;
   late final TextEditingController _gmailClientSecret;
+  late final TextEditingController _gmailAndroidClientId;
+  late final TextEditingController _gmailAndroidClientSecret;
+  late final TextEditingController _gmailAndroidRedirectUri;
   late final TextEditingController _outlookClientId;
   late final TextEditingController _outlookClientSecret;
+  late final TextEditingController _outlookAndroidClientId;
+  late final TextEditingController _outlookAndroidClientSecret;
+  late final TextEditingController _outlookAndroidRedirectUri;
   late final List<VaultOAuthProviderConfig> _extraProviders;
   bool _showGmailSecret = false;
+  bool _showGmailAndroidSecret = false;
   bool _showOutlookSecret = false;
+  bool _showOutlookAndroidSecret = false;
   String? _error;
 
   @override
@@ -7585,9 +7601,27 @@ class _OAuthProviderSettingsDialogState
     final outlook = _provider('outlook');
     _gmailClientId = TextEditingController(text: gmail?.clientId ?? '');
     _gmailClientSecret = TextEditingController(text: gmail?.clientSecret ?? '');
+    _gmailAndroidClientId = TextEditingController(
+      text: gmail?.androidClientId ?? '',
+    );
+    _gmailAndroidClientSecret = TextEditingController(
+      text: gmail?.androidClientSecret ?? '',
+    );
+    _gmailAndroidRedirectUri = TextEditingController(
+      text: gmail?.androidRedirectUri ?? '',
+    );
     _outlookClientId = TextEditingController(text: outlook?.clientId ?? '');
     _outlookClientSecret = TextEditingController(
       text: outlook?.clientSecret ?? '',
+    );
+    _outlookAndroidClientId = TextEditingController(
+      text: outlook?.androidClientId ?? '',
+    );
+    _outlookAndroidClientSecret = TextEditingController(
+      text: outlook?.androidClientSecret ?? '',
+    );
+    _outlookAndroidRedirectUri = TextEditingController(
+      text: outlook?.androidRedirectUri ?? '',
     );
     _extraProviders =
         widget.providers
@@ -7603,8 +7637,14 @@ class _OAuthProviderSettingsDialogState
   void dispose() {
     _gmailClientId.dispose();
     _gmailClientSecret.dispose();
+    _gmailAndroidClientId.dispose();
+    _gmailAndroidClientSecret.dispose();
+    _gmailAndroidRedirectUri.dispose();
     _outlookClientId.dispose();
     _outlookClientSecret.dispose();
+    _outlookAndroidClientId.dispose();
+    _outlookAndroidClientSecret.dispose();
+    _outlookAndroidRedirectUri.dispose();
     super.dispose();
   }
 
@@ -7632,11 +7672,22 @@ class _OAuthProviderSettingsDialogState
               icon: Icons.alternate_email,
               clientId: _gmailClientId,
               clientSecret: _gmailClientSecret,
+              androidClientId: _gmailAndroidClientId,
+              androidClientSecret: _gmailAndroidClientSecret,
+              androidRedirectUri: _gmailAndroidRedirectUri,
               showSecret: _showGmailSecret,
+              showAndroidSecret: _showGmailAndroidSecret,
               buildClientId: widget.gmailBuildClientId,
               buildClientSecret: widget.gmailBuildClientSecret,
+              androidBuildClientId: widget.gmailAndroidBuildClientId,
+              androidBuildClientSecret: widget.gmailAndroidBuildClientSecret,
+              androidBuildRedirectUri: widget.gmailAndroidBuildRedirectUri,
               onToggleSecret:
                   () => setState(() => _showGmailSecret = !_showGmailSecret),
+              onToggleAndroidSecret:
+                  () => setState(
+                    () => _showGmailAndroidSecret = !_showGmailAndroidSecret,
+                  ),
             ),
             const Divider(height: 28),
             _providerFields(
@@ -7645,12 +7696,24 @@ class _OAuthProviderSettingsDialogState
               icon: Icons.business_center_outlined,
               clientId: _outlookClientId,
               clientSecret: _outlookClientSecret,
+              androidClientId: _outlookAndroidClientId,
+              androidClientSecret: _outlookAndroidClientSecret,
+              androidRedirectUri: _outlookAndroidRedirectUri,
               showSecret: _showOutlookSecret,
+              showAndroidSecret: _showOutlookAndroidSecret,
               buildClientId: widget.outlookBuildClientId,
               buildClientSecret: widget.outlookBuildClientSecret,
+              androidBuildClientId: widget.outlookAndroidBuildClientId,
+              androidBuildClientSecret: widget.outlookAndroidBuildClientSecret,
+              androidBuildRedirectUri: widget.outlookAndroidBuildRedirectUri,
               onToggleSecret:
                   () =>
                       setState(() => _showOutlookSecret = !_showOutlookSecret),
+              onToggleAndroidSecret:
+                  () => setState(
+                    () =>
+                        _showOutlookAndroidSecret = !_showOutlookAndroidSecret,
+                  ),
             ),
             if (_error != null) ...[
               const SizedBox(height: 12),
@@ -7685,10 +7748,18 @@ class _OAuthProviderSettingsDialogState
     required IconData icon,
     required TextEditingController clientId,
     required TextEditingController clientSecret,
+    required TextEditingController androidClientId,
+    required TextEditingController androidClientSecret,
+    required TextEditingController androidRedirectUri,
     required bool showSecret,
+    required bool showAndroidSecret,
     required String buildClientId,
     required String buildClientSecret,
+    required String androidBuildClientId,
+    required String androidBuildClientSecret,
+    required String androidBuildRedirectUri,
     required VoidCallback onToggleSecret,
+    required VoidCallback onToggleAndroidSecret,
   }) {
     final textTheme = Theme.of(context).textTheme;
     final colorScheme = Theme.of(context).colorScheme;
@@ -7717,6 +7788,11 @@ class _OAuthProviderSettingsDialogState
           ],
         ),
         const SizedBox(height: 10),
+        Text(
+          'Desktop',
+          style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
+        ),
+        const SizedBox(height: 8),
         TextField(
           controller: clientId,
           keyboardType: TextInputType.text,
@@ -7758,6 +7834,69 @@ class _OAuthProviderSettingsDialogState
             ),
           ),
         ),
+        const SizedBox(height: 14),
+        Text(
+          'Android',
+          style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          controller: androidClientId,
+          keyboardType: TextInputType.text,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            labelText: 'Android client ID',
+            hintText: _androidClientIdHint(provider),
+            prefixIcon: const Icon(Icons.android_outlined),
+          ),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: androidClientSecret,
+          obscureText: !showAndroidSecret,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            labelText: 'Android client secret',
+            prefixIcon: const Icon(Icons.key_outlined),
+            suffixIcon: IconButton(
+              tooltip:
+                  showAndroidSecret
+                      ? 'Hide Android secret'
+                      : 'Show Android secret',
+              onPressed: onToggleAndroidSecret,
+              icon: Icon(
+                showAndroidSecret
+                    ? Icons.visibility_off_outlined
+                    : Icons.visibility_outlined,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: androidRedirectUri,
+          keyboardType: TextInputType.url,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            labelText: 'Android redirect URI',
+            hintText: _androidRedirectUriHint(provider),
+            prefixIcon: const Icon(Icons.link_outlined),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            'Android fallback: ${_fallbackStatus(androidBuildClientId, androidBuildClientSecret)}'
+            '${androidBuildRedirectUri.trim().isEmpty ? '' : ', redirect URI configured'}',
+            style: textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -7767,6 +7906,22 @@ class _OAuthProviderSettingsDialogState
       'gmail' => 'Google OAuth desktop client ID',
       'outlook' => 'Microsoft OAuth client ID',
       _ => 'OAuth client ID',
+    };
+  }
+
+  String _androidClientIdHint(String provider) {
+    return switch (provider) {
+      'gmail' => 'Google OAuth Android client ID',
+      'outlook' => 'Microsoft Android/mobile client ID',
+      _ => 'Android OAuth client ID',
+    };
+  }
+
+  String _androidRedirectUriHint(String provider) {
+    return switch (provider) {
+      'gmail' => 'app.nyamail.client:/oauth2redirect',
+      'outlook' => 'app.nyamail.client:/oauth2redirect',
+      _ => 'app.nyamail.client:/oauth2redirect',
     };
   }
 
@@ -7785,12 +7940,18 @@ class _OAuthProviderSettingsDialogState
       provider: 'gmail',
       clientId: _gmailClientId.text,
       clientSecret: _gmailClientSecret.text,
+      androidClientId: _gmailAndroidClientId.text,
+      androidClientSecret: _gmailAndroidClientSecret.text,
+      androidRedirectUri: _gmailAndroidRedirectUri.text,
     );
     if (_error != null) return;
     final outlook = _configFromFields(
       provider: 'outlook',
       clientId: _outlookClientId.text,
       clientSecret: _outlookClientSecret.text,
+      androidClientId: _outlookAndroidClientId.text,
+      androidClientSecret: _outlookAndroidClientSecret.text,
+      androidRedirectUri: _outlookAndroidRedirectUri.text,
     );
     if (_error != null) return;
     if (gmail != null) providers.add(gmail);
@@ -7802,13 +7963,36 @@ class _OAuthProviderSettingsDialogState
     required String provider,
     required String clientId,
     required String clientSecret,
+    required String androidClientId,
+    required String androidClientSecret,
+    required String androidRedirectUri,
   }) {
     final id = clientId.trim();
     final secret = clientSecret.trim();
-    if (id.isEmpty && secret.isEmpty) return null;
+    final androidId = androidClientId.trim();
+    final androidSecret = androidClientSecret.trim();
+    final androidRedirect = androidRedirectUri.trim();
+    if (id.isEmpty &&
+        secret.isEmpty &&
+        androidId.isEmpty &&
+        androidSecret.isEmpty &&
+        androidRedirect.isEmpty) {
+      return null;
+    }
     if (id.isEmpty) {
+      if (secret.isNotEmpty) {
+        setState(
+          () => _error = 'Client ID is required when a client secret is set.',
+        );
+        return null;
+      }
+    }
+    if (androidId.isEmpty &&
+        (androidSecret.isNotEmpty || androidRedirect.isNotEmpty)) {
       setState(
-        () => _error = 'Client ID is required when a client secret is set.',
+        () =>
+            _error =
+                'Android client ID is required when Android OAuth values are set.',
       );
       return null;
     }
@@ -7816,6 +8000,9 @@ class _OAuthProviderSettingsDialogState
       provider: provider,
       clientId: id,
       clientSecret: secret,
+      androidClientId: androidId,
+      androidClientSecret: androidSecret,
+      androidRedirectUri: androidRedirect,
     ).normalized();
   }
 }
@@ -8245,8 +8432,14 @@ class _AddMailboxDialog extends StatefulWidget {
     required this.oauthClient,
     required this.gmailOAuthClientId,
     required this.gmailOAuthClientSecret,
+    required this.gmailAndroidOAuthClientId,
+    required this.gmailAndroidOAuthClientSecret,
+    required this.gmailAndroidOAuthRedirectUri,
     required this.outlookOAuthClientId,
     required this.outlookOAuthClientSecret,
+    required this.outlookAndroidOAuthClientId,
+    required this.outlookAndroidOAuthClientSecret,
+    required this.outlookAndroidOAuthRedirectUri,
   });
 
   final VaultDocument document;
@@ -8254,8 +8447,14 @@ class _AddMailboxDialog extends StatefulWidget {
   final OAuthLoopbackClient oauthClient;
   final String gmailOAuthClientId;
   final String gmailOAuthClientSecret;
+  final String gmailAndroidOAuthClientId;
+  final String gmailAndroidOAuthClientSecret;
+  final String gmailAndroidOAuthRedirectUri;
   final String outlookOAuthClientId;
   final String outlookOAuthClientSecret;
+  final String outlookAndroidOAuthClientId;
+  final String outlookAndroidOAuthClientSecret;
+  final String outlookAndroidOAuthRedirectUri;
 
   @override
   State<_AddMailboxDialog> createState() => _AddMailboxDialogState();
@@ -8430,6 +8629,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
                     final clientIdMissing =
                         _oauthClientIdForProvider(_provider).isEmpty;
                     final clientSecretMissing =
+                        !io.Platform.isAndroid &&
                         _provider == 'gmail' &&
                         _oauthClientSecretForProvider(_provider).isEmpty;
                     return Text(
@@ -8555,13 +8755,15 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
       if (clientId.isEmpty) {
         throw StateError('OAuth client id is not configured for $_provider.');
       }
+      final clientSecret = _oauthClientSecretForProvider(_provider);
       final oauthProvider = oauthProviderConfig(_provider);
       final vaultItemId = widget.vaultCrypto.newVaultItemId(address);
       final tokenSet = await widget.oauthClient.authorize(
         provider: oauthProvider,
         clientId: clientId,
-        clientSecret: _oauthClientSecretForProvider(_provider),
+        clientSecret: clientSecret,
         loginHint: address,
+        mobileRedirectUri: _oauthMobileRedirectUriForProvider(_provider),
       );
       final item = oauthMailboxItem(
         id: vaultItemId,
@@ -8569,6 +8771,8 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
         displayName: _displayName.text.trim(),
         provider: oauthProvider,
         tokenSet: tokenSet,
+        oauthClientId: clientId,
+        oauthClientSecret: clientSecret,
       );
       final credential = item.toCredential();
       _pendingCredential = credential;
@@ -8651,6 +8855,15 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
 
   String _oauthClientIdForProvider(String provider) {
     final vaultConfig = widget.document.oauthProviderFor(provider);
+    if (io.Platform.isAndroid) {
+      final androidClientId = vaultConfig?.androidClientId.trim() ?? '';
+      if (androidClientId.isNotEmpty) return androidClientId;
+      return switch (provider) {
+        'gmail' => widget.gmailAndroidOAuthClientId.trim(),
+        'outlook' => widget.outlookAndroidOAuthClientId.trim(),
+        _ => '',
+      };
+    }
     final vaultClientId = vaultConfig?.clientId.trim() ?? '';
     if (vaultClientId.isNotEmpty) return vaultClientId;
     return switch (provider) {
@@ -8662,6 +8875,16 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
 
   String _oauthClientSecretForProvider(String provider) {
     final vaultConfig = widget.document.oauthProviderFor(provider);
+    if (io.Platform.isAndroid) {
+      if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
+        return vaultConfig!.androidClientSecret.trim();
+      }
+      return switch (provider) {
+        'gmail' => widget.gmailAndroidOAuthClientSecret.trim(),
+        'outlook' => widget.outlookAndroidOAuthClientSecret.trim(),
+        _ => '',
+      };
+    }
     if (vaultConfig?.clientId.trim().isNotEmpty == true) {
       return vaultConfig!.clientSecret.trim();
     }
@@ -8670,6 +8893,30 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
       'outlook' => widget.outlookOAuthClientSecret.trim(),
       _ => '',
     };
+  }
+
+  Uri? _oauthMobileRedirectUriForProvider(String provider) {
+    if (!io.Platform.isAndroid) return null;
+    final vaultConfig = widget.document.oauthProviderFor(provider);
+    final vaultRedirectUri = vaultConfig?.androidRedirectUri.trim() ?? '';
+    if (vaultRedirectUri.isNotEmpty) {
+      return _parseOAuthRedirectUri(vaultRedirectUri);
+    }
+    final buildRedirectUri = switch (provider) {
+      'gmail' => widget.gmailAndroidOAuthRedirectUri.trim(),
+      'outlook' => widget.outlookAndroidOAuthRedirectUri.trim(),
+      _ => '',
+    };
+    if (buildRedirectUri.isEmpty) return null;
+    return _parseOAuthRedirectUri(buildRedirectUri);
+  }
+
+  Uri _parseOAuthRedirectUri(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null || !uri.hasScheme) {
+      throw StateError('Android OAuth redirect URI is invalid.');
+    }
+    return uri;
   }
 }
 
