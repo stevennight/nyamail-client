@@ -181,6 +181,8 @@ class _MailHomePageState extends State<MailHomePage>
   Future<void>? _oauthRefreshFuture;
   bool _claimingVaultShare = false;
   String? _banner;
+  bool _refreshingMail = false;
+  int? _refreshingMailRequestId;
   bool _mailUndoSnackBarVisible = false;
   int _mailUndoSnackBarGeneration = 0;
   int _nextPendingMailActionId = 0;
@@ -1115,16 +1117,26 @@ class _MailHomePageState extends State<MailHomePage>
       await _loadMoreMessages();
       return;
     }
+    if (_refreshingMail) return;
     final requestId = _nextMessageLoadGeneration();
     if (resetLimit) {
       _hasMoreMessages = true;
     }
-    await _showCachedMessages(requestId: requestId, resetSelection: resetLimit);
-    await _refreshMessagesInBackground(
-      requestId: requestId,
-      showErrors: true,
-      preserveSelection: !resetLimit,
-    );
+    _beginMailRefresh(requestId);
+    try {
+      await _showCachedMessages(
+        requestId: requestId,
+        resetSelection: resetLimit,
+      );
+      await _refreshMessagesInBackground(
+        requestId: requestId,
+        showErrors: true,
+        preserveSelection: !resetLimit,
+        showRefreshIndicator: false,
+      );
+    } finally {
+      _endMailRefresh(requestId);
+    }
   }
 
   int _nextMessageLoadGeneration() => ++_messageLoadGeneration;
@@ -1171,7 +1183,11 @@ class _MailHomePageState extends State<MailHomePage>
     bool showErrors = false,
     bool preserveSelection = true,
     bool suppressNewMailNotifications = false,
+    bool showRefreshIndicator = true,
   }) async {
+    if (showRefreshIndicator) {
+      _beginMailRefresh(requestId);
+    }
     try {
       await _refreshOAuthVaultIfNeeded();
       if (!_isCurrentMessageLoad(requestId)) return;
@@ -1209,7 +1225,27 @@ class _MailHomePageState extends State<MailHomePage>
         _loadingMore = false;
         _banner = 'Could not refresh mail: $error';
       });
+    } finally {
+      if (showRefreshIndicator) {
+        _endMailRefresh(requestId);
+      }
     }
+  }
+
+  void _beginMailRefresh(int requestId) {
+    if (!mounted) return;
+    setState(() {
+      _refreshingMail = true;
+      _refreshingMailRequestId = requestId;
+    });
+  }
+
+  void _endMailRefresh(int requestId) {
+    if (!mounted || _refreshingMailRequestId != requestId) return;
+    setState(() {
+      _refreshingMail = false;
+      _refreshingMailRequestId = null;
+    });
   }
 
   Future<void> _reloadMessages() async {
@@ -1322,7 +1358,8 @@ class _MailHomePageState extends State<MailHomePage>
                   compactShell ? _labelForMailboxView(_view, _accounts) : null,
               showFolderMenu: useFolderDrawer,
               onCompose: _accounts.isEmpty ? null : _showCompose,
-              onRefresh: _loadMessages,
+              onRefresh: _refreshingMail ? null : _loadMessages,
+              refreshing: _refreshingMail,
               onSettings: _showSettings,
             ),
             if (_banner != null)
@@ -1351,6 +1388,7 @@ class _MailHomePageState extends State<MailHomePage>
                       onSelect: _openMobileMessage,
                       canLoadMore: _canLoadMore,
                       loadingMore: _loadingMore,
+                      refreshing: _refreshingMail,
                       onLoadMore: _loadMoreMessages,
                       interactionSettings: _interactionSettings,
                       pinnedMessageIds: _pinnedMessageIds,
@@ -1400,6 +1438,7 @@ class _MailHomePageState extends State<MailHomePage>
                           onSelectAll: _selectAllVisibleMessages,
                           canLoadMore: _canLoadMore,
                           loadingMore: _loadingMore,
+                          refreshing: _refreshingMail,
                           onLoadMore: _loadMoreMessages,
                           supportsMobileSwipe: _supportsMobileSwipe,
                           supportsDesktopContextMenu:
@@ -4692,6 +4731,7 @@ class _TopBar extends StatelessWidget {
     required this.showFolderMenu,
     required this.onCompose,
     required this.onRefresh,
+    required this.refreshing,
     required this.onSettings,
   });
 
@@ -4700,7 +4740,8 @@ class _TopBar extends StatelessWidget {
   final String? compactTitle;
   final bool showFolderMenu;
   final VoidCallback? onCompose;
-  final VoidCallback onRefresh;
+  final VoidCallback? onRefresh;
+  final bool refreshing;
   final VoidCallback onSettings;
 
   @override
@@ -4745,9 +4786,9 @@ class _TopBar extends StatelessWidget {
           icon: const Icon(Icons.edit_outlined),
         ),
         IconButton(
-          tooltip: 'Refresh mail',
-          onPressed: onRefresh,
-          icon: const Icon(Icons.refresh),
+          tooltip: refreshing ? 'Refreshing mail...' : 'Refresh mail',
+          onPressed: refreshing ? null : onRefresh,
+          icon: _RefreshButtonIcon(refreshing: refreshing),
         ),
         IconButton(
           tooltip: 'Settings',
@@ -4782,9 +4823,9 @@ class _TopBar extends StatelessWidget {
           icon: const Icon(Icons.edit_outlined),
         ),
         IconButton(
-          tooltip: 'Refresh mail',
-          onPressed: onRefresh,
-          icon: const Icon(Icons.refresh),
+          tooltip: refreshing ? 'Refreshing mail...' : 'Refresh mail',
+          onPressed: refreshing ? null : onRefresh,
+          icon: _RefreshButtonIcon(refreshing: refreshing),
         ),
         IconButton(
           tooltip: 'Settings',
@@ -4792,6 +4833,21 @@ class _TopBar extends StatelessWidget {
           icon: const Icon(Icons.settings_outlined),
         ),
       ],
+    );
+  }
+}
+
+class _RefreshButtonIcon extends StatelessWidget {
+  const _RefreshButtonIcon({required this.refreshing});
+
+  final bool refreshing;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!refreshing) return const Icon(Icons.refresh);
+    return const SizedBox.square(
+      dimension: 20,
+      child: CircularProgressIndicator(strokeWidth: 2),
     );
   }
 }
@@ -5549,6 +5605,7 @@ class _MessageList extends StatefulWidget {
     required this.onSelectAll,
     required this.canLoadMore,
     required this.loadingMore,
+    required this.refreshing,
     required this.onLoadMore,
     required this.supportsMobileSwipe,
     required this.supportsDesktopContextMenu,
@@ -5574,6 +5631,7 @@ class _MessageList extends StatefulWidget {
   final VoidCallback onSelectAll;
   final bool canLoadMore;
   final bool loadingMore;
+  final bool refreshing;
   final VoidCallback onLoadMore;
   final bool supportsMobileSwipe;
   final bool supportsDesktopContextMenu;
@@ -5691,6 +5749,7 @@ class _MessageListState extends State<_MessageList> {
                   isEmpty: widget.messages.isEmpty,
                   canLoadMore: widget.canLoadMore,
                   loadingMore: widget.loadingMore,
+                  refreshing: widget.refreshing,
                   onLoadMore: widget.onLoadMore,
                 );
               }
@@ -6271,17 +6330,37 @@ class _MessageListFooter extends StatelessWidget {
     required this.isEmpty,
     required this.canLoadMore,
     required this.loadingMore,
+    required this.refreshing,
     required this.onLoadMore,
   });
 
   final bool isEmpty;
   final bool canLoadMore;
   final bool loadingMore;
+  final bool refreshing;
   final VoidCallback onLoadMore;
 
   @override
   Widget build(BuildContext context) {
     final labelStyle = Theme.of(context).textTheme.labelMedium;
+    if (isEmpty && refreshing) {
+      return SizedBox(
+        height: 260,
+        child: Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox.square(
+                dimension: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 10),
+              Text('Refreshing mail...', style: labelStyle),
+            ],
+          ),
+        ),
+      );
+    }
     if (loadingMore) {
       return Padding(
         padding: const EdgeInsets.all(16),
@@ -8326,6 +8405,7 @@ class _MobileInbox extends StatelessWidget {
     required this.onSelect,
     required this.canLoadMore,
     required this.loadingMore,
+    required this.refreshing,
     required this.onLoadMore,
     required this.interactionSettings,
     required this.pinnedMessageIds,
@@ -8348,6 +8428,7 @@ class _MobileInbox extends StatelessWidget {
   final ValueChanged<MailMessage> onSelect;
   final bool canLoadMore;
   final bool loadingMore;
+  final bool refreshing;
   final VoidCallback onLoadMore;
   final MailInteractionSettings interactionSettings;
   final Set<String> pinnedMessageIds;
@@ -8384,6 +8465,7 @@ class _MobileInbox extends StatelessWidget {
       onSelectAll: onSelectAll,
       canLoadMore: canLoadMore,
       loadingMore: loadingMore,
+      refreshing: refreshing,
       onLoadMore: onLoadMore,
       supportsMobileSwipe: supportsMobileSwipe,
       supportsDesktopContextMenu: supportsDesktopContextMenu,
