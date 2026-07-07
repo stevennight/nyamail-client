@@ -136,7 +136,7 @@ html {
   background: ${palette.canvas};
   width: 100%;
   max-width: 100%;
-  overflow-x: auto;
+  overflow-x: hidden;
 }
 * {
   box-sizing: border-box;
@@ -147,7 +147,7 @@ body {
   min-width: 0 !important;
   width: 100%;
   max-width: 100%;
-  overflow-x: auto;
+  overflow-x: hidden;
   overflow-wrap: anywhere;
   word-break: break-word;
   color: ${palette.text};
@@ -162,7 +162,6 @@ img, video, canvas, svg, iframe {
   height: auto !important;
 }
 table {
-  max-width: 100% !important;
   border-collapse: collapse;
 }
 tbody, thead, tfoot, tr, td, th {
@@ -181,6 +180,14 @@ pre {
 code {
   overflow-wrap: anywhere;
 }
+.nyamail-scale-frame {
+  width: 100%;
+  overflow: hidden;
+}
+.nyamail-fit-root {
+  min-width: 100%;
+  transform-origin: top left;
+}
 .nyamail-img-placeholder {
   display: inline-flex;
   align-items: center;
@@ -196,7 +203,7 @@ code {
 }
 </style>
 </head>
-<body>$body</body>
+<body><div id="nyamail-scale-frame" class="nyamail-scale-frame"><div id="nyamail-fit-root" class="nyamail-fit-root">$body</div></div></body>
 </html>
 ''';
   return MailHtmlRenderResult(

@@ -207,8 +207,9 @@ void main() {
       ),
     );
 
-    expect(rendered.html, contains('max-width: 100% !important'));
-    expect(rendered.html, contains('overflow-x: auto'));
+    expect(rendered.html, contains('id="nyamail-scale-frame"'));
+    expect(rendered.html, contains('id="nyamail-fit-root"'));
+    expect(rendered.html, contains('overflow-x: hidden'));
     expect(rendered.html, contains('word-break: break-word'));
   });
 

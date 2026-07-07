@@ -224,7 +224,6 @@ class _MailHtmlViewState extends State<MailHtmlView> {
       'canvas',
       'svg',
       'iframe',
-      'table',
       'pre'
     ];
     selectors.forEach(function(selector) {
@@ -240,6 +239,34 @@ class _MailHtmlViewState extends State<MailHtmlView> {
       setImportant(node, 'word-break', 'break-word');
       setImportant(node, 'overflow-wrap', 'anywhere');
     });
+    fitBodyToViewport();
+  }
+  function resetBodyFit(frame, root) {
+    root.style.transform = '';
+    root.style.width = '';
+    frame.style.height = '';
+    frame.dataset.nyamailScale = '1';
+  }
+  function fitBodyToViewport() {
+    var frame = document.getElementById('nyamail-scale-frame');
+    var root = document.getElementById('nyamail-fit-root');
+    if (!frame || !root) return;
+    resetBodyFit(frame, root);
+    var viewport = Math.max(
+      1,
+      frame.clientWidth || document.documentElement.clientWidth || window.innerWidth || 1
+    );
+    var contentWidth = Math.max(
+      root.scrollWidth || 0,
+      root.offsetWidth || 0,
+      root.getBoundingClientRect ? root.getBoundingClientRect().width || 0 : 0
+    );
+    if (contentWidth <= viewport + 1) return;
+    var scale = viewport / contentWidth;
+    if (!isFinite(scale) || scale <= 0 || scale >= 1) return;
+    root.style.transform = 'scale(' + scale + ')';
+    frame.style.height = Math.ceil((root.scrollHeight || root.offsetHeight || 0) * scale) + 'px';
+    frame.dataset.nyamailScale = scale.toFixed(4);
   }
   function heightOf(node) {
     if (!node) return 0;
