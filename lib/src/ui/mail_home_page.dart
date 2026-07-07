@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -25,6 +26,7 @@ import '../mail/mail_render_settings.dart';
 import '../mail/provider_presets.dart';
 import '../mail/mail_repository.dart';
 import '../mail/mail_transport.dart';
+import '../oauth/google_android_oauth_client.dart';
 import '../oauth/oauth_loopback_client.dart';
 import '../oauth/oauth_mailbox_builder.dart';
 import '../oauth/oauth_provider.dart';
@@ -53,6 +55,40 @@ import '../system/tray_service.dart';
 import 'mail_html_view.dart';
 
 const _maxOutgoingAttachmentBytes = 25 * 1024 * 1024;
+const _googleAndroidOAuthClient = GoogleAndroidOAuthClient();
+
+bool _usesGoogleAndroidOAuth(String provider) {
+  return !kIsWeb &&
+      io.Platform.isAndroid &&
+      normalizeOAuthProviderKey(provider) == 'gmail';
+}
+
+Future<OAuthTokenSet> _authorizeOAuthForCurrentPlatform({
+  required OAuthLoopbackClient oauthClient,
+  required OAuthProviderConfig provider,
+  required String clientId,
+  String? clientSecret,
+  String? loginHint,
+  Uri? mobileRedirectUri,
+  OAuthAuthorizationProgressCallback? onProgress,
+}) {
+  if (_usesGoogleAndroidOAuth(provider.provider)) {
+    return _googleAndroidOAuthClient.authorize(
+      provider: provider,
+      clientId: clientId,
+      loginHint: loginHint,
+      onProgress: onProgress,
+    );
+  }
+  return oauthClient.authorize(
+    provider: provider,
+    clientId: clientId,
+    clientSecret: clientSecret,
+    loginHint: loginHint,
+    mobileRedirectUri: mobileRedirectUri,
+    onProgress: onProgress,
+  );
+}
 
 class MailHomePage extends StatefulWidget {
   const MailHomePage({
@@ -1822,10 +1858,12 @@ class _MailHomePageState extends State<MailHomePage> {
               provider.provider,
             ),
       );
-      final tokenSet = await widget.oauthClient.authorize(
+      final clientSecret = _oauthClientSecretForProvider(item.provider);
+      final tokenSet = await _authorizeOAuthForCurrentPlatform(
+        oauthClient: widget.oauthClient,
         provider: provider,
         clientId: clientId,
-        clientSecret: _oauthClientSecretForProvider(item.provider),
+        clientSecret: clientSecret,
         loginHint: item.address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(item.provider),
         onProgress: (progress) {
@@ -1844,7 +1882,12 @@ class _MailHomePageState extends State<MailHomePage> {
         provider: provider.provider,
         username: item.username.trim().isEmpty ? item.address : item.username,
         secret: tokenSet.accessToken,
-        refreshToken: tokenSet.refreshToken ?? item.refreshToken,
+        refreshToken:
+            tokenSet.refreshToken?.isNotEmpty == true
+                ? tokenSet.refreshToken!
+                : _usesGoogleAndroidOAuth(provider.provider)
+                ? ''
+                : item.refreshToken,
         tokenExpiresAt:
             tokenSet.expiresIn == null
                 ? item.tokenExpiresAt
@@ -1853,7 +1896,7 @@ class _MailHomePageState extends State<MailHomePage> {
                 ),
         tokenScope: tokenSet.scope ?? item.tokenScope,
         oauthClientId: clientId,
-        oauthClientSecret: _oauthClientSecretForProvider(item.provider),
+        oauthClientSecret: clientSecret,
         imapHost:
             item.imapHost.trim().isEmpty ? provider.imapHost : item.imapHost,
         imapPort: item.imapPort,
@@ -1895,6 +1938,7 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Uri? _oauthMobileRedirectUriForProvider(String provider) {
     if (kIsWeb || !io.Platform.isAndroid) return null;
+    if (_usesGoogleAndroidOAuth(provider)) return null;
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
     final redirect = vaultConfig?.androidRedirectUri.trim() ?? '';
     final value =
@@ -3048,6 +3092,7 @@ class _MailHomePageState extends State<MailHomePage> {
   }
 
   String _oauthClientSecretForProvider(String provider) {
+    if (_usesGoogleAndroidOAuth(provider)) return '';
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
     if (io.Platform.isAndroid) {
       if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
@@ -5095,35 +5140,65 @@ class _SwipeActionTile extends StatefulWidget {
 }
 
 class _SwipeActionTileState extends State<_SwipeActionTile> {
-  static const _level1Threshold = 0.20;
-  static const _level2Threshold = 0.48;
-  static const _maxVisualOffset = 112.0;
+  static const _actionPaneWidth = 72.0;
+  static const _resetDuration = Duration(milliseconds: 180);
 
   double _dragDx = 0;
+  bool _dragging = false;
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final width = constraints.maxWidth <= 0 ? 1.0 : constraints.maxWidth;
-        final action = _currentAction(width);
+        final selection = _currentSelection(width);
+        final visualDx = _visualOffset(width);
+        final direction = _swipeDirection;
         return GestureDetector(
           behavior: HitTestBehavior.translucent,
+          onHorizontalDragStart:
+              (_) => setState(() {
+                _dragging = true;
+              }),
           onHorizontalDragUpdate:
               (details) => setState(() {
-                _dragDx += details.primaryDelta ?? 0;
+                final next = _dragDx + (details.primaryDelta ?? 0);
+                _dragDx =
+                    next
+                        .clamp(
+                          -_maxDragDistance(width),
+                          _maxDragDistance(width),
+                        )
+                        .toDouble();
               }),
           onHorizontalDragEnd: (_) => _finishDrag(width),
-          onHorizontalDragCancel: () => setState(() => _dragDx = 0),
+          onHorizontalDragCancel: _resetDrag,
           child: Stack(
+            clipBehavior: Clip.hardEdge,
             children: [
-              Positioned.fill(child: _SwipeActionBackground(action: action)),
-              Transform.translate(
-                offset: Offset(
-                  _dragDx.clamp(-_maxVisualOffset, _maxVisualOffset),
-                  0,
+              Positioned.fill(
+                child: _SwipeActionBackground(
+                  direction: direction,
+                  revealExtent: visualDx.abs(),
+                  level1Action:
+                      direction == _SwipeDirection.leftToRight
+                          ? widget.leftLevel1
+                          : widget.rightLevel1,
+                  level2Action:
+                      direction == _SwipeDirection.leftToRight
+                          ? widget.leftLevel2
+                          : widget.rightLevel2,
+                  activeAction: selection?.action,
                 ),
-                child: widget.child,
+              ),
+              AnimatedContainer(
+                duration: _dragging ? Duration.zero : _resetDuration,
+                curve: Curves.easeOutCubic,
+                transform: Matrix4.translationValues(visualDx, 0, 0),
+                child: ColoredBox(
+                  color: Theme.of(context).colorScheme.surface,
+                  child: widget.child,
+                ),
               ),
             ],
           ),
@@ -5132,52 +5207,168 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
     );
   }
 
-  MailListActionPreference? _currentAction(double width) {
-    final fraction = (_dragDx.abs() / width).clamp(0, 1);
-    if (fraction < _level1Threshold) return null;
-    final level2 = fraction >= _level2Threshold;
+  _SwipeActionSelection? _currentSelection(double width) {
+    final distance = _dragDx.abs();
+    if (distance < _level1Distance(width)) return null;
+    final level2 = distance >= _level2Distance(width);
+    final direction = _swipeDirection;
+    if (direction == null) return null;
     if (_dragDx < 0) {
-      return level2 ? widget.rightLevel2 : widget.rightLevel1;
+      return _SwipeActionSelection(
+        action: level2 ? widget.rightLevel2 : widget.rightLevel1,
+      );
     }
-    return level2 ? widget.leftLevel2 : widget.leftLevel1;
+    return _SwipeActionSelection(
+      action: level2 ? widget.leftLevel2 : widget.leftLevel1,
+    );
   }
 
   Future<void> _finishDrag(double width) async {
-    final action = _currentAction(width);
-    setState(() => _dragDx = 0);
-    if (action != null) {
-      await widget.onAction(action);
+    final selection = _currentSelection(width);
+    _resetDrag();
+    if (selection != null) {
+      await widget.onAction(selection.action);
     }
+  }
+
+  void _resetDrag() {
+    if (!mounted) return;
+    setState(() {
+      _dragging = false;
+      _dragDx = 0;
+    });
+  }
+
+  _SwipeDirection? get _swipeDirection {
+    if (_dragDx > 0) return _SwipeDirection.leftToRight;
+    if (_dragDx < 0) return _SwipeDirection.rightToLeft;
+    return null;
+  }
+
+  double _visualOffset(double width) {
+    return _dragDx
+        .clamp(-_maxVisualOffset(width), _maxVisualOffset(width))
+        .toDouble();
+  }
+
+  double _level1Distance(double width) {
+    return math.min(width * 0.16, 56.0);
+  }
+
+  double _level2Distance(double width) {
+    final responsive = math.min(width * 0.36, 132.0);
+    return math.max(_level1Distance(width) + 44.0, responsive);
+  }
+
+  double _maxVisualOffset(double width) {
+    return math.min(width * 0.58, _actionPaneWidth * 2.25);
+  }
+
+  double _maxDragDistance(double width) {
+    return math.min(width * 0.72, _actionPaneWidth * 3);
   }
 }
 
-class _SwipeActionBackground extends StatelessWidget {
-  const _SwipeActionBackground({required this.action});
+enum _SwipeDirection { leftToRight, rightToLeft }
 
-  final MailListActionPreference? action;
+class _SwipeActionSelection {
+  const _SwipeActionSelection({required this.action});
+
+  final MailListActionPreference action;
+}
+
+class _SwipeActionBackground extends StatelessWidget {
+  const _SwipeActionBackground({
+    required this.direction,
+    required this.revealExtent,
+    required this.level1Action,
+    required this.level2Action,
+    required this.activeAction,
+  });
+
+  final _SwipeDirection? direction;
+  final double revealExtent;
+  final MailListActionPreference level1Action;
+  final MailListActionPreference level2Action;
+  final MailListActionPreference? activeAction;
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final resolvedAction = action ?? MailListActionPreference.pin;
+    final resolvedDirection = direction;
+    if (resolvedDirection == null || revealExtent <= 0) {
+      return const SizedBox.shrink();
+    }
+    final firstWidth = math.min(
+      revealExtent,
+      _SwipeActionTileState._actionPaneWidth,
+    );
+    final secondWidth = math.max(0.0, revealExtent - firstWidth);
+    final firstPane = _SwipeActionPane(
+      action: level1Action,
+      width: firstWidth,
+      active: activeAction == level1Action,
+    );
+    final secondPane = _SwipeActionPane(
+      action: level2Action,
+      width: secondWidth,
+      active: activeAction == level2Action,
+    );
+    final panes =
+        resolvedDirection == _SwipeDirection.leftToRight
+            ? [firstPane, secondPane]
+            : [secondPane, firstPane];
     return ColoredBox(
-      color:
-          action == null
-              ? Colors.transparent
-              : _mailListActionColor(resolvedAction, colorScheme),
+      color: Colors.transparent,
       child: Align(
-        alignment: Alignment.center,
-        child:
-            action == null
-                ? const SizedBox.shrink()
-                : Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(_mailListActionIcon(resolvedAction), size: 18),
-                    const SizedBox(width: 8),
-                    Text(_mailListActionLabel(resolvedAction)),
-                  ],
-                ),
+        alignment:
+            resolvedDirection == _SwipeDirection.leftToRight
+                ? Alignment.centerLeft
+                : Alignment.centerRight,
+        child: SizedBox(
+          width: revealExtent,
+          child: Row(mainAxisSize: MainAxisSize.min, children: panes),
+        ),
+      ),
+    );
+  }
+}
+
+class _SwipeActionPane extends StatelessWidget {
+  const _SwipeActionPane({
+    required this.action,
+    required this.width,
+    required this.active,
+  });
+
+  final MailListActionPreference action;
+  final double width;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    if (width <= 0) return const SizedBox.shrink();
+    final colorScheme = Theme.of(context).colorScheme;
+    final progress =
+        (width / _SwipeActionTileState._actionPaneWidth)
+            .clamp(0.0, 1.0)
+            .toDouble();
+    return SizedBox(
+      width: width,
+      child: ColoredBox(
+        color: _mailListActionColor(action, colorScheme),
+        child: Center(
+          child: Opacity(
+            opacity: progress,
+            child: Transform.scale(
+              scale: active ? 1.08 : 0.9 + (0.1 * progress),
+              child: Icon(
+                _mailListActionIcon(action),
+                color: _mailListActionForegroundColor(action, colorScheme),
+                size: active ? 24 : 22,
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -8953,9 +9144,15 @@ class _OAuthProviderSettingsDialogState
     final textTheme = Theme.of(context).textTheme;
     final colorScheme = Theme.of(context).colorScheme;
     final showAndroidFields = _showAndroidOAuthFields;
+    final usesNativeGoogleAndroid =
+        showAndroidFields && normalizeOAuthProviderKey(provider) == 'gmail';
     final activeFallbackStatus =
         showAndroidFields
-            ? _fallbackStatus(androidBuildClientId, androidBuildClientSecret)
+            ? _androidFallbackStatus(
+              provider,
+              androidBuildClientId,
+              androidBuildClientSecret,
+            )
             : _fallbackStatus(buildClientId, buildClientSecret);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -9052,74 +9249,90 @@ class _OAuthProviderSettingsDialogState
             ),
           ),
           const SizedBox(height: 10),
-          TextField(
-            controller: androidClientSecret,
-            obscureText: !showAndroidSecret,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: InputDecoration(
-              labelText: 'Android client secret',
-              prefixIcon: const Icon(Icons.key_outlined),
-              suffixIcon: IconButton(
-                tooltip:
-                    showAndroidSecret
-                        ? 'Hide Android secret'
-                        : 'Show Android secret',
-                onPressed: onToggleAndroidSecret,
-                icon: Icon(
-                  showAndroidSecret
-                      ? Icons.visibility_off_outlined
-                      : Icons.visibility_outlined,
+          if (usesNativeGoogleAndroid) ...[
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Google Android OAuth uses package name and SHA-1. It does not use an Android client secret or custom redirect URI.',
+                style: textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
                 ),
               ),
             ),
-          ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: androidRedirectUri,
-            keyboardType: TextInputType.url,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: InputDecoration(
-              labelText: 'Android redirect URI',
-              hintText: _androidRedirectUriHint(provider),
-              prefixIcon: const Icon(Icons.link_outlined),
-              suffixIcon: IconButton(
-                tooltip: 'Copy provider redirect URI',
-                onPressed:
-                    () => _copyAndroidRedirectUri(
-                      provider: provider,
-                      controller: androidRedirectUri,
-                      androidBuildRedirectUri: androidBuildRedirectUri,
-                    ),
-                icon: const Icon(Icons.content_copy),
+          ] else ...[
+            const SizedBox(height: 10),
+            TextField(
+              controller: androidClientSecret,
+              obscureText: !showAndroidSecret,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
+                labelText: 'Android client secret',
+                prefixIcon: const Icon(Icons.key_outlined),
+                suffixIcon: IconButton(
+                  tooltip:
+                      showAndroidSecret
+                          ? 'Hide Android secret'
+                          : 'Show Android secret',
+                  onPressed: onToggleAndroidSecret,
+                  icon: Icon(
+                    showAndroidSecret
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined,
+                  ),
+                ),
               ),
             ),
-          ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: androidRedirectUri,
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
+                labelText: 'Android redirect URI',
+                hintText: _androidRedirectUriHint(provider),
+                prefixIcon: const Icon(Icons.link_outlined),
+                suffixIcon: IconButton(
+                  tooltip: 'Copy provider redirect URI',
+                  onPressed:
+                      () => _copyAndroidRedirectUri(
+                        provider: provider,
+                        controller: androidRedirectUri,
+                        androidBuildRedirectUri: androidBuildRedirectUri,
+                      ),
+                  icon: const Icon(Icons.content_copy),
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 6),
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              'Android fallback: ${_fallbackStatus(androidBuildClientId, androidBuildClientSecret)}'
-              '${androidBuildRedirectUri.trim().isEmpty ? '' : ', redirect URI configured'}',
+              'Android fallback: ${_androidFallbackStatus(provider, androidBuildClientId, androidBuildClientSecret)}'
+              '${usesNativeGoogleAndroid || androidBuildRedirectUri.trim().isEmpty ? '' : ', redirect URI configured'}',
               style: textTheme.bodySmall?.copyWith(
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
           ),
-          const SizedBox(height: 6),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              _androidRedirectProviderNote(
-                provider: provider,
-                androidBuildRedirectUri: androidBuildRedirectUri,
-              ),
-              style: textTheme.bodySmall?.copyWith(
-                color: colorScheme.onSurfaceVariant,
+          if (!usesNativeGoogleAndroid) ...[
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                _androidRedirectProviderNote(
+                  provider: provider,
+                  androidBuildRedirectUri: androidBuildRedirectUri,
+                ),
+                style: textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ],
     );
@@ -9187,6 +9400,19 @@ class _OAuthProviderSettingsDialogState
     return 'not configured';
   }
 
+  String _androidFallbackStatus(
+    String provider,
+    String clientId,
+    String clientSecret,
+  ) {
+    if (normalizeOAuthProviderKey(provider) == 'gmail') {
+      return clientId.trim().isEmpty
+          ? 'not configured'
+          : 'Android client id configured';
+    }
+    return _fallbackStatus(clientId, clientSecret);
+  }
+
   void _save() {
     _error = null;
     final providers = [..._extraProviders];
@@ -9221,11 +9447,15 @@ class _OAuthProviderSettingsDialogState
     required String androidClientSecret,
     required String androidRedirectUri,
   }) {
+    final normalizedProvider = normalizeOAuthProviderKey(provider);
+    final usesNativeGoogleAndroid = normalizedProvider == 'gmail';
     final id = clientId.trim();
     final secret = clientSecret.trim();
     final androidId = androidClientId.trim();
-    final androidSecret = androidClientSecret.trim();
-    final androidRedirect = androidRedirectUri.trim();
+    final androidSecret =
+        usesNativeGoogleAndroid ? '' : androidClientSecret.trim();
+    final androidRedirect =
+        usesNativeGoogleAndroid ? '' : androidRedirectUri.trim();
     if (id.isEmpty &&
         secret.isEmpty &&
         androidId.isEmpty &&
@@ -9251,7 +9481,7 @@ class _OAuthProviderSettingsDialogState
       return null;
     }
     return VaultOAuthProviderConfig(
-      provider: provider,
+      provider: normalizedProvider,
       clientId: id,
       clientSecret: secret,
       androidClientId: androidId,
@@ -10283,6 +10513,8 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
                           ? 'OAuth client id is not configured for this provider.'
                           : clientSecretMissing
                           ? 'Google Desktop OAuth may require the client secret from Google Cloud.'
+                          : _usesGoogleAndroidOAuth(_provider)
+                          ? 'Android will use Google account authorization.'
                           : 'OAuth will open the provider in your browser.',
                       style: TextStyle(
                         color:
@@ -10428,7 +10660,8 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
       final clientSecret = _oauthClientSecretForProvider(_provider);
       final oauthProvider = oauthProviderConfig(_provider);
       final vaultItemId = widget.vaultCrypto.newVaultItemId(address);
-      final tokenSet = await widget.oauthClient.authorize(
+      final tokenSet = await _authorizeOAuthForCurrentPlatform(
+        oauthClient: widget.oauthClient,
         provider: oauthProvider,
         clientId: clientId,
         clientSecret: clientSecret,
@@ -10578,6 +10811,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   }
 
   String _oauthClientSecretForProvider(String provider) {
+    if (_usesGoogleAndroidOAuth(provider)) return '';
     final vaultConfig = widget.document.oauthProviderFor(provider);
     if (io.Platform.isAndroid) {
       if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
@@ -10601,6 +10835,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
 
   Uri? _oauthMobileRedirectUriForProvider(String provider) {
     if (!io.Platform.isAndroid) return null;
+    if (_usesGoogleAndroidOAuth(provider)) return null;
     final vaultConfig = widget.document.oauthProviderFor(provider);
     final vaultRedirectUri = vaultConfig?.androidRedirectUri.trim() ?? '';
     if (vaultRedirectUri.isNotEmpty) {
@@ -10722,6 +10957,20 @@ Color _mailListActionColor(
     MailListActionPreference.toggleRead ||
     MailListActionPreference.archive ||
     MailListActionPreference.moveToInbox => colorScheme.primaryContainer,
+  };
+}
+
+Color _mailListActionForegroundColor(
+  MailListActionPreference action,
+  ColorScheme colorScheme,
+) {
+  return switch (action) {
+    MailListActionPreference.delete => colorScheme.onErrorContainer,
+    MailListActionPreference.toggleStar => colorScheme.onTertiaryContainer,
+    MailListActionPreference.pin ||
+    MailListActionPreference.toggleRead ||
+    MailListActionPreference.archive ||
+    MailListActionPreference.moveToInbox => colorScheme.onPrimaryContainer,
   };
 }
 
