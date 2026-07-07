@@ -3877,6 +3877,10 @@ class _MailHomePageState extends State<MailHomePage>
       description: description,
       messages: List.unmodifiable(actionable),
       messageIds: Set.unmodifiable(actionable.map((message) => message.id)),
+      displayOrder: Map.unmodifiable({
+        for (var index = 0; index < _messages.length; index++)
+          _messages[index].id: index,
+      }),
       commitRemote: () => commitRemote(actionable),
     );
     _pendingMailActions[action.id] = action;
@@ -3936,7 +3940,7 @@ class _MailHomePageState extends State<MailHomePage>
     action.undone = true;
     action.timer?.cancel();
     action.closePrompt?.call();
-    _restorePendingMessages(action.messages);
+    _restorePendingMessages(action.messages, displayOrder: action.displayOrder);
     _showTransientNotice('Mail action undone.');
   }
 
@@ -3965,6 +3969,7 @@ class _MailHomePageState extends State<MailHomePage>
         action.messages
             .where((message) => !committedIds.contains(message.id))
             .toList(growable: false),
+        displayOrder: action.displayOrder,
       );
       _showTransientNotice('Could not sync mail action: $cause', error: true);
     }
@@ -3983,7 +3988,10 @@ class _MailHomePageState extends State<MailHomePage>
     }
   }
 
-  void _restorePendingMessages(List<MailMessage> messages) {
+  void _restorePendingMessages(
+    List<MailMessage> messages, {
+    Map<String, int> displayOrder = const {},
+  }) {
     if (!mounted || messages.isEmpty) return;
     final hidden = _pendingRemovedMessageIds;
     final restorable = messages
@@ -4006,8 +4014,23 @@ class _MailHomePageState extends State<MailHomePage>
         merged.add(restored ?? message);
         seen.add(message.id);
       }
-      for (final message in restorable) {
-        if (seen.add(message.id)) merged.add(message);
+      final missing = [
+        for (final message in restorable)
+          if (!seen.contains(message.id)) message,
+      ]..sort(
+        (a, b) => (displayOrder[a.id] ?? _messages.length).compareTo(
+          displayOrder[b.id] ?? _messages.length,
+        ),
+      );
+      for (final message in missing) {
+        if (!seen.add(message.id)) continue;
+        final preferredIndex = displayOrder[message.id];
+        if (preferredIndex == null) {
+          merged.add(message);
+          continue;
+        }
+        final insertIndex = preferredIndex.clamp(0, merged.length).toInt();
+        merged.insert(insertIndex, message);
       }
       _messages = _sortMessagesForDisplay(merged);
       _selected = _messageFor(_messages, _selected?.id, fallbackToFirst: false);
@@ -4439,6 +4462,7 @@ class _PendingMailAction {
     required this.description,
     required this.messages,
     required this.messageIds,
+    required this.displayOrder,
     required this.commitRemote,
   });
 
@@ -4446,6 +4470,7 @@ class _PendingMailAction {
   final String description;
   final List<MailMessage> messages;
   final Set<String> messageIds;
+  final Map<String, int> displayOrder;
   final Future<Set<String>> Function() commitRemote;
   Timer? timer;
   VoidCallback? closePrompt;
