@@ -180,6 +180,8 @@ class _MailHomePageState extends State<MailHomePage> {
   Future<void>? _oauthRefreshFuture;
   bool _claimingVaultShare = false;
   String? _banner;
+  bool _mailUndoSnackBarVisible = false;
+  int _mailUndoSnackBarGeneration = 0;
   String? _pendingPairingPackage;
   final _startupService = const StartupService();
   final _systemSettingsStore = const SystemBehaviorSettingsStore();
@@ -209,6 +211,42 @@ class _MailHomePageState extends State<MailHomePage> {
     unawaited(_trayService.dispose());
     _search.dispose();
     super.dispose();
+  }
+
+  void _showTransientNotice(
+    String message, {
+    bool error = false,
+    Duration duration = const Duration(seconds: 4),
+  }) {
+    if (!mounted) return;
+    final colorScheme = Theme.of(context).colorScheme;
+    final messenger = ScaffoldMessenger.of(context);
+    if (!_mailUndoSnackBarVisible) {
+      messenger.hideCurrentSnackBar();
+    }
+    messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: duration,
+        backgroundColor: error ? colorScheme.error : null,
+        content: Row(
+          children: [
+            Icon(
+              error ? Icons.error_outline : Icons.check_circle_outline,
+              color: error ? colorScheme.onError : colorScheme.inversePrimary,
+              size: 20,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: error ? TextStyle(color: colorScheme.onError) : null,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _loadSystemBehaviorSettings() async {
@@ -920,7 +958,7 @@ class _MailHomePageState extends State<MailHomePage> {
       if (!mounted) return;
       if (!result.updateAvailable || result.latest == null) {
         if (!silent) {
-          setState(() => _banner = 'NyaMail is up to date.');
+          _showTransientNotice('NyaMail is up to date.');
         }
         return;
       }
@@ -947,9 +985,8 @@ class _MailHomePageState extends State<MailHomePage> {
       final file = await widget.releaseService.downloadAndVerify(artifact);
       await widget.releaseService.openDownloadedFile(file);
       if (!mounted) return;
-      setState(() {
-        _banner = 'Update downloaded, verified, and opened: ${file.path}';
-      });
+      setState(() => _banner = null);
+      _showTransientNotice('Update downloaded, verified, and opened.');
     } catch (_) {
       if (!silent && mounted) {
         setState(() => _banner = 'Could not complete the update.');
@@ -1248,18 +1285,25 @@ class _MailHomePageState extends State<MailHomePage> {
             _TopBar(
               session: _session,
               profile: _profile,
-              banner: _banner,
               compactTitle:
                   compactShell ? _labelForMailboxView(_view, _accounts) : null,
               showFolderMenu: useFolderDrawer,
-              onShowPairingQr:
-                  _pendingPairingPackage == null
-                      ? null
-                      : () => _showPairingQr(_pendingPairingPackage!),
               onCompose: _accounts.isEmpty ? null : _showCompose,
               onRefresh: _loadMessages,
               onSettings: _showSettings,
             ),
+            if (_banner != null)
+              _InlineNoticeBanner(
+                message: _banner!,
+                actionIcon:
+                    _pendingPairingPackage == null ? null : Icons.qr_code_2,
+                actionTooltip: 'Show pairing QR',
+                onAction:
+                    _pendingPairingPackage == null
+                        ? null
+                        : () => _showPairingQr(_pendingPairingPackage!),
+                onDismiss: () => setState(() => _banner = null),
+              ),
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
@@ -2047,8 +2091,9 @@ class _MailHomePageState extends State<MailHomePage> {
       _messages = messages;
       _selected = _messageFor(messages, null);
       _selectedMessageIds = const <String>{};
-      _banner = 'Local data cleared on this device.';
+      _banner = null;
     });
+    _showTransientNotice('Local data cleared on this device.');
     _ensureSelectedMessageBody();
   }
 
@@ -2118,8 +2163,9 @@ class _MailHomePageState extends State<MailHomePage> {
         _selectedMessageIds = const <String>{};
         _hasMoreMessages = page.hasMore;
         _loadingMore = false;
-        _banner = 'Mail cache cleared. Rebuilding from mail servers.';
+        _banner = null;
       });
+      _showTransientNotice('Mail cache cleared. Rebuilding from mail servers.');
       return true;
     } catch (error) {
       if (_isCurrentMessageLoad(requestId)) {
@@ -2221,9 +2267,12 @@ class _MailHomePageState extends State<MailHomePage> {
           result.requiresApproval
               ? 'This device needs approval. Pair $pairingCode. Pairing package copied.'
               : result.recoveryCodes.isEmpty
-              ? 'Sync connected as ${result.email}.'
+              ? null
               : 'Recovery codes created. Store them before closing this build.';
     });
+    if (!result.requiresApproval && result.recoveryCodes.isEmpty && mounted) {
+      _showTransientNotice('Sync connected as ${result.email}.');
+    }
     if (result.recoveryCodes.isNotEmpty) {
       await _showRecoveryCodes(result.recoveryCodes);
       if (!mounted) return;
@@ -2377,8 +2426,11 @@ class _MailHomePageState extends State<MailHomePage> {
       _messages = messages;
       _selected = _messageFor(messages, _selected?.id);
       _selectedMessageIds = const <String>{};
-      _banner = 'This device left sync. Local vault remains available.';
+      _banner = null;
     });
+    _showTransientNotice(
+      'This device left sync. Local vault remains available.',
+    );
     _ensureSelectedMessageBody();
   }
 
@@ -2412,8 +2464,11 @@ class _MailHomePageState extends State<MailHomePage> {
       _messages = messages;
       _selected = _messageFor(messages, null);
       _selectedMessageIds = const <String>{};
-      _banner = 'Sync server disconnected. Local vault remains available.';
+      _banner = null;
     });
+    _showTransientNotice(
+      'Sync server disconnected. Local vault remains available.',
+    );
     _ensureSelectedMessageBody();
   }
 
@@ -2828,10 +2883,8 @@ class _MailHomePageState extends State<MailHomePage> {
       if (mounted && !silent) {
         final conflictText =
             result.conflicts == 0 ? '' : ', conflicts ${result.conflicts}';
-        setState(
-          () =>
-              _banner =
-                  'Vault sync complete. Pushed ${result.pushed}, pulled ${result.pulled}$conflictText.',
+        _showTransientNotice(
+          'Vault sync complete. Pushed ${result.pushed}, pulled ${result.pulled}$conflictText.',
         );
       }
       return true;
@@ -2876,9 +2929,14 @@ class _MailHomePageState extends State<MailHomePage> {
     setState(() {
       _banner =
           synced || _session == null
-              ? '${added.mailbox.address} was added to the local encrypted vault.'
+              ? null
               : '${added.mailbox.address} was added locally. Sync will retry later.';
     });
+    if (synced || _session == null) {
+      _showTransientNotice(
+        '${added.mailbox.address} was added to the local encrypted vault.',
+      );
+    }
   }
 
   Future<void> _deleteMailbox(MailAccount account) async {
@@ -2940,13 +2998,17 @@ class _MailHomePageState extends State<MailHomePage> {
       await _applyVaultDocument(updatedDocument);
       final synced = await _syncVaultRecordsWithServer(silent: true);
       if (!mounted) return;
-      setState(
-        () =>
-            _banner =
-                synced || session == null
-                    ? '${account.address} was removed from the local encrypted vault.'
-                    : '${account.address} was removed locally. Sync will retry later.',
-      );
+      setState(() {
+        _banner =
+            synced || session == null
+                ? null
+                : '${account.address} was removed locally. Sync will retry later.';
+      });
+      if (synced || session == null) {
+        _showTransientNotice(
+          '${account.address} was removed from the local encrypted vault.',
+        );
+      }
     } catch (error) {
       if (mounted) {
         setState(() => _banner = 'Could not remove mailbox: $error');
@@ -3218,7 +3280,7 @@ class _MailHomePageState extends State<MailHomePage> {
       attachments: attachments,
     );
     if (!mounted) return;
-    setState(() => _banner = 'Reply sent.');
+    _showTransientNotice('Reply sent.');
   }
 
   Future<void> _sendReplyAll(
@@ -3235,7 +3297,7 @@ class _MailHomePageState extends State<MailHomePage> {
       attachments: attachments,
     );
     if (!mounted) return;
-    setState(() => _banner = 'Reply all sent.');
+    _showTransientNotice('Reply all sent.');
   }
 
   Future<void> _showCompose() async {
@@ -3243,7 +3305,7 @@ class _MailHomePageState extends State<MailHomePage> {
     final draft = await _draftCache?.loadComposeDraft();
     if (!mounted) return;
     if (draft != null) {
-      setState(() => _banner = 'Local draft restored.');
+      _showTransientNotice('Local draft restored.');
     }
     final sent = await showDialog<bool>(
       context: context,
@@ -3265,7 +3327,7 @@ class _MailHomePageState extends State<MailHomePage> {
     if (sent == true) {
       await _draftCache?.deleteComposeDraft();
       if (!mounted) return;
-      setState(() => _banner = 'Message sent.');
+      _showTransientNotice('Message sent.');
     }
   }
 
@@ -3287,7 +3349,7 @@ class _MailHomePageState extends State<MailHomePage> {
           ),
     );
     if (sent == true && mounted) {
-      setState(() => _banner = 'Message forwarded.');
+      _showTransientNotice('Message forwarded.');
     }
   }
 
@@ -3315,7 +3377,7 @@ class _MailHomePageState extends State<MailHomePage> {
           ),
     );
     if (result != null && mounted) {
-      setState(() => _banner = result);
+      _showTransientNotice(result);
     }
   }
 
@@ -3509,7 +3571,7 @@ class _MailHomePageState extends State<MailHomePage> {
       throw StateError('Could not open ${file.path}');
     }
     if (!mounted) return;
-    setState(() => _banner = 'Attachment downloaded: ${file.path}');
+    _showTransientNotice('Attachment downloaded: ${file.path}');
   }
 
   bool get _supportsMobileSwipe {
@@ -3605,7 +3667,10 @@ class _MailHomePageState extends State<MailHomePage> {
     );
   }
 
-  void _restoreMailUndoSnapshot(_MailUndoSnapshot snapshot) {
+  void _restoreMailUndoSnapshot(
+    _MailUndoSnapshot snapshot, {
+    String? notice = 'Mail action undone.',
+  }) {
     if (!mounted) return;
     setState(() {
       _messages = snapshot.messages;
@@ -3613,8 +3678,10 @@ class _MailHomePageState extends State<MailHomePage> {
       _selectedMessageIds = snapshot.selectedMessageIds;
       _pinnedMessageIds = snapshot.pinnedMessageIds;
       _interactionSettings = snapshot.interactionSettings;
-      _banner = 'Mail action undone.';
     });
+    if (notice != null) {
+      _showTransientNotice(notice);
+    }
     _ensureSelectedMessageBody();
   }
 
@@ -3635,33 +3702,42 @@ class _MailHomePageState extends State<MailHomePage> {
         await commitRemote();
       } catch (error) {
         if (!mounted) return;
-        _restoreMailUndoSnapshot(snapshot);
-        setState(() => _banner = 'Could not sync mail action: $error');
+        _restoreMailUndoSnapshot(snapshot, notice: null);
+        _showTransientNotice('Could not sync mail action: $error', error: true);
       }
     });
 
     final messenger = ScaffoldMessenger.of(context);
+    final snackBarGeneration = ++_mailUndoSnackBarGeneration;
+    _mailUndoSnackBarVisible = true;
     messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            Expanded(child: Text(description)),
-            const SizedBox(width: 12),
-            _UndoCountdownIndicator(duration: _mailActionUndoWindow),
-          ],
-        ),
-        duration: _mailActionUndoWindow,
-        action: SnackBarAction(
-          label: 'Undo',
-          onPressed: () {
-            undone = true;
-            timer.cancel();
-            _restoreMailUndoSnapshot(snapshot);
-          },
-        ),
-      ),
-    );
+    messenger
+        .showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                Expanded(child: Text(description)),
+                const SizedBox(width: 12),
+                _UndoCountdownIndicator(duration: _mailActionUndoWindow),
+              ],
+            ),
+            duration: _mailActionUndoWindow,
+            action: SnackBarAction(
+              label: 'Undo',
+              onPressed: () {
+                undone = true;
+                timer.cancel();
+                _restoreMailUndoSnapshot(snapshot);
+              },
+            ),
+          ),
+        )
+        .closed
+        .whenComplete(() {
+          if (_mailUndoSnackBarGeneration == snackBarGeneration) {
+            _mailUndoSnackBarVisible = false;
+          }
+        });
   }
 
   void _scheduleTogglePinnedMessages(List<MailMessage> messages) {
@@ -3808,7 +3884,7 @@ class _MailHomePageState extends State<MailHomePage> {
         .toList(growable: false);
     if (movableMessages.isEmpty) {
       if (!mounted) return;
-      setState(() => _banner = 'No selected messages can move to inbox.');
+      _showTransientNotice('No selected messages can move to inbox.');
       return;
     }
     final snapshot = _captureMailUndoSnapshot();
@@ -3900,7 +3976,7 @@ class _MailHomePageState extends State<MailHomePage> {
       }
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = 'Mail action failed: $error');
+      _showTransientNotice('Mail action failed: $error', error: true);
     }
   }
 
@@ -3928,7 +4004,7 @@ class _MailHomePageState extends State<MailHomePage> {
       setState(() => _selectedMessageIds = const <String>{});
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = 'Batch mail action failed: $error');
+      _showTransientNotice('Batch mail action failed: $error', error: true);
     }
   }
 
@@ -4030,7 +4106,8 @@ class _UndoCountdownIndicator extends StatefulWidget {
   final Duration duration;
 
   @override
-  State<_UndoCountdownIndicator> createState() => _UndoCountdownIndicatorState();
+  State<_UndoCountdownIndicator> createState() =>
+      _UndoCountdownIndicatorState();
 }
 
 class _UndoCountdownIndicatorState extends State<_UndoCountdownIndicator>
@@ -4284,10 +4361,8 @@ class _TopBar extends StatelessWidget {
   const _TopBar({
     required this.session,
     required this.profile,
-    required this.banner,
     required this.compactTitle,
     required this.showFolderMenu,
-    required this.onShowPairingQr,
     required this.onCompose,
     required this.onRefresh,
     required this.onSettings,
@@ -4295,10 +4370,8 @@ class _TopBar extends StatelessWidget {
 
   final LocalSession? session;
   final LocalProfile? profile;
-  final String? banner;
   final String? compactTitle;
   final bool showFolderMenu;
-  final VoidCallback? onShowPairingQr;
   final VoidCallback? onCompose;
   final VoidCallback onRefresh;
   final VoidCallback onSettings;
@@ -4318,40 +4391,7 @@ class _TopBar extends StatelessWidget {
               ),
             ),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              compact ? _compactRow(context) : _wideRow(context),
-              if (banner != null)
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            banner!,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Theme.of(context).colorScheme.primary,
-                            ),
-                          ),
-                        ),
-                        if (onShowPairingQr != null)
-                          IconButton(
-                            tooltip: 'Show pairing QR',
-                            onPressed: onShowPairingQr,
-                            icon: const Icon(Icons.qr_code_2),
-                            visualDensity: VisualDensity.compact,
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
-          ),
+          child: compact ? _compactRow(context) : _wideRow(context),
         );
       },
     );
@@ -4426,6 +4466,81 @@ class _TopBar extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+class _InlineNoticeBanner extends StatelessWidget {
+  const _InlineNoticeBanner({
+    required this.message,
+    required this.onDismiss,
+    this.actionIcon,
+    this.actionTooltip,
+    this.onAction,
+  });
+
+  final String message;
+  final VoidCallback onDismiss;
+  final IconData? actionIcon;
+  final String? actionTooltip;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final error = _looksLikeError(message);
+    final backgroundColor =
+        error ? colorScheme.errorContainer : colorScheme.secondaryContainer;
+    final foregroundColor =
+        error ? colorScheme.onErrorContainer : colorScheme.onSecondaryContainer;
+    return Material(
+      color: backgroundColor,
+      child: Padding(
+        padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 8, 8),
+        child: Row(
+          children: [
+            Icon(
+              error ? Icons.error_outline : Icons.info_outline,
+              color: foregroundColor,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: foregroundColor),
+              ),
+            ),
+            if (actionIcon != null && onAction != null)
+              IconButton(
+                tooltip: actionTooltip,
+                onPressed: onAction,
+                icon: Icon(actionIcon),
+                color: foregroundColor,
+                visualDensity: VisualDensity.compact,
+              ),
+            IconButton(
+              tooltip: 'Dismiss',
+              onPressed: onDismiss,
+              icon: const Icon(Icons.close),
+              color: foregroundColor,
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  bool _looksLikeError(String value) {
+    final normalized = value.trim().toLowerCase();
+    return normalized.startsWith('could not') ||
+        normalized.startsWith('cannot') ||
+        normalized.startsWith('failed') ||
+        normalized.contains(' failed') ||
+        normalized.contains('error') ||
+        normalized.contains('could not ');
   }
 }
 
