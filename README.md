@@ -49,4 +49,25 @@ flutter analyze --no-pub
 flutter test --no-pub
 ```
 
+## Release Builds
+
+Use the project release wrapper so artifacts always land in the same place with
+the same naming convention:
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+Outputs:
+
+```text
+build/releases/nyamail-windows-x64-<version>.zip
+build/releases/nyamail-android-<version>.apk
+```
+
+The version comes from `pubspec.yaml`, for example `0.1.0+1`. The Windows zip
+contains the Flutter `Release` directory contents and excludes stale zip files
+from previous builds. Use `-SkipWindows`, `-SkipAndroid`, or `-NoPub` when you
+only need part of the build.
+
 Provider/OAuth smoke tools live under `tool/`.

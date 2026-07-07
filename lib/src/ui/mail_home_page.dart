@@ -153,6 +153,7 @@ class MailHomePage extends StatefulWidget {
 
 class _MailHomePageState extends State<MailHomePage> {
   static const _messagePageSize = 30;
+  static const _mailActionUndoWindow = Duration(seconds: 5);
 
   LocalSession? _session;
   LocalProfile? _profile;
@@ -3430,10 +3431,7 @@ class _MailHomePageState extends State<MailHomePage> {
   }
 
   Future<void> _setRead(MailMessage message, bool read) async {
-    await _refreshOAuthVaultIfNeeded();
-    final updated = await _mailRepository.setRead(message: message, read: read);
-    if (!mounted) return;
-    _replaceMessage(updated);
+    _scheduleSetReadMessages([message], read);
   }
 
   void _markReadWhenOpened(MailMessage message) {
@@ -3476,50 +3474,26 @@ class _MailHomePageState extends State<MailHomePage> {
   }
 
   Future<void> _setStarred(MailMessage message, bool starred) async {
-    await _refreshOAuthVaultIfNeeded();
-    final updated = await _mailRepository.setStarred(
-      message: message,
-      starred: starred,
-    );
-    if (!mounted) return;
-    _replaceMessage(updated);
+    _scheduleSetStarredMessages([message], starred);
   }
 
   Future<void> _archiveMessage(MailMessage message) async {
-    await _refreshOAuthVaultIfNeeded();
-    await _mailRepository.archive(message);
-    if (!mounted) return;
-    _removeMessage(message.id, 'Message archived.');
+    _scheduleArchiveMessages([message]);
   }
 
   Future<void> _deleteMessage(MailMessage message) async {
-    await _refreshOAuthVaultIfNeeded();
-    await _mailRepository.delete(message);
-    if (!mounted) return;
-    _removeMessage(message.id, 'Message moved to trash.');
+    _scheduleDeleteMessages([message]);
   }
 
   Future<void> _moveToInboxMessage(MailMessage message) async {
-    await _refreshOAuthVaultIfNeeded();
-    await _mailRepository.moveToInbox(message);
-    if (!mounted) return;
-    _removeMessage(message.id, 'Message moved to inbox.');
+    _scheduleMoveToInboxMessages([message]);
   }
 
   Future<void> _moveMessageToMailbox(
     MailMessage message,
     MailboxKind destination,
   ) async {
-    await _refreshOAuthVaultIfNeeded();
-    await _mailRepository.moveToMailbox(
-      message: message,
-      destination: destination,
-    );
-    if (!mounted) return;
-    _removeMessage(
-      message.id,
-      'Message moved to ${_labelForMailbox(destination)}.',
-    );
+    _scheduleMoveToMailboxMessages([message], destination);
   }
 
   Future<void> _downloadAttachment(
@@ -3590,30 +3564,6 @@ class _MailHomePageState extends State<MailHomePage> {
     await _saveInteractionSettings(settings);
   }
 
-  Future<void> _setPinnedMessageIds(Set<String> pinnedMessageIds) async {
-    final settings = _interactionSettings.copyWith(
-      pinnedMessageIds: pinnedMessageIds.toList()..sort(),
-    );
-    await const MailInteractionSettingsStore().save(settings);
-    if (!mounted) return;
-    setState(() {
-      _interactionSettings = settings;
-      _pinnedMessageIds = pinnedMessageIds;
-      _messages = _sortMessagesForDisplay(
-        _messages,
-        pinnedMessageIds: pinnedMessageIds,
-      );
-    });
-  }
-
-  Future<void> _togglePinnedMessage(MailMessage message) async {
-    final next = {..._pinnedMessageIds};
-    if (!next.add(message.id)) {
-      next.remove(message.id);
-    }
-    await _setPinnedMessageIds(next);
-  }
-
   void _setMessageSelected(String messageId, bool selected) {
     setState(() {
       final next = {..._selectedMessageIds};
@@ -3645,6 +3595,284 @@ class _MailHomePageState extends State<MailHomePage> {
     ];
   }
 
+  _MailUndoSnapshot _captureMailUndoSnapshot() {
+    return _MailUndoSnapshot(
+      messages: List.unmodifiable(_messages),
+      selected: _selected,
+      selectedMessageIds: Set.unmodifiable(_selectedMessageIds),
+      pinnedMessageIds: Set.unmodifiable(_pinnedMessageIds),
+      interactionSettings: _interactionSettings,
+    );
+  }
+
+  void _restoreMailUndoSnapshot(_MailUndoSnapshot snapshot) {
+    if (!mounted) return;
+    setState(() {
+      _messages = snapshot.messages;
+      _selected = snapshot.selected;
+      _selectedMessageIds = snapshot.selectedMessageIds;
+      _pinnedMessageIds = snapshot.pinnedMessageIds;
+      _interactionSettings = snapshot.interactionSettings;
+      _banner = 'Mail action undone.';
+    });
+    _ensureSelectedMessageBody();
+  }
+
+  void _scheduleUndoableMailAction({
+    required String description,
+    required _MailUndoSnapshot snapshot,
+    required VoidCallback applyLocal,
+    required Future<void> Function() commitRemote,
+  }) {
+    applyLocal();
+    var undone = false;
+    late final Timer timer;
+    timer = Timer(_mailActionUndoWindow, () async {
+      if (undone || !mounted) return;
+      try {
+        await _refreshOAuthVaultIfNeeded();
+        if (undone || !mounted) return;
+        await commitRemote();
+      } catch (error) {
+        if (!mounted) return;
+        _restoreMailUndoSnapshot(snapshot);
+        setState(() => _banner = 'Could not sync mail action: $error');
+      }
+    });
+
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(description),
+        duration: _mailActionUndoWindow,
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            undone = true;
+            timer.cancel();
+            _restoreMailUndoSnapshot(snapshot);
+          },
+        ),
+      ),
+    );
+  }
+
+  void _scheduleTogglePinnedMessages(List<MailMessage> messages) {
+    if (messages.isEmpty) return;
+    final selectedIds = messages.map((message) => message.id).toSet();
+    final allPinned = selectedIds.every(_pinnedMessageIds.contains);
+    final next = {..._pinnedMessageIds};
+    if (allPinned) {
+      next.removeAll(selectedIds);
+    } else {
+      next.addAll(selectedIds);
+    }
+    final snapshot = _captureMailUndoSnapshot();
+    _scheduleUndoableMailAction(
+      description:
+          allPinned
+              ? _messageCountLabel(
+                messages.length,
+                'Message unpinned.',
+                pluralNoun: 'messages unpinned.',
+              )
+              : _messageCountLabel(
+                messages.length,
+                'Message pinned.',
+                pluralNoun: 'messages pinned.',
+              ),
+      snapshot: snapshot,
+      applyLocal: () => _applyPinnedMessageIdsLocal(next),
+      commitRemote: () => _persistPinnedMessageIds(next),
+    );
+  }
+
+  void _scheduleSetReadMessages(List<MailMessage> messages, bool read) {
+    if (messages.isEmpty) return;
+    final snapshot = _captureMailUndoSnapshot();
+    final updated = [
+      for (final message in messages) message.copyWith(read: read),
+    ];
+    _scheduleUndoableMailAction(
+      description:
+          read
+              ? _messageCountLabel(
+                messages.length,
+                'Message marked read.',
+                pluralNoun: 'messages marked read.',
+              )
+              : _messageCountLabel(
+                messages.length,
+                'Message marked unread.',
+                pluralNoun: 'messages marked unread.',
+              ),
+      snapshot: snapshot,
+      applyLocal: () => _replaceMessages(updated),
+      commitRemote: () async {
+        for (final message in messages) {
+          final remote = await _mailRepository.setRead(
+            message: message,
+            read: read,
+          );
+          if (!mounted) return;
+          _replaceMessages([remote]);
+        }
+      },
+    );
+  }
+
+  void _scheduleSetStarredMessages(List<MailMessage> messages, bool starred) {
+    if (messages.isEmpty) return;
+    final snapshot = _captureMailUndoSnapshot();
+    final updated = [
+      for (final message in messages) message.copyWith(starred: starred),
+    ];
+    _scheduleUndoableMailAction(
+      description:
+          starred
+              ? _messageCountLabel(
+                messages.length,
+                'Message starred.',
+                pluralNoun: 'messages starred.',
+              )
+              : _messageCountLabel(
+                messages.length,
+                'Message unstarred.',
+                pluralNoun: 'messages unstarred.',
+              ),
+      snapshot: snapshot,
+      applyLocal: () => _replaceMessages(updated),
+      commitRemote: () async {
+        for (final message in messages) {
+          final remote = await _mailRepository.setStarred(
+            message: message,
+            starred: starred,
+          );
+          if (!mounted) return;
+          _replaceMessages([remote]);
+        }
+      },
+    );
+  }
+
+  void _scheduleArchiveMessages(List<MailMessage> messages) {
+    if (messages.isEmpty) return;
+    final snapshot = _captureMailUndoSnapshot();
+    final ids = messages.map((message) => message.id).toSet();
+    _scheduleUndoableMailAction(
+      description: _messageCountLabel(
+        messages.length,
+        'Message archived.',
+        pluralNoun: 'messages archived.',
+      ),
+      snapshot: snapshot,
+      applyLocal: () => _removeMessages(ids),
+      commitRemote: () async {
+        for (final message in messages) {
+          await _mailRepository.archive(message);
+        }
+      },
+    );
+  }
+
+  void _scheduleDeleteMessages(List<MailMessage> messages) {
+    if (messages.isEmpty) return;
+    final snapshot = _captureMailUndoSnapshot();
+    final ids = messages.map((message) => message.id).toSet();
+    _scheduleUndoableMailAction(
+      description: _messageCountLabel(
+        messages.length,
+        'Message moved to trash.',
+        pluralNoun: 'messages moved to trash.',
+      ),
+      snapshot: snapshot,
+      applyLocal: () => _removeMessages(ids),
+      commitRemote: () async {
+        for (final message in messages) {
+          await _mailRepository.delete(message);
+        }
+      },
+    );
+  }
+
+  void _scheduleMoveToInboxMessages(List<MailMessage> messages) {
+    final movableMessages = messages
+        .where((message) => _canMoveToInbox(message.effectiveMailbox))
+        .toList(growable: false);
+    if (movableMessages.isEmpty) {
+      if (!mounted) return;
+      setState(() => _banner = 'No selected messages can move to inbox.');
+      return;
+    }
+    final snapshot = _captureMailUndoSnapshot();
+    final ids = movableMessages.map((message) => message.id).toSet();
+    _scheduleUndoableMailAction(
+      description: _messageCountLabel(
+        movableMessages.length,
+        'Message moved to inbox.',
+        pluralNoun: 'messages moved to inbox.',
+      ),
+      snapshot: snapshot,
+      applyLocal: () => _removeMessages(ids),
+      commitRemote: () async {
+        for (final message in movableMessages) {
+          await _mailRepository.moveToInbox(message);
+        }
+      },
+    );
+  }
+
+  void _scheduleMoveToMailboxMessages(
+    List<MailMessage> messages,
+    MailboxKind destination,
+  ) {
+    if (messages.isEmpty) return;
+    final snapshot = _captureMailUndoSnapshot();
+    final ids = messages.map((message) => message.id).toSet();
+    _scheduleUndoableMailAction(
+      description: _messageCountLabel(
+        messages.length,
+        'Message moved to ${_labelForMailbox(destination)}.',
+        pluralNoun: 'messages moved to ${_labelForMailbox(destination)}.',
+      ),
+      snapshot: snapshot,
+      applyLocal: () => _removeMessages(ids),
+      commitRemote: () async {
+        for (final message in messages) {
+          await _mailRepository.moveToMailbox(
+            message: message,
+            destination: destination,
+          );
+        }
+      },
+    );
+  }
+
+  void _applyPinnedMessageIdsLocal(Set<String> pinnedMessageIds) {
+    final sorted = pinnedMessageIds.toList()..sort();
+    final settings = _interactionSettings.copyWith(pinnedMessageIds: sorted);
+    setState(() {
+      _interactionSettings = settings;
+      _pinnedMessageIds = pinnedMessageIds;
+      _messages = _sortMessagesForDisplay(
+        _messages,
+        pinnedMessageIds: pinnedMessageIds,
+      );
+    });
+  }
+
+  Future<void> _persistPinnedMessageIds(Set<String> pinnedMessageIds) async {
+    final sorted = pinnedMessageIds.toList()..sort();
+    final settings = _interactionSettings.copyWith(pinnedMessageIds: sorted);
+    await const MailInteractionSettingsStore().save(settings);
+  }
+
+  String _messageCountLabel(int count, String singular, {String? pluralNoun}) {
+    if (count == 1) return singular;
+    return '$count ${pluralNoun ?? 'messages updated.'}';
+  }
+
   Future<void> _runMessageAction(
     MailMessage message,
     MailListActionPreference action,
@@ -3652,17 +3880,17 @@ class _MailHomePageState extends State<MailHomePage> {
     try {
       switch (action) {
         case MailListActionPreference.pin:
-          await _togglePinnedMessage(message);
+          _scheduleTogglePinnedMessages([message]);
         case MailListActionPreference.delete:
-          await _deleteMessage(message);
+          _scheduleDeleteMessages([message]);
         case MailListActionPreference.toggleRead:
-          await _setRead(message, !message.read);
+          _scheduleSetReadMessages([message], !message.read);
         case MailListActionPreference.toggleStar:
-          await _setStarred(message, !message.starred);
+          _scheduleSetStarredMessages([message], !message.starred);
         case MailListActionPreference.archive:
-          await _archiveMessage(message);
+          _scheduleArchiveMessages([message]);
         case MailListActionPreference.moveToInbox:
-          await _moveToInboxMessage(message);
+          _scheduleMoveToInboxMessages([message]);
       }
     } catch (error) {
       if (!mounted) return;
@@ -3676,37 +3904,19 @@ class _MailHomePageState extends State<MailHomePage> {
     try {
       switch (action) {
         case MailListActionPreference.pin:
-          final selectedIds = messages.map((message) => message.id).toSet();
-          final allPinned = selectedIds.every(_pinnedMessageIds.contains);
-          final next = {..._pinnedMessageIds};
-          if (allPinned) {
-            next.removeAll(selectedIds);
-          } else {
-            next.addAll(selectedIds);
-          }
-          await _setPinnedMessageIds(next);
+          _scheduleTogglePinnedMessages(messages);
         case MailListActionPreference.delete:
-          for (final message in messages) {
-            await _deleteMessage(message);
-          }
+          _scheduleDeleteMessages(messages);
         case MailListActionPreference.toggleRead:
           final read = messages.any((message) => !message.read);
-          for (final message in messages) {
-            await _setRead(message, read);
-          }
+          _scheduleSetReadMessages(messages, read);
         case MailListActionPreference.toggleStar:
           final starred = messages.any((message) => !message.starred);
-          for (final message in messages) {
-            await _setStarred(message, starred);
-          }
+          _scheduleSetStarredMessages(messages, starred);
         case MailListActionPreference.archive:
-          for (final message in messages) {
-            await _archiveMessage(message);
-          }
+          _scheduleArchiveMessages(messages);
         case MailListActionPreference.moveToInbox:
-          for (final message in messages) {
-            await _moveToInboxMessage(message);
-          }
+          _scheduleMoveToInboxMessages(messages);
       }
       if (!mounted) return;
       setState(() => _selectedMessageIds = const <String>{});
@@ -3716,27 +3926,51 @@ class _MailHomePageState extends State<MailHomePage> {
     }
   }
 
-  void _replaceMessage(MailMessage updated) {
+  void _replaceMessages(List<MailMessage> updatedMessages) {
+    if (updatedMessages.isEmpty) return;
     setState(() {
-      final keepInCurrentList = _messageBelongsToCurrentView(updated);
+      final byId = {for (final message in updatedMessages) message.id: message};
       final messages = <MailMessage>[];
       for (final message in _messages) {
-        if (message.id == updated.id) {
-          if (keepInCurrentList) {
-            messages.add(updated);
-          }
-        } else {
+        final updated = byId[message.id];
+        if (updated == null) {
           messages.add(message);
+        } else if (_messageBelongsToCurrentView(updated)) {
+          messages.add(updated);
         }
       }
       _messages = _sortMessagesForDisplay(messages);
       _selectedMessageIds = _selectedMessageIds.intersection(
         messages.map((message) => message.id).toSet(),
       );
-      if (_selected?.id == updated.id) {
-        _selected = updated;
+      final selected = _selected;
+      if (selected != null) {
+        final updatedSelected = byId[selected.id];
+        if (updatedSelected != null) {
+          _selected =
+              _messageBelongsToCurrentView(updatedSelected)
+                  ? updatedSelected
+                  : _messageFor(messages, null);
+        }
       }
     });
+  }
+
+  void _replaceMessage(MailMessage updated) {
+    _replaceMessages([updated]);
+  }
+
+  void _removeMessages(Set<String> messageIds) {
+    if (messageIds.isEmpty) return;
+    setState(() {
+      _messages =
+          _messages
+              .where((message) => !messageIds.contains(message.id))
+              .toList();
+      _selected = _messageFor(_messages, _selected?.id);
+      _selectedMessageIds = _selectedMessageIds.difference(messageIds);
+    });
+    _ensureSelectedMessageBody();
   }
 
   bool _messageBelongsToCurrentView(MailMessage message) {
@@ -3745,17 +3979,6 @@ class _MailHomePageState extends State<MailHomePage> {
     if (smart != null) return mailMessageMatchesSmartFolder(message, smart);
     final folder = _view.folder;
     return folder == null || mailMessageMatchesFolder(message, folder);
-  }
-
-  void _removeMessage(String messageId, String banner) {
-    setState(() {
-      _messages =
-          _messages.where((message) => message.id != messageId).toList();
-      _selected = _messageFor(_messages, _selected?.id);
-      _selectedMessageIds = _selectedMessageIds.difference({messageId});
-      _banner = banner;
-    });
-    _ensureSelectedMessageBody();
   }
 
   String? _selectedAccountIdFor(List<MailAccount> accounts) {
@@ -3777,6 +4000,22 @@ class _MailHomePageState extends State<MailHomePage> {
     }
     return fallbackToFirst ? messages.first : null;
   }
+}
+
+class _MailUndoSnapshot {
+  const _MailUndoSnapshot({
+    required this.messages,
+    required this.selected,
+    required this.selectedMessageIds,
+    required this.pinnedMessageIds,
+    required this.interactionSettings,
+  });
+
+  final List<MailMessage> messages;
+  final MailMessage? selected;
+  final Set<String> selectedMessageIds;
+  final Set<String> pinnedMessageIds;
+  final MailInteractionSettings interactionSettings;
 }
 
 class _UpdateDetailRow extends StatelessWidget {
@@ -4891,6 +5130,10 @@ class _MessageListState extends State<_MessageList> {
   @override
   Widget build(BuildContext context) {
     final selecting = widget.selectedMessageIds.isNotEmpty;
+    final selectedMessages = [
+      for (final message in widget.messages)
+        if (widget.selectedMessageIds.contains(message.id)) message,
+    ];
     final accountLabels = {
       for (final account in widget.accounts)
         account.id:
@@ -4912,6 +5155,7 @@ class _MessageListState extends State<_MessageList> {
         if (selecting)
           _MessageBatchToolbar(
             selectedCount: widget.selectedMessageIds.length,
+            selectedMessages: selectedMessages,
             onAction: widget.onBatchAction,
             onClear: widget.onClearSelection,
             onSelectAll: widget.onSelectAll,
@@ -5013,7 +5257,7 @@ class _MessageListState extends State<_MessageList> {
           PopupMenuItem(
             value: action,
             child: ListTile(
-              leading: Icon(_mailListActionIcon(action)),
+              leading: Icon(_mailListActionIcon(action, message: message)),
               title: Text(_mailListActionLabel(action, message: message)),
               dense: true,
             ),
@@ -5029,12 +5273,14 @@ class _MessageListState extends State<_MessageList> {
 class _MessageBatchToolbar extends StatelessWidget {
   const _MessageBatchToolbar({
     required this.selectedCount,
+    required this.selectedMessages,
     required this.onAction,
     required this.onClear,
     required this.onSelectAll,
   });
 
   final int selectedCount;
+  final List<MailMessage> selectedMessages;
   final Future<void> Function(MailListActionPreference action) onAction;
   final VoidCallback onClear;
   final VoidCallback onSelectAll;
@@ -5042,6 +5288,21 @@ class _MessageBatchToolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
+    final markRead = selectedMessages.any((message) => !message.read);
+    final star = selectedMessages.any((message) => !message.starred);
+    final canMoveToInbox = selectedMessages.any(
+      (message) => _canMoveToInbox(message.effectiveMailbox),
+    );
+    final actions = [
+      if (canMoveToInbox)
+        MailListActionPreference.moveToInbox
+      else
+        MailListActionPreference.archive,
+      MailListActionPreference.delete,
+      MailListActionPreference.toggleStar,
+      MailListActionPreference.toggleRead,
+      MailListActionPreference.pin,
+    ];
     return Material(
       color: colorScheme.surfaceContainerHighest,
       child: Padding(
@@ -5066,19 +5327,48 @@ class _MessageBatchToolbar extends StatelessWidget {
               onPressed: onSelectAll,
               icon: const Icon(Icons.select_all),
             ),
-            for (final action in const [
-              MailListActionPreference.pin,
-              MailListActionPreference.toggleRead,
-              MailListActionPreference.toggleStar,
-              MailListActionPreference.archive,
-              MailListActionPreference.moveToInbox,
-              MailListActionPreference.delete,
-            ])
-              IconButton(
-                tooltip: _mailListActionLabel(action),
-                onPressed: () => onAction(action),
-                icon: Icon(_mailListActionIcon(action)),
+            Flexible(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final action in actions)
+                      IconButton(
+                        tooltip: _mailListActionLabel(
+                          action,
+                          read:
+                              action == MailListActionPreference.toggleRead
+                                  ? !markRead
+                                  : null,
+                          starred:
+                              action == MailListActionPreference.toggleStar
+                                  ? !star
+                                  : null,
+                        ),
+                        onPressed: () => onAction(action),
+                        color:
+                            action == MailListActionPreference.delete
+                                ? colorScheme.error
+                                : null,
+                        icon: Icon(
+                          _mailListActionIcon(
+                            action,
+                            read:
+                                action == MailListActionPreference.toggleRead
+                                    ? !markRead
+                                    : null,
+                            starred:
+                                action == MailListActionPreference.toggleStar
+                                    ? !star
+                                    : null,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
+            ),
           ],
         ),
       ),
@@ -10992,12 +11282,23 @@ bool _canMoveToInbox(MailboxKind kind) {
   };
 }
 
-IconData _mailListActionIcon(MailListActionPreference action) {
+IconData _mailListActionIcon(
+  MailListActionPreference action, {
+  MailMessage? message,
+  bool? read,
+  bool? starred,
+}) {
+  final effectiveRead = read ?? message?.read;
+  final effectiveStarred = starred ?? message?.starred;
   return switch (action) {
     MailListActionPreference.pin => Icons.push_pin_outlined,
     MailListActionPreference.delete => Icons.delete_outline,
-    MailListActionPreference.toggleRead => Icons.mark_email_read_outlined,
-    MailListActionPreference.toggleStar => Icons.star_outline,
+    MailListActionPreference.toggleRead =>
+      effectiveRead == true
+          ? Icons.mark_email_unread_outlined
+          : Icons.mark_email_read_outlined,
+    MailListActionPreference.toggleStar =>
+      effectiveStarred == true ? Icons.star : Icons.star_border,
     MailListActionPreference.archive => Icons.archive_outlined,
     MailListActionPreference.moveToInbox => Icons.move_to_inbox_outlined,
   };
@@ -11006,14 +11307,18 @@ IconData _mailListActionIcon(MailListActionPreference action) {
 String _mailListActionLabel(
   MailListActionPreference action, {
   MailMessage? message,
+  bool? read,
+  bool? starred,
 }) {
+  final effectiveRead = read ?? message?.read;
+  final effectiveStarred = starred ?? message?.starred;
   return switch (action) {
     MailListActionPreference.pin => 'Pin',
     MailListActionPreference.delete => 'Delete',
     MailListActionPreference.toggleRead =>
-      message?.read == true ? 'Mark unread' : 'Mark read',
+      effectiveRead == true ? 'Mark unread' : 'Mark read',
     MailListActionPreference.toggleStar =>
-      message?.starred == true ? 'Unstar' : 'Star',
+      effectiveStarred == true ? 'Unstar' : 'Star',
     MailListActionPreference.archive => 'Archive',
     MailListActionPreference.moveToInbox => 'Move to inbox',
   };
