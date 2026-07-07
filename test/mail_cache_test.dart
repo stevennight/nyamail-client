@@ -121,6 +121,31 @@ void main() {
   });
 
   test(
+    'mail cache quarantines unreadable json instead of failing load',
+    () async {
+      final cache = MailCache(supportDirectoryProvider: () async => tempDir);
+      final file = File('${tempDir.path}/mail-cache/messages.json');
+      await file.parent.create(recursive: true);
+      await file.writeAsString('not json', encoding: utf8);
+
+      final loaded = await cache.loadMessages();
+
+      expect(loaded, isEmpty);
+      expect(await file.exists(), isFalse);
+      final quarantined =
+          await file.parent
+              .list()
+              .where(
+                (entity) =>
+                    entity is File &&
+                    entity.path.contains('messages.json.invalid-'),
+              )
+              .toList();
+      expect(quarantined, hasLength(1));
+    },
+  );
+
+  test(
     'mail cache does not treat invalid cached dates as current time',
     () async {
       final cache = MailCache(supportDirectoryProvider: () async => tempDir);

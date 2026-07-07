@@ -151,7 +151,8 @@ class MailHomePage extends StatefulWidget {
   State<MailHomePage> createState() => _MailHomePageState();
 }
 
-class _MailHomePageState extends State<MailHomePage> {
+class _MailHomePageState extends State<MailHomePage>
+    with WidgetsBindingObserver {
   static const _messagePageSize = 30;
   static const _mailActionUndoWindow = Duration(seconds: 5);
 
@@ -182,6 +183,10 @@ class _MailHomePageState extends State<MailHomePage> {
   String? _banner;
   bool _mailUndoSnackBarVisible = false;
   int _mailUndoSnackBarGeneration = 0;
+  int _nextPendingMailActionId = 0;
+  int? _visiblePendingMailActionId;
+  bool _flushingPendingMailActions = false;
+  final _pendingMailActions = <int, _PendingMailAction>{};
   String? _pendingPairingPackage;
   final _mobileMessageNotifiers = <String, ValueNotifier<MailMessage>>{};
   final _startupService = const StartupService();
@@ -201,6 +206,7 @@ class _MailHomePageState extends State<MailHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _mailRepository = widget.mailRepository;
     unawaited(_loadSystemBehaviorSettings());
     _bootstrap();
@@ -208,11 +214,27 @@ class _MailHomePageState extends State<MailHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _newMailPollTimer?.cancel();
+    unawaited(_flushPendingMailActions());
     unawaited(_trayService.dispose());
     _mobileMessageNotifiers.clear();
     _search.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        unawaited(_flushPendingMailActions());
+        break;
+      case AppLifecycleState.resumed:
+      case AppLifecycleState.inactive:
+        break;
+    }
   }
 
   void _showTransientNotice(
@@ -366,7 +388,7 @@ class _MailHomePageState extends State<MailHomePage> {
       limit: _messagePageSize,
     );
     final pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
-    final messages = _sortMessagesForDisplay(
+    final messages = _visibleMessagesForDisplay(
       page.messages,
       pinnedMessageIds: pinnedMessageIds,
     );
@@ -553,6 +575,15 @@ class _MailHomePageState extends State<MailHomePage> {
     } on VaultCryptoException catch (error) {
       if (mounted) {
         setState(() => _banner = error.message);
+      }
+      return false;
+    } on FormatException catch (error) {
+      if (mounted) {
+        setState(
+          () =>
+              _banner =
+                  'Local vault data is not readable. Clear local data or reconnect sync. (${error.message})',
+        );
       }
       return false;
     } catch (error) {
@@ -1112,7 +1143,7 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
-      final messages = _sortMessagesForDisplay(page.messages);
+      final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
         _messages = messages;
         _selected = _messageFor(
@@ -1155,7 +1186,7 @@ class _MailHomePageState extends State<MailHomePage> {
       } else {
         unawaited(_notifyForNewIncomingMail(page.messages));
       }
-      final messages = _sortMessagesForDisplay(page.messages);
+      final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
         _messages = messages;
         _selected = _messageFor(
@@ -1207,7 +1238,7 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
-      final messages = _sortMessagesForDisplay(page.messages);
+      final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
         _messages = messages;
         _selected = _messageFor(
@@ -2037,6 +2068,7 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Future<void> _clearLocalData() async {
     if (!await _confirmClearLocalData()) return;
+    await _flushPendingMailActions();
     _nextMessageLoadGeneration();
     _search.clear();
     if (mounted) {
@@ -2074,7 +2106,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: view,
       limit: _messagePageSize,
     );
-    final messages = _sortMessagesForDisplay(page.messages);
+    final messages = _visibleMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -2130,6 +2162,7 @@ class _MailHomePageState extends State<MailHomePage> {
 
   Future<bool> _clearMailCacheAndRebuild() async {
     if (!await _confirmClearMailCache()) return false;
+    await _flushPendingMailActions();
     final requestId = _nextMessageLoadGeneration();
     _resetNewMailNotificationBaseline();
     if (mounted) {
@@ -2158,7 +2191,7 @@ class _MailHomePageState extends State<MailHomePage> {
       );
       if (!_isCurrentMessageLoad(requestId)) return true;
       _primeNewMailNotificationBaseline(page.messages);
-      final messages = _sortMessagesForDisplay(page.messages);
+      final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
         _messages = messages;
         _selected = _messageFor(messages, null, fallbackToFirst: false);
@@ -2389,6 +2422,7 @@ class _MailHomePageState extends State<MailHomePage> {
   Future<void> _leaveSync() async {
     final session = _session;
     if (session == null) return;
+    await _flushPendingMailActions();
     _nextMessageLoadGeneration();
     _search.clear();
     if (mounted) {
@@ -2415,7 +2449,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: activeView,
       limit: _messagePageSize,
     );
-    final messages = _sortMessagesForDisplay(page.messages);
+    final messages = _visibleMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -2437,6 +2471,7 @@ class _MailHomePageState extends State<MailHomePage> {
   }
 
   Future<void> _signOut() async {
+    await _flushPendingMailActions();
     _nextMessageLoadGeneration();
     _search.clear();
     if (mounted) {
@@ -2453,7 +2488,7 @@ class _MailHomePageState extends State<MailHomePage> {
       view: view,
       limit: _messagePageSize,
     );
-    final messages = _sortMessagesForDisplay(page.messages);
+    final messages = _visibleMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _session = null;
@@ -3067,7 +3102,7 @@ class _MailHomePageState extends State<MailHomePage> {
               limit: _messagePageSize,
             )
             : MailMessagePage(messages: _messages, hasMore: _hasMoreMessages);
-    final messages = _sortMessagesForDisplay(page.messages);
+    final messages = _visibleMessagesForDisplay(page.messages);
     if (!mounted) return;
     setState(() {
       _accounts = accounts;
@@ -3607,6 +3642,28 @@ class _MailHomePageState extends State<MailHomePage> {
     return [...top, ...rest];
   }
 
+  List<MailMessage> _visibleMessagesForDisplay(
+    List<MailMessage> messages, {
+    Set<String>? pinnedMessageIds,
+  }) {
+    final hidden = _pendingRemovedMessageIds;
+    final visible =
+        hidden.isEmpty
+            ? messages
+            : messages
+                .where((message) => !hidden.contains(message.id))
+                .toList(growable: false);
+    return _sortMessagesForDisplay(visible, pinnedMessageIds: pinnedMessageIds);
+  }
+
+  Set<String> get _pendingRemovedMessageIds {
+    if (_pendingMailActions.isEmpty) return const <String>{};
+    return {
+      for (final action in _pendingMailActions.values)
+        if (!action.undone) ...action.messageIds,
+    };
+  }
+
   Future<void> _saveInteractionSettings(
     MailInteractionSettings settings,
   ) async {
@@ -3757,18 +3814,208 @@ class _MailHomePageState extends State<MailHomePage> {
     });
   }
 
+  void _dismissMailUndoPrompt() {
+    if (!_mailUndoSnackBarVisible) return;
+    _mailUndoSnackBarVisible = false;
+    _visiblePendingMailActionId = null;
+    _mailUndoSnackBarGeneration++;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+  }
+
+  void _schedulePendingMailAction({
+    required String description,
+    required List<MailMessage> messages,
+    required Future<Set<String>> Function(List<MailMessage> messages)
+    commitRemote,
+  }) {
+    final alreadyPending = _pendingRemovedMessageIds;
+    final actionable = messages
+        .where((message) => !alreadyPending.contains(message.id))
+        .toList(growable: false);
+    if (actionable.isEmpty) return;
+    final action = _PendingMailAction(
+      id: ++_nextPendingMailActionId,
+      description: description,
+      messages: List.unmodifiable(actionable),
+      messageIds: Set.unmodifiable(actionable.map((message) => message.id)),
+      commitRemote: () => commitRemote(actionable),
+    );
+    _pendingMailActions[action.id] = action;
+    _removeMessages(action.messageIds);
+    _showPendingMailUndoPrompt(action);
+    action.timer = Timer(
+      _mailActionUndoWindow,
+      () => unawaited(_commitPendingMailAction(action.id)),
+    );
+  }
+
+  void _showPendingMailUndoPrompt(_PendingMailAction action) {
+    final messenger = ScaffoldMessenger.of(context);
+    final snackBarGeneration = ++_mailUndoSnackBarGeneration;
+    _mailUndoSnackBarVisible = true;
+    _visiblePendingMailActionId = action.id;
+    messenger.hideCurrentSnackBar();
+    late final ScaffoldFeatureController<SnackBar, SnackBarClosedReason>
+    snackBarController;
+
+    void markUndoSnackBarClosed() {
+      if (_mailUndoSnackBarGeneration == snackBarGeneration) {
+        _mailUndoSnackBarVisible = false;
+        _visiblePendingMailActionId = null;
+      }
+    }
+
+    action.closePrompt = () {
+      if (_visiblePendingMailActionId != action.id) return;
+      markUndoSnackBarClosed();
+      snackBarController.close();
+    };
+
+    snackBarController = messenger.showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Expanded(child: Text(action.description)),
+            const SizedBox(width: 12),
+            _UndoCountdownIndicator(duration: _mailActionUndoWindow),
+          ],
+        ),
+        duration: _mailActionUndoWindow + const Duration(milliseconds: 250),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () => _undoPendingMailAction(action.id),
+        ),
+      ),
+    );
+    snackBarController.closed.whenComplete(markUndoSnackBarClosed);
+  }
+
+  void _undoPendingMailAction(int actionId) {
+    final action = _pendingMailActions[actionId];
+    if (action == null || action.committing) return;
+    _pendingMailActions.remove(actionId);
+    action.undone = true;
+    action.timer?.cancel();
+    action.closePrompt?.call();
+    _restorePendingMessages(action.messages);
+    _showTransientNotice('Mail action undone.');
+  }
+
+  Future<void> _commitPendingMailAction(int actionId) async {
+    final action = _pendingMailActions[actionId];
+    if (action == null || action.undone || action.committing) return;
+    action.committing = true;
+    action.timer?.cancel();
+    action.closePrompt?.call();
+    try {
+      if (mounted) {
+        await _refreshOAuthVaultIfNeeded();
+      }
+      if (action.undone) return;
+      await action.commitRemote();
+      _pendingMailActions.remove(actionId);
+    } catch (error) {
+      final committedIds =
+          error is _PendingMailCommitFailure
+              ? error.committedMessageIds
+              : const <String>{};
+      final cause = error is _PendingMailCommitFailure ? error.cause : error;
+      _pendingMailActions.remove(actionId);
+      if (!mounted) return;
+      _restorePendingMessages(
+        action.messages
+            .where((message) => !committedIds.contains(message.id))
+            .toList(growable: false),
+      );
+      _showTransientNotice('Could not sync mail action: $cause', error: true);
+    }
+  }
+
+  Future<void> _flushPendingMailActions() async {
+    if (_flushingPendingMailActions || _pendingMailActions.isEmpty) return;
+    _flushingPendingMailActions = true;
+    try {
+      final actionIds = _pendingMailActions.keys.toList(growable: false);
+      for (final actionId in actionIds) {
+        await _commitPendingMailAction(actionId);
+      }
+    } finally {
+      _flushingPendingMailActions = false;
+    }
+  }
+
+  void _restorePendingMessages(List<MailMessage> messages) {
+    if (!mounted || messages.isEmpty) return;
+    final hidden = _pendingRemovedMessageIds;
+    final restorable = messages
+        .where(
+          (message) =>
+              !hidden.contains(message.id) &&
+              _messageBelongsToCurrentView(message),
+        )
+        .toList(growable: false);
+    if (restorable.isEmpty) {
+      _ensureSelectedMessageBody();
+      return;
+    }
+    setState(() {
+      final byId = {for (final message in restorable) message.id: message};
+      final merged = <MailMessage>[];
+      final seen = <String>{};
+      for (final message in _messages) {
+        final restored = byId[message.id];
+        merged.add(restored ?? message);
+        seen.add(message.id);
+      }
+      for (final message in restorable) {
+        if (seen.add(message.id)) merged.add(message);
+      }
+      _messages = _sortMessagesForDisplay(merged);
+      _selected = _messageFor(_messages, _selected?.id, fallbackToFirst: false);
+      _selectedMessageIds = _selectedMessageIds.intersection(
+        _messages.map((message) => message.id).toSet(),
+      );
+    });
+    _updateMobileMessageNotifiers(restorable);
+    _ensureSelectedMessageBody();
+  }
+
+  Future<Set<String>> _commitPendingMessages(
+    List<MailMessage> messages,
+    Future<void> Function(MailMessage message) commitMessage,
+  ) async {
+    final committed = <String>{};
+    try {
+      for (final message in messages) {
+        await commitMessage(message);
+        committed.add(message.id);
+      }
+      return committed;
+    } catch (error) {
+      throw _PendingMailCommitFailure(
+        cause: error,
+        committedMessageIds: Set.unmodifiable(committed),
+      );
+    }
+  }
+
   void _runImmediateMailAction({
     required String description,
     required _MailUndoSnapshot snapshot,
     required VoidCallback applyLocal,
     required Future<void> Function() commitRemote,
+    bool restoreSnapshotOnFailure = true,
   }) {
     applyLocal();
-    _showTransientNotice(description);
+    if (_visiblePendingMailActionId == null) {
+      _dismissMailUndoPrompt();
+      _showTransientNotice(description);
+    }
     unawaited(
       _commitImmediateMailAction(
         snapshot: snapshot,
         commitRemote: commitRemote,
+        restoreSnapshotOnFailure: restoreSnapshotOnFailure,
       ),
     );
   }
@@ -3776,6 +4023,7 @@ class _MailHomePageState extends State<MailHomePage> {
   Future<void> _commitImmediateMailAction({
     required _MailUndoSnapshot snapshot,
     required Future<void> Function() commitRemote,
+    required bool restoreSnapshotOnFailure,
   }) async {
     try {
       await _refreshOAuthVaultIfNeeded();
@@ -3783,7 +4031,11 @@ class _MailHomePageState extends State<MailHomePage> {
       await commitRemote();
     } catch (error) {
       if (!mounted) return;
-      _restoreMailUndoSnapshot(snapshot, notice: null);
+      if (restoreSnapshotOnFailure) {
+        _restoreMailUndoSnapshot(snapshot, notice: null);
+      } else {
+        await _reloadMessages();
+      }
       _showTransientNotice('Could not sync mail action: $error', error: true);
     }
   }
@@ -3888,41 +4140,31 @@ class _MailHomePageState extends State<MailHomePage> {
 
   void _scheduleArchiveMessages(List<MailMessage> messages) {
     if (messages.isEmpty) return;
-    final snapshot = _captureMailUndoSnapshot();
-    final ids = messages.map((message) => message.id).toSet();
-    _scheduleUndoableMailAction(
+    _schedulePendingMailAction(
       description: _messageCountLabel(
         messages.length,
         'Message archived.',
         pluralNoun: 'messages archived.',
       ),
-      snapshot: snapshot,
-      applyLocal: () => _removeMessages(ids),
-      commitRemote: () async {
-        for (final message in messages) {
-          await _mailRepository.archive(message);
-        }
-      },
+      messages: messages,
+      commitRemote:
+          (pendingMessages) =>
+              _commitPendingMessages(pendingMessages, _mailRepository.archive),
     );
   }
 
   void _scheduleDeleteMessages(List<MailMessage> messages) {
     if (messages.isEmpty) return;
-    final snapshot = _captureMailUndoSnapshot();
-    final ids = messages.map((message) => message.id).toSet();
-    _scheduleUndoableMailAction(
+    _schedulePendingMailAction(
       description: _messageCountLabel(
         messages.length,
         'Message moved to trash.',
         pluralNoun: 'messages moved to trash.',
       ),
-      snapshot: snapshot,
-      applyLocal: () => _removeMessages(ids),
-      commitRemote: () async {
-        for (final message in messages) {
-          await _mailRepository.delete(message);
-        }
-      },
+      messages: messages,
+      commitRemote:
+          (pendingMessages) =>
+              _commitPendingMessages(pendingMessages, _mailRepository.delete),
     );
   }
 
@@ -3935,21 +4177,18 @@ class _MailHomePageState extends State<MailHomePage> {
       _showTransientNotice('No selected messages can move to inbox.');
       return;
     }
-    final snapshot = _captureMailUndoSnapshot();
-    final ids = movableMessages.map((message) => message.id).toSet();
-    _scheduleUndoableMailAction(
+    _schedulePendingMailAction(
       description: _messageCountLabel(
         movableMessages.length,
         'Message moved to inbox.',
         pluralNoun: 'messages moved to inbox.',
       ),
-      snapshot: snapshot,
-      applyLocal: () => _removeMessages(ids),
-      commitRemote: () async {
-        for (final message in movableMessages) {
-          await _mailRepository.moveToInbox(message);
-        }
-      },
+      messages: movableMessages,
+      commitRemote:
+          (pendingMessages) => _commitPendingMessages(
+            pendingMessages,
+            _mailRepository.moveToInbox,
+          ),
     );
   }
 
@@ -3958,24 +4197,21 @@ class _MailHomePageState extends State<MailHomePage> {
     MailboxKind destination,
   ) {
     if (messages.isEmpty) return;
-    final snapshot = _captureMailUndoSnapshot();
-    final ids = messages.map((message) => message.id).toSet();
-    _scheduleUndoableMailAction(
+    _schedulePendingMailAction(
       description: _messageCountLabel(
         messages.length,
         'Message moved to ${_labelForMailbox(destination)}.',
         pluralNoun: 'messages moved to ${_labelForMailbox(destination)}.',
       ),
-      snapshot: snapshot,
-      applyLocal: () => _removeMessages(ids),
-      commitRemote: () async {
-        for (final message in messages) {
-          await _mailRepository.moveToMailbox(
-            message: message,
-            destination: destination,
-          );
-        }
-      },
+      messages: messages,
+      commitRemote:
+          (pendingMessages) => _commitPendingMessages(
+            pendingMessages,
+            (message) => _mailRepository.moveToMailbox(
+              message: message,
+              destination: destination,
+            ),
+          ),
     );
   }
 
@@ -4156,6 +4392,39 @@ class _MailUndoSnapshot {
   final Set<String> selectedMessageIds;
   final Set<String> pinnedMessageIds;
   final MailInteractionSettings interactionSettings;
+}
+
+class _PendingMailAction {
+  _PendingMailAction({
+    required this.id,
+    required this.description,
+    required this.messages,
+    required this.messageIds,
+    required this.commitRemote,
+  });
+
+  final int id;
+  final String description;
+  final List<MailMessage> messages;
+  final Set<String> messageIds;
+  final Future<Set<String>> Function() commitRemote;
+  Timer? timer;
+  VoidCallback? closePrompt;
+  bool undone = false;
+  bool committing = false;
+}
+
+class _PendingMailCommitFailure implements Exception {
+  const _PendingMailCommitFailure({
+    required this.cause,
+    required this.committedMessageIds,
+  });
+
+  final Object cause;
+  final Set<String> committedMessageIds;
+
+  @override
+  String toString() => cause.toString();
 }
 
 class _UndoCountdownIndicator extends StatefulWidget {

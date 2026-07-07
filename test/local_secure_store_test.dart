@@ -74,6 +74,17 @@ void main() {
     expect(await store.readQuickUnlockMethod(), isNull);
   });
 
+  test('malformed vault unlock envelopes are ignored', () async {
+    FlutterSecureStorage.setMockInitialValues({
+      'nyamail.vault_secret.envelope.v1': 'not json',
+      'nyamail.vault_quick_unlock.envelope.v1': '{bad',
+    });
+    const store = LocalSecureStore();
+
+    expect(await store.readVaultSecretEnvelope(), isNull);
+    expect(await store.readQuickUnlockEnvelope(), isNull);
+  });
+
   test('api base url can be saved and cleared', () async {
     const store = LocalSecureStore();
 

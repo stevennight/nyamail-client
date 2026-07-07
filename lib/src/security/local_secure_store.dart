@@ -183,11 +183,7 @@ class LocalSecureStore {
   }
 
   Future<EncryptedBlob?> readVaultSecretEnvelope() async {
-    final value = await _storage.read(key: _vaultSecretEnvelopeKey);
-    if (value == null || value.trim().isEmpty) return null;
-    final decoded = jsonDecode(value);
-    if (decoded is! Map) return null;
-    return EncryptedBlob.fromJson(decoded.cast<String, Object?>());
+    return _readEncryptedBlob(_vaultSecretEnvelopeKey);
   }
 
   Future<void> saveVaultSecretEnvelope(EncryptedBlob envelope) {
@@ -210,11 +206,23 @@ class LocalSecureStore {
   }
 
   Future<EncryptedBlob?> readQuickUnlockEnvelope() async {
-    final value = await _storage.read(key: _quickUnlockEnvelopeKey);
+    return _readEncryptedBlob(_quickUnlockEnvelopeKey);
+  }
+
+  Future<EncryptedBlob?> _readEncryptedBlob(String key) async {
+    final value = await _storage.read(key: key);
     if (value == null || value.trim().isEmpty) return null;
-    final decoded = jsonDecode(value);
-    if (decoded is! Map) return null;
-    return EncryptedBlob.fromJson(decoded.cast<String, Object?>());
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is! Map) return null;
+      return EncryptedBlob.fromJson(decoded.cast<String, Object?>());
+    } on FormatException {
+      return null;
+    } on TypeError {
+      return null;
+    } on ArgumentError {
+      return null;
+    }
   }
 
   Future<String?> readQuickUnlockMethod() {

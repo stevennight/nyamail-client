@@ -385,6 +385,34 @@ void main() {
     }
   });
 
+  test('SocketMailTransport returns COPYUID destination for moves', () async {
+    final server = await _FakeImapServer.start(moveDestinationUid: 777);
+    try {
+      final result = await const SocketMailTransport().moveMessage(
+        credential: MailboxCredential(
+          accountId: 'acc',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: InternetAddress.loopbackIPv4.address,
+          imapPort: server.port,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+          useTls: false,
+        ),
+        messageId: 'acc:inbox:42',
+        destination: MailboxKind.trash,
+      );
+
+      expect(server.selectedMailbox, 'INBOX');
+      expect(server.sawUidMove, isTrue);
+      expect(result.destinationUid, 777);
+    } finally {
+      await server.close();
+    }
+  });
+
   test(
     'SocketMailTransport uses IMAP INTERNALDATE for received time',
     () async {
@@ -838,12 +866,14 @@ class _FakeImapServer {
     required this.searchUids,
     required this.messagesByUid,
     required this.internalDatesByUid,
+    required this.moveDestinationUid,
   });
 
   final ServerSocket _server;
   final List<int> searchUids;
   final Map<int, String> messagesByUid;
   final Map<int, String> internalDatesByUid;
+  final int? moveDestinationUid;
   final _commands = <String>[];
   final fetchedUids = <int>[];
 
@@ -872,6 +902,10 @@ class _FakeImapServer {
 
   bool get sawUidFetch {
     return _commands.any((command) => command.contains(' UID FETCH 501 '));
+  }
+
+  bool get sawUidMove {
+    return _commands.any((command) => command.contains(' UID MOVE '));
   }
 
   bool get sawPreviewRangeFetch {
@@ -906,12 +940,14 @@ class _FakeImapServer {
     List<int> searchUids = const [501],
     Map<int, String> messagesByUid = const {},
     Map<int, String> internalDatesByUid = const {},
+    int? moveDestinationUid,
   }) async {
     final server = _FakeImapServer._(
       await ServerSocket.bind(InternetAddress.loopbackIPv4, 0),
       searchUids: searchUids,
       messagesByUid: messagesByUid,
       internalDatesByUid: internalDatesByUid,
+      moveDestinationUid: moveDestinationUid,
     );
     unawaited(server._serve());
     return server;
@@ -975,6 +1011,17 @@ class _FakeImapServer {
       } else if (command.contains(' UID SEARCH ALL')) {
         socket.write('* SEARCH ${searchUids.join(' ')}\r\n');
         socket.write('$tag OK SEARCH completed\r\n');
+      } else if (command.contains(' UID MOVE ')) {
+        final sourceUid =
+            RegExp(r' UID MOVE (\d+) ').firstMatch(command)?.group(1) ?? '1';
+        final destinationUid = moveDestinationUid;
+        if (destinationUid == null) {
+          socket.write('$tag OK MOVE completed\r\n');
+        } else {
+          socket.write(
+            '$tag OK [COPYUID 12345 $sourceUid $destinationUid] MOVE completed\r\n',
+          );
+        }
       } else if (command.contains(' UID FETCH ')) {
         final uid = RegExp(r' UID FETCH (\d+) ').firstMatch(command)?.group(1);
         if (uid == null) {

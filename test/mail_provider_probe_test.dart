@@ -179,7 +179,7 @@ class _ProbeTransport implements MailTransport {
   }
 
   @override
-  Future<void> moveMessage({
+  Future<MailMoveResult> moveMessage({
     required MailboxCredential credential,
     required String messageId,
     required MailboxKind destination,

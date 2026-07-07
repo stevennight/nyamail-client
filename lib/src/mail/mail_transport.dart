@@ -91,6 +91,12 @@ class DownloadedAttachment {
   final List<int> bytes;
 }
 
+class MailMoveResult {
+  const MailMoveResult({this.destinationUid});
+
+  final int? destinationUid;
+}
+
 abstract class MailTransport {
   Future<void> validateCredential({required MailboxCredential credential});
 
@@ -143,7 +149,7 @@ abstract class MailTransport {
     required bool flagged,
   });
 
-  Future<void> moveMessage({
+  Future<MailMoveResult> moveMessage({
     required MailboxCredential credential,
     required String messageId,
     required MailboxKind destination,
@@ -414,7 +420,7 @@ class SocketMailTransport implements MailTransport {
   }
 
   @override
-  Future<void> moveMessage({
+  Future<MailMoveResult> moveMessage({
     required MailboxCredential credential,
     required String messageId,
     required MailboxKind destination,
@@ -458,10 +464,10 @@ class SocketMailTransport implements MailTransport {
     }
   }
 
-  Future<void> _withImap(
+  Future<T> _withImap<T>(
     MailboxCredential credential,
     String messageId,
-    Future<void> Function(_ImapConnection imap) action,
+    Future<T> Function(_ImapConnection imap) action,
   ) async {
     final imap = await _ImapConnection.connect(credential);
     try {
@@ -469,7 +475,7 @@ class SocketMailTransport implements MailTransport {
       final resolver = await _ImapMailboxResolver.discover(imap);
       imap.mailboxResolver = resolver;
       await imap.selectMailbox(_folderNameFromMessageId(resolver, messageId));
-      await action(imap);
+      return await action(imap);
     } finally {
       await imap.close();
     }
@@ -1147,17 +1153,19 @@ class _ImapConnection {
     return _command('UID STORE $uid $operation ($flag)');
   }
 
-  Future<void> moveMessage(int id, String mailbox) async {
+  Future<MailMoveResult> moveMessage(int id, String mailbox) async {
     return uidMoveMessage(id, mailbox);
   }
 
-  Future<void> uidMoveMessage(int uid, String mailbox) async {
+  Future<MailMoveResult> uidMoveMessage(int uid, String mailbox) async {
     try {
-      await _command('UID MOVE $uid "${_escape(mailbox)}"');
+      final lines = await _commandLines('UID MOVE $uid "${_escape(mailbox)}"');
+      return MailMoveResult(destinationUid: _copyUidDestination(lines, uid));
     } on MailTransportException {
-      await _command('UID COPY $uid "${_escape(mailbox)}"');
+      final lines = await _commandLines('UID COPY $uid "${_escape(mailbox)}"');
       await uidStoreFlag(uid, r'\Deleted', true);
       await _command('EXPUNGE');
+      return MailMoveResult(destinationUid: _copyUidDestination(lines, uid));
     }
   }
 
@@ -1472,6 +1480,47 @@ DateTime? _parseFetchInternalDate(List<String> lines) {
     if (parsed != null) return parsed;
   }
   return null;
+}
+
+int? _copyUidDestination(List<String> lines, int sourceUid) {
+  for (final line in lines) {
+    final match = RegExp(
+      r'\[COPYUID\s+\d+\s+([^\s\]]+)\s+([^\s\]]+)\]',
+      caseSensitive: false,
+    ).firstMatch(line);
+    if (match == null) continue;
+    final sourceSet = _expandUidSet(match.group(1)!);
+    final destinationSet = _expandUidSet(match.group(2)!);
+    if (sourceSet.isEmpty || sourceSet.length != destinationSet.length) {
+      return destinationSet.length == 1 ? destinationSet.single : null;
+    }
+    final index = sourceSet.indexOf(sourceUid);
+    if (index >= 0) return destinationSet[index];
+    if (sourceSet.length == 1) return destinationSet.single;
+  }
+  return null;
+}
+
+List<int> _expandUidSet(String value) {
+  final output = <int>[];
+  for (final part in value.split(',')) {
+    final trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final range = RegExp(r'^(\d+):(\d+)$').firstMatch(trimmed);
+    if (range != null) {
+      final start = int.parse(range.group(1)!);
+      final end = int.parse(range.group(2)!);
+      final step = start <= end ? 1 : -1;
+      for (var uid = start; uid != end + step; uid += step) {
+        output.add(uid);
+        if (output.length > 1000) return output;
+      }
+      continue;
+    }
+    final uid = int.tryParse(trimmed);
+    if (uid != null) output.add(uid);
+  }
+  return output;
 }
 
 List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {

@@ -216,6 +216,88 @@ void main() {
     },
   );
 
+  test('move actions store the COPYUID destination id in cache', () async {
+    final transport =
+        _RecordingTransport()
+          ..moveResult = const MailMoveResult(destinationUid: 777);
+    final cache = _MemoryMailCache();
+    final repository = CachedTransportMailRepository(
+      cache: cache,
+      transport: transport,
+      credentials: const [
+        MailboxCredential(
+          accountId: 'work',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: 'imap.example.com',
+          imapPort: 993,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+        ),
+      ],
+    );
+    final message = MailMessage(
+      id: 'work:inbox:42',
+      accountId: 'work',
+      from: 'Alice <alice@example.com>',
+      subject: 'Hello',
+      preview: 'Hello',
+      body: 'Hello',
+      receivedAt: DateTime.utc(2026, 7),
+    );
+    await cache.saveMessages([message]);
+
+    await repository.delete(message);
+
+    expect(transport.movedMessageId, 'work:inbox:42');
+    expect(transport.moveDestination, MailboxKind.trash);
+    expect(await cache.loadMessages(mailbox: MailboxKind.inbox), isEmpty);
+    final trash = await cache.loadMessages(mailbox: MailboxKind.trash);
+    expect(trash, hasLength(1));
+    expect(trash.single.id, 'work:trash:777');
+    expect(trash.single.mailbox, MailboxKind.trash);
+  });
+
+  test(
+    'move actions drop stale cache when destination UID is unavailable',
+    () async {
+      final cache = _MemoryMailCache();
+      final repository = CachedTransportMailRepository(
+        cache: cache,
+        transport: _RecordingTransport(),
+        credentials: const [
+          MailboxCredential(
+            accountId: 'work',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: 'imap.example.com',
+            imapPort: 993,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+          ),
+        ],
+      );
+      final message = MailMessage(
+        id: 'work:inbox:42',
+        accountId: 'work',
+        from: 'Alice <alice@example.com>',
+        subject: 'Hello',
+        preview: 'Hello',
+        body: 'Hello',
+        receivedAt: DateTime.utc(2026, 7),
+      );
+      await cache.saveMessages([message]);
+
+      await repository.archive(message);
+
+      expect(await cache.loadMessages(), isEmpty);
+    },
+  );
+
   test('messages refreshes and filters the selected mailbox', () async {
     final transport =
         _RecordingTransport()
@@ -1154,7 +1236,9 @@ void main() {
   );
 
   test('archive moves cached message into archive mailbox', () async {
-    final transport = _RecordingTransport();
+    final transport =
+        _RecordingTransport()
+          ..moveResult = const MailMoveResult(destinationUid: 420);
     final cache = _MemoryMailCache();
     final repository = CachedTransportMailRepository(
       cache: cache,
@@ -1190,13 +1274,16 @@ void main() {
     expect(transport.moveDestination, MailboxKind.archive);
     expect(await cache.loadMessages(mailbox: MailboxKind.inbox), isEmpty);
     final archived = await cache.loadMessages(mailbox: MailboxKind.archive);
+    expect(archived.single.id, 'work:archive:420');
     expect(archived.single.mailbox, MailboxKind.archive);
   });
 
   test(
     'moveToMailbox moves cached message into the selected mailbox',
     () async {
-      final transport = _RecordingTransport();
+      final transport =
+          _RecordingTransport()
+            ..moveResult = const MailMoveResult(destinationUid: 990);
       final cache = _MemoryMailCache();
       final repository = CachedTransportMailRepository(
         cache: cache,
@@ -1235,13 +1322,16 @@ void main() {
       expect(transport.moveDestination, MailboxKind.spam);
       expect(await cache.loadMessages(mailbox: MailboxKind.inbox), isEmpty);
       final spam = await cache.loadMessages(mailbox: MailboxKind.spam);
+      expect(spam.single.id, 'work:spam:990');
       expect(spam.single.mailbox, MailboxKind.spam);
       expect(spam.single.subject, 'Check this');
     },
   );
 
   test('moveToInbox moves cached message back into inbox', () async {
-    final transport = _RecordingTransport();
+    final transport =
+        _RecordingTransport()
+          ..moveResult = const MailMoveResult(destinationUid: 43);
     final cache = _MemoryMailCache();
     final repository = CachedTransportMailRepository(
       cache: cache,
@@ -1278,6 +1368,7 @@ void main() {
     expect(transport.moveDestination, MailboxKind.inbox);
     expect(await cache.loadMessages(mailbox: MailboxKind.trash), isEmpty);
     final inbox = await cache.loadMessages(mailbox: MailboxKind.inbox);
+    expect(inbox.single.id, 'work:inbox:43');
     expect(inbox.single.mailbox, MailboxKind.inbox);
     expect(inbox.single.subject, 'Recover me');
   });
@@ -1745,6 +1836,7 @@ class _RecordingTransport implements MailTransport {
   bool? flagged;
   String? movedMessageId;
   MailboxKind? moveDestination;
+  MailMoveResult moveResult = const MailMoveResult();
   String? attachmentMessageId;
   String? attachmentPartId;
   int attachmentDownloadCount = 0;
@@ -1914,13 +2006,14 @@ class _RecordingTransport implements MailTransport {
   }
 
   @override
-  Future<void> moveMessage({
+  Future<MailMoveResult> moveMessage({
     required MailboxCredential credential,
     required String messageId,
     required MailboxKind destination,
   }) async {
     movedMessageId = messageId;
     moveDestination = destination;
+    return moveResult;
   }
 
   @override

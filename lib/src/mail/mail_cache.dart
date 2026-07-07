@@ -69,16 +69,29 @@ class MailCache implements MailMessageCache {
   }) async {
     final file = await _cacheFile();
     if (!await file.exists()) return const [];
-    final raw = await _readCacheText(file);
-    if (raw == null) return const [];
-    final decodedJson = jsonDecode(raw);
-    if (decodedJson is! List) return const [];
-    final decoded =
-        decodedJson
-            .map(
-              (item) => _messageFromJson((item as Map).cast<String, Object?>()),
-            )
-            .toList();
+    final List<MailMessage> decoded;
+    try {
+      final raw = await _readCacheText(file);
+      if (raw == null) return const [];
+      final decodedJson = jsonDecode(raw);
+      if (decodedJson is! List) {
+        await _quarantineUnreadableCache(file);
+        return const [];
+      }
+      decoded =
+          decodedJson
+              .map(
+                (item) =>
+                    _messageFromJson((item as Map).cast<String, Object?>()),
+              )
+              .toList();
+    } catch (error) {
+      if (_isCacheFormatError(error)) {
+        await _quarantineUnreadableCache(file);
+        return const [];
+      }
+      rethrow;
+    }
     final scoped =
         decoded.where((message) {
           if (mailbox != null && message.effectiveMailbox != mailbox) {
@@ -238,12 +251,35 @@ class MailCache implements MailMessageCache {
     return raw;
   }
 
+  Future<void> _quarantineUnreadableCache(File file) async {
+    if (!await file.exists()) return;
+    final backup = File(
+      '${file.path}.invalid-${DateTime.now().toUtc().microsecondsSinceEpoch}',
+    );
+    try {
+      await file.rename(backup.path);
+    } catch (_) {
+      try {
+        await file.delete();
+      } catch (_) {
+        // If the platform keeps the file locked, leave it in place and let the
+        // next successful write replace it.
+      }
+    }
+  }
+
   Future<void> _writeCacheText(File file, String plaintext) async {
     final cipher = _localCacheCipher;
     final output =
         cipher == null ? plaintext : await cipher.encryptText(plaintext);
     await file.writeAsString(output, encoding: utf8);
   }
+}
+
+bool _isCacheFormatError(Object error) {
+  return error is FormatException ||
+      error is TypeError ||
+      error is ArgumentError;
 }
 
 String mailCacheNamespaceForUser(String userId) {

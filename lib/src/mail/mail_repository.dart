@@ -872,22 +872,38 @@ class CachedTransportMailRepository implements MailRepository {
     required MailMessage message,
     required MailboxKind destination,
   }) async {
-    if (message.mailbox == destination) return;
+    if (message.effectiveMailbox == destination) return;
     final credential = _credentialFor(message);
+    MailMoveResult? moveResult;
     if (credential != null) {
-      await _transport.moveMessage(
+      moveResult = await _transport.moveMessage(
         credential: credential,
         messageId: message.id,
         destination: destination,
       );
     }
-    await _cache.updateMessage(
-      message.copyWith(
-        mailbox: destination,
-        folderPath: '',
-        folderDisplayName: '',
-      ),
+    final destinationUid = moveResult?.destinationUid;
+    if (credential != null && destinationUid == null) {
+      await _cache.deleteMessage(message.id);
+      return;
+    }
+    final updated = message.copyWith(
+      id:
+          destinationUid == null
+              ? message.id
+              : _messageIdForMailbox(
+                accountId: message.accountId,
+                mailbox: destination,
+                uid: destinationUid,
+              ),
+      mailbox: destination,
+      folderPath: '',
+      folderDisplayName: '',
     );
+    if (updated.id != message.id) {
+      await _cache.deleteMessage(message.id);
+    }
+    await _cache.updateMessage(updated);
   }
 
   @override
@@ -1356,6 +1372,14 @@ class CachedTransportMailRepository implements MailRepository {
     final parsed = int.tryParse(raw);
     if (parsed == null || parsed <= 0) return null;
     return parsed;
+  }
+
+  String _messageIdForMailbox({
+    required String accountId,
+    required MailboxKind mailbox,
+    required int uid,
+  }) {
+    return '$accountId:${mailbox.name}:$uid';
   }
 
   MailboxCredential? _credentialFor(MailMessage message) {
