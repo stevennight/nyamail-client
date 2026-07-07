@@ -244,4 +244,7 @@ class _EmptyMailRepository implements MailRepository {
   }) {
     throw UnimplementedError();
   }
+
+  @override
+  Future<void> clearLocalCache() async {}
 }

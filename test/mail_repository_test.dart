@@ -1438,6 +1438,48 @@ void main() {
     },
   );
 
+  test(
+    'clearLocalCache removes message cache and scoped attachment cache',
+    () async {
+      final userNamespace = mailCacheNamespaceForUser('user-one');
+      final otherNamespace = mailCacheNamespaceForUser('user-two');
+      final cache = _MemoryMailCache();
+      await cache.saveMessages([
+        MailMessage(
+          id: 'work:42',
+          accountId: 'work',
+          from: 'Alice <alice@example.com>',
+          subject: 'Report',
+          preview: 'See attached',
+          body: 'See attached',
+          receivedAt: DateTime.utc(2026, 7),
+        ),
+      ]);
+      final userAttachment = File(
+        '${tempDir.path}/mail-attachments/$userNamespace/work_42/2/report.pdf',
+      );
+      final otherAttachment = File(
+        '${tempDir.path}/mail-attachments/$otherNamespace/work_42/2/report.pdf',
+      );
+      await userAttachment.parent.create(recursive: true);
+      await otherAttachment.parent.create(recursive: true);
+      await userAttachment.writeAsBytes([1, 2, 3]);
+      await otherAttachment.writeAsBytes([4, 5, 6]);
+      final repository = CachedTransportMailRepository(
+        cache: cache,
+        transport: _RecordingTransport(),
+        cacheNamespace: userNamespace,
+        supportDirectoryProvider: () async => tempDir,
+      );
+
+      await repository.clearLocalCache();
+
+      expect(await cache.loadMessages(), isEmpty);
+      expect(await userAttachment.exists(), isFalse);
+      expect(await otherAttachment.exists(), isTrue);
+    },
+  );
+
   test('downloadAttachment reuses a complete cached attachment', () async {
     final transport =
         _RecordingTransport()
@@ -1686,6 +1728,11 @@ class _MemoryMailCache implements MailMessageCache {
   @override
   Future<void> deleteMessage(String messageId) async {
     _messages.remove(messageId);
+  }
+
+  @override
+  Future<void> clear() async {
+    _messages.clear();
   }
 }
 

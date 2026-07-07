@@ -102,6 +102,7 @@ abstract class MailRepository {
     required MailMessage message,
     required MailAttachment attachment,
   });
+  Future<void> clearLocalCache();
 }
 
 class DemoMailRepository implements MailRepository {
@@ -375,6 +376,9 @@ class DemoMailRepository implements MailRepository {
       'Connect a mailbox before downloading attachments.',
     );
   }
+
+  @override
+  Future<void> clearLocalCache() async {}
 }
 
 class CachedTransportMailRepository implements MailRepository {
@@ -945,6 +949,22 @@ class CachedTransportMailRepository implements MailRepository {
       dir: attachmentDir,
       filename: downloaded.filename,
       bytes: downloaded.bytes,
+    );
+  }
+
+  @override
+  Future<void> clearLocalCache() async {
+    await _cache.clear();
+    final namespace = _safeOptionalPathSegment(_cacheNamespace);
+    if (namespace == null) {
+      await clearLegacyMailAttachmentCache(
+        supportDirectoryProvider: _supportDirectoryProvider,
+      );
+      return;
+    }
+    await clearMailAttachmentCache(
+      cacheNamespace: namespace,
+      supportDirectoryProvider: _supportDirectoryProvider,
     );
   }
 

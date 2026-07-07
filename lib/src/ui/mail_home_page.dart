@@ -20,6 +20,7 @@ import '../mail/mail_draft_cache.dart';
 import '../mail/mail_appearance.dart';
 import '../mail/mail_html_sanitizer.dart';
 import '../mail/mail_interaction_settings.dart';
+import '../mail/mail_notification_baseline.dart';
 import '../mail/mailbox_diagnostics.dart';
 import '../mail/mail_models.dart';
 import '../mail/mail_render_settings.dart';
@@ -189,8 +190,7 @@ class _MailHomePageState extends State<MailHomePage> {
   SystemBehaviorSettings _systemSettings = SystemBehaviorSettings.defaults;
   Timer? _newMailPollTimer;
   bool _pollingNewMail = false;
-  bool _notificationBaselineReady = false;
-  final Set<String> _knownIncomingUnreadMessageIds = <String>{};
+  final _newMailNotificationBaseline = MailNotificationBaseline();
   late final LocalVaultAuthenticator _vaultAuthenticator =
       LocalVaultAuthenticator();
 
@@ -360,7 +360,12 @@ class _MailHomePageState extends State<MailHomePage> {
     final requestId = _nextMessageLoadGeneration();
     unawaited(_discoverFoldersInBackground());
     // Keep the first unlocked frame local-only; network work continues behind it.
-    unawaited(_refreshMessagesInBackground(requestId: requestId));
+    unawaited(
+      _refreshMessagesInBackground(
+        requestId: requestId,
+        suppressNewMailNotifications: true,
+      ),
+    );
     if (session != null) {
       unawaited(_tryUnlockStoredVault(session));
     }
@@ -392,7 +397,10 @@ class _MailHomePageState extends State<MailHomePage> {
         view: const MailboxView.smart(MailSmartFolder.allIncoming),
         limit: _messagePageSize,
       );
-      await _notifyForNewIncomingMail(page.messages);
+      await _notifyForNewIncomingMail(
+        page.messages,
+        completeStartupBaseline: true,
+      );
     } catch (error) {
       debugPrint('[NyaMail notifications] new mail poll failed: $error');
     } finally {
@@ -401,29 +409,23 @@ class _MailHomePageState extends State<MailHomePage> {
   }
 
   void _primeNewMailNotificationBaseline(Iterable<MailMessage> messages) {
-    for (final message in messages.where(_isNotifiableIncomingUnread)) {
-      _knownIncomingUnreadMessageIds.add(message.id);
-    }
-    _notificationBaselineReady = true;
+    _newMailNotificationBaseline.prime(
+      messages.where(_isNotifiableIncomingUnread),
+    );
   }
 
   void _resetNewMailNotificationBaseline() {
-    _knownIncomingUnreadMessageIds.clear();
-    _notificationBaselineReady = false;
+    _newMailNotificationBaseline.reset();
   }
 
-  Future<void> _notifyForNewIncomingMail(List<MailMessage> messages) async {
-    final incomingUnread = messages.where(_isNotifiableIncomingUnread).toList();
-    if (!_notificationBaselineReady) {
-      _primeNewMailNotificationBaseline(incomingUnread);
-      return;
-    }
-    final fresh = <MailMessage>[];
-    for (final message in incomingUnread) {
-      if (_knownIncomingUnreadMessageIds.add(message.id)) {
-        fresh.add(message);
-      }
-    }
+  Future<void> _notifyForNewIncomingMail(
+    List<MailMessage> messages, {
+    bool completeStartupBaseline = false,
+  }) async {
+    final fresh = _newMailNotificationBaseline.freshMessages(
+      messages.where(_isNotifiableIncomingUnread),
+      completeStartupBaseline: completeStartupBaseline,
+    );
     if (!_systemSettings.newMailNotifications || fresh.isEmpty) return;
     final title =
         fresh.length == 1
@@ -1097,6 +1099,7 @@ class _MailHomePageState extends State<MailHomePage> {
     required int requestId,
     bool showErrors = false,
     bool preserveSelection = true,
+    bool suppressNewMailNotifications = false,
   }) async {
     try {
       await _refreshOAuthVaultIfNeeded();
@@ -1107,7 +1110,9 @@ class _MailHomePageState extends State<MailHomePage> {
         limit: _messagePageSize,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
-      if (_notificationBaselineReady) {
+      if (suppressNewMailNotifications) {
+        _primeNewMailNotificationBaseline(page.messages);
+      } else {
         unawaited(_notifyForNewIncomingMail(page.messages));
       }
       final messages = _sortMessagesForDisplay(page.messages);
@@ -1569,6 +1574,8 @@ class _MailHomePageState extends State<MailHomePage> {
       case _SettingsAction.mailboxes:
         await _showMailboxSettings();
         return true;
+      case _SettingsAction.clearMailCache:
+        return !await _clearMailCacheAndRebuild();
       case _SettingsAction.appThemeSettings:
         await _showAppThemeSettings();
         return true;
@@ -2042,6 +2049,86 @@ class _MailHomePageState extends State<MailHomePage> {
       _banner = 'Local data cleared on this device.';
     });
     _ensureSelectedMessageBody();
+  }
+
+  Future<bool> _confirmClearMailCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Clear mail cache?'),
+            content: const Text(
+              'This removes cached messages, the local mail index, and downloaded attachments from this device only. Your local vault, mailbox accounts, settings, sync session, and drafts will be kept. Mail will be fetched again from the configured mailboxes.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(context).colorScheme.error,
+                  foregroundColor: Theme.of(context).colorScheme.onError,
+                ),
+                onPressed: () => Navigator.of(context).pop(true),
+                icon: const Icon(Icons.cleaning_services_outlined),
+                label: const Text('Clear cache'),
+              ),
+            ],
+          ),
+    );
+    return confirmed == true;
+  }
+
+  Future<bool> _clearMailCacheAndRebuild() async {
+    if (!await _confirmClearMailCache()) return false;
+    final requestId = _nextMessageLoadGeneration();
+    _resetNewMailNotificationBaseline();
+    if (mounted) {
+      setState(() {
+        _messages = const [];
+        _selected = null;
+        _selectedMessageIds = const <String>{};
+        _hasMoreMessages = true;
+        _loadingMore = false;
+        _banner = 'Clearing mail cache...';
+      });
+    }
+
+    try {
+      await _mailRepository.clearLocalCache();
+      if (!_isCurrentMessageLoad(requestId)) return true;
+      if (mounted) {
+        setState(() => _banner = 'Mail cache cleared. Rebuilding index...');
+      }
+      await _refreshOAuthVaultIfNeeded();
+      if (!_isCurrentMessageLoad(requestId)) return true;
+      final page = await _mailRepository.viewPage(
+        view: _view,
+        query: _search.text,
+        limit: _messagePageSize,
+      );
+      if (!_isCurrentMessageLoad(requestId)) return true;
+      _primeNewMailNotificationBaseline(page.messages);
+      final messages = _sortMessagesForDisplay(page.messages);
+      setState(() {
+        _messages = messages;
+        _selected = _messageFor(messages, null, fallbackToFirst: false);
+        _selectedMessageIds = const <String>{};
+        _hasMoreMessages = page.hasMore;
+        _loadingMore = false;
+        _banner = 'Mail cache cleared. Rebuilding from mail servers.';
+      });
+      return true;
+    } catch (error) {
+      if (_isCurrentMessageLoad(requestId)) {
+        setState(() {
+          _loadingMore = false;
+          _banner = 'Could not clear mail cache: $error';
+        });
+      }
+      return true;
+    }
   }
 
   Future<void> _showLogin() async {
@@ -2934,7 +3021,8 @@ class _MailHomePageState extends State<MailHomePage> {
       }
     });
     final nextAccountIds = accounts.map((account) => account.id).toSet();
-    if (!setEquals(previousAccountIds, nextAccountIds)) {
+    final accountsChanged = !setEquals(previousAccountIds, nextAccountIds);
+    if (accountsChanged) {
       _resetNewMailNotificationBaseline();
       _syncNewMailPolling(_systemSettings.newMailNotifications);
     }
@@ -2944,6 +3032,7 @@ class _MailHomePageState extends State<MailHomePage> {
         _refreshMessagesInBackground(
           requestId: requestId,
           preserveSelection: false,
+          suppressNewMailNotifications: accountsChanged,
         ),
       );
     }
@@ -4028,6 +4117,7 @@ enum _SettingsAction {
   checkUpdates,
   addMailbox,
   mailboxes,
+  clearMailCache,
   appThemeSettings,
   localVaultSettings,
   mailSettings,
@@ -4204,6 +4294,12 @@ class _SettingsContent extends StatelessWidget {
                       ? 'No mailbox configured'
                       : '$accountCount configured',
               enabled: accountCount > 0,
+            ),
+            _SettingsTile(
+              action: _SettingsAction.clearMailCache,
+              icon: Icons.cleaning_services_outlined,
+              title: 'Clear mail cache',
+              subtitle: 'Re-fetch messages and rebuild local index',
             ),
             _SettingsTile(
               action: _SettingsAction.oauthProviderSettings,
@@ -5184,10 +5280,6 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
                       direction == _SwipeDirection.leftToRight
                           ? widget.leftLevel1
                           : widget.rightLevel1,
-                  level2Action:
-                      direction == _SwipeDirection.leftToRight
-                          ? widget.leftLevel2
-                          : widget.rightLevel2,
                   activeAction: selection?.action,
                 ),
               ),
@@ -5252,20 +5344,20 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
   }
 
   double _level1Distance(double width) {
-    return math.min(width * 0.16, 56.0);
+    final level2 = _level2Distance(width);
+    return math.min(math.max(12.0, _maxVisualOffset(width) * 0.25), level2 - 4);
   }
 
   double _level2Distance(double width) {
-    final responsive = math.min(width * 0.36, 132.0);
-    return math.max(_level1Distance(width) + 44.0, responsive);
+    return _maxVisualOffset(width) * 0.5;
   }
 
   double _maxVisualOffset(double width) {
-    return math.min(width * 0.58, _actionPaneWidth * 2.25);
+    return math.min(width * 0.30, _actionPaneWidth);
   }
 
   double _maxDragDistance(double width) {
-    return math.min(width * 0.72, _actionPaneWidth * 3);
+    return _maxVisualOffset(width);
   }
 }
 
@@ -5282,14 +5374,12 @@ class _SwipeActionBackground extends StatelessWidget {
     required this.direction,
     required this.revealExtent,
     required this.level1Action,
-    required this.level2Action,
     required this.activeAction,
   });
 
   final _SwipeDirection? direction;
   final double revealExtent;
   final MailListActionPreference level1Action;
-  final MailListActionPreference level2Action;
   final MailListActionPreference? activeAction;
 
   @override
@@ -5298,25 +5388,7 @@ class _SwipeActionBackground extends StatelessWidget {
     if (resolvedDirection == null || revealExtent <= 0) {
       return const SizedBox.shrink();
     }
-    final firstWidth = math.min(
-      revealExtent,
-      _SwipeActionTileState._actionPaneWidth,
-    );
-    final secondWidth = math.max(0.0, revealExtent - firstWidth);
-    final firstPane = _SwipeActionPane(
-      action: level1Action,
-      width: firstWidth,
-      active: activeAction == level1Action,
-    );
-    final secondPane = _SwipeActionPane(
-      action: level2Action,
-      width: secondWidth,
-      active: activeAction == level2Action,
-    );
-    final panes =
-        resolvedDirection == _SwipeDirection.leftToRight
-            ? [firstPane, secondPane]
-            : [secondPane, firstPane];
+    final action = activeAction ?? level1Action;
     return ColoredBox(
       color: Colors.transparent,
       child: Align(
@@ -5324,9 +5396,10 @@ class _SwipeActionBackground extends StatelessWidget {
             resolvedDirection == _SwipeDirection.leftToRight
                 ? Alignment.centerLeft
                 : Alignment.centerRight,
-        child: SizedBox(
-          width: revealExtent,
-          child: Row(mainAxisSize: MainAxisSize.min, children: panes),
+        child: _SwipeActionPane(
+          action: action,
+          revealExtent: revealExtent,
+          active: activeAction == action,
         ),
       ),
     );
@@ -5336,24 +5409,24 @@ class _SwipeActionBackground extends StatelessWidget {
 class _SwipeActionPane extends StatelessWidget {
   const _SwipeActionPane({
     required this.action,
-    required this.width,
+    required this.revealExtent,
     required this.active,
   });
 
   final MailListActionPreference action;
-  final double width;
+  final double revealExtent;
   final bool active;
 
   @override
   Widget build(BuildContext context) {
-    if (width <= 0) return const SizedBox.shrink();
+    if (revealExtent <= 0) return const SizedBox.shrink();
     final colorScheme = Theme.of(context).colorScheme;
     final progress =
-        (width / _SwipeActionTileState._actionPaneWidth)
+        (revealExtent / _SwipeActionTileState._actionPaneWidth)
             .clamp(0.0, 1.0)
             .toDouble();
     return SizedBox(
-      width: width,
+      width: revealExtent,
       child: ColoredBox(
         color: _mailListActionColor(action, colorScheme),
         child: Center(

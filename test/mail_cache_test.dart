@@ -121,6 +121,36 @@ void main() {
   });
 
   test(
+    'mail cache does not treat invalid cached dates as current time',
+    () async {
+      final cache = MailCache(supportDirectoryProvider: () async => tempDir);
+      final file = File('${tempDir.path}/mail-cache/messages.json');
+      await file.parent.create(recursive: true);
+      await file.writeAsString(
+        jsonEncode([
+          {
+            'id': 'work:inbox:bad-date',
+            'account_id': 'work',
+            'from': 'Alice <alice@example.com>',
+            'subject': 'Bad date',
+            'preview': 'Preview',
+            'body': 'Body',
+            'received_at': 'not a date',
+          },
+        ]),
+        encoding: utf8,
+      );
+
+      final loaded = await cache.loadMessages();
+
+      expect(
+        loaded.single.receivedAt,
+        DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+      );
+    },
+  );
+
+  test(
     'mail cache preserves loaded body when a preview is saved later',
     () async {
       final cache = MailCache(supportDirectoryProvider: () async => tempDir);

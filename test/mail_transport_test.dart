@@ -74,6 +74,41 @@ void main() {
     expect(message.subject, '你好 NyaMail');
   });
 
+  test('parseRfc822Message uses stable fallback instead of current time', () {
+    final fallback = DateTime.utc(2012, 5, 6, 7, 8, 9);
+    final message = parseRfc822Message(
+      [
+        'From: Alice <alice@example.com>',
+        'Subject: Legacy mail',
+        'Date: not a real mail date',
+        '',
+        'Old body',
+      ].join('\r\n'),
+      id: 'acc:legacy',
+      accountId: 'acc',
+      fallbackReceivedAt: fallback,
+    );
+
+    expect(message.receivedAt, fallback);
+  });
+
+  test('parseRfc822Message prefers server received time', () {
+    final message = parseRfc822Message(
+      [
+        'From: Alice <alice@example.com>',
+        'Subject: Imported mail',
+        'Date: 2026-07-01T08:00:00Z',
+        '',
+        'Body',
+      ].join('\r\n'),
+      id: 'acc:server-date',
+      accountId: 'acc',
+      receivedAt: DateTime.utc(2011, 2, 3, 4, 5, 6),
+    );
+
+    expect(message.receivedAt, DateTime.utc(2011, 2, 3, 4, 5, 6));
+  });
+
   test(
     'parseRfc822Message extracts multipart body and attachment metadata',
     () {
@@ -349,6 +384,46 @@ void main() {
       await server.close();
     }
   });
+
+  test(
+    'SocketMailTransport uses IMAP INTERNALDATE for received time',
+    () async {
+      final server = await _FakeImapServer.start(
+        messagesByUid: {
+          501: [
+            'From: Alice <alice@example.com>',
+            'Subject: Old imported message',
+            'Date: not parseable',
+            '',
+            'Body 501',
+          ].join('\r\n'),
+        },
+        internalDatesByUid: const {501: '09-Feb-2010 13:14:15 +0800'},
+      );
+      try {
+        final messages = await const SocketMailTransport().fetchMessagePreviews(
+          credential: MailboxCredential(
+            accountId: 'acc',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: InternetAddress.loopbackIPv4.address,
+            imapPort: server.port,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+            useTls: false,
+          ),
+          mailbox: MailboxKind.inbox,
+          limit: 1,
+        );
+
+        expect(messages.single.receivedAt, DateTime.utc(2010, 2, 9, 5, 14, 15));
+      } finally {
+        await server.close();
+      }
+    },
+  );
 
   test('SocketMailTransport decodes base64 message previews', () async {
     const text = '您好，欢迎使用 NyaMail。';
@@ -762,11 +837,13 @@ class _FakeImapServer {
     this._server, {
     required this.searchUids,
     required this.messagesByUid,
+    required this.internalDatesByUid,
   });
 
   final ServerSocket _server;
   final List<int> searchUids;
   final Map<int, String> messagesByUid;
+  final Map<int, String> internalDatesByUid;
   final _commands = <String>[];
   final fetchedUids = <int>[];
 
@@ -828,11 +905,13 @@ class _FakeImapServer {
   static Future<_FakeImapServer> start({
     List<int> searchUids = const [501],
     Map<int, String> messagesByUid = const {},
+    Map<int, String> internalDatesByUid = const {},
   }) async {
     final server = _FakeImapServer._(
       await ServerSocket.bind(InternetAddress.loopbackIPv4, 0),
       searchUids: searchUids,
       messagesByUid: messagesByUid,
+      internalDatesByUid: internalDatesByUid,
     );
     unawaited(server._serve());
     return server;
@@ -913,8 +992,11 @@ class _FakeImapServer {
               '',
               'Body $parsedUid',
             ].join('\r\n');
+        final internalDate =
+            internalDatesByUid[parsedUid] ?? '01-Jul-2026 08:00:00 +0000';
         socket.write(
-          '* 1 FETCH (UID $parsedUid FLAGS (\\Seen \\Flagged) BODY[] '
+          '* 1 FETCH (UID $parsedUid FLAGS (\\Seen \\Flagged) '
+          'INTERNALDATE "$internalDate" BODY[] '
           '{${utf8.encode(raw).length}}\r\n',
         );
         socket.add(utf8.encode(raw));

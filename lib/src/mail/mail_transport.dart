@@ -223,6 +223,7 @@ class SocketMailTransport implements MailTransport {
             folderDisplayName: folder.displayName,
             read: fetched.flags.contains(r'\Seen'),
             starred: fetched.flags.contains(r'\Flagged'),
+            receivedAt: fetched.internalDate,
           ),
         );
       }
@@ -267,6 +268,7 @@ class SocketMailTransport implements MailTransport {
           read: fetched.flags.contains(r'\Seen'),
           starred: fetched.flags.contains(r'\Flagged'),
           bodyLoaded: false,
+          receivedAt: fetched.internalDate,
         );
         messages.add(
           parsed.copyWith(
@@ -313,6 +315,7 @@ class SocketMailTransport implements MailTransport {
           read: fetched.flags.contains(r'\Seen'),
           starred: fetched.flags.contains(r'\Flagged'),
           bodyLoaded: false,
+          receivedAt: fetched.internalDate,
         );
         messages.add(
           parsed.copyWith(
@@ -352,6 +355,8 @@ class SocketMailTransport implements MailTransport {
         read: fetched.flags.contains(r'\Seen'),
         starred: fetched.flags.contains(r'\Flagged'),
         bodyLoaded: true,
+        receivedAt: fetched.internalDate,
+        fallbackReceivedAt: message.receivedAt,
       );
     } finally {
       await imap.close();
@@ -499,10 +504,16 @@ MailMessage parseRfc822Message(
   bool read = false,
   bool starred = false,
   bool bodyLoaded = true,
+  DateTime? receivedAt,
+  DateTime? fallbackReceivedAt,
 }) {
   final parsed = _parseMimeEntity(raw);
   final headers = parsed.headers;
-  final date = _parseMailDate(headers['date'] ?? '') ?? DateTime.now();
+  final date =
+      receivedAt?.toUtc() ??
+      _parseMailDate(headers['date'] ?? '') ??
+      fallbackReceivedAt?.toUtc() ??
+      DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
   final body = parsed.bestBody.replaceAll('\r\n', '\n').trim();
   final htmlBody = parsed.htmlBody.replaceAll('\r\n', '\n').trim();
   final preview = body.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -879,40 +890,93 @@ List<String> _parseAddressHeader(String value) {
 
 DateTime? _parseMailDate(String value) {
   final parsed = DateTime.tryParse(value);
-  if (parsed != null) return parsed;
-  final cleaned = value.replaceFirst(RegExp(r'^[A-Za-z]{3},\s*'), '').trim();
+  if (parsed != null) return parsed.toUtc();
+  final cleaned =
+      value
+          .replaceFirst(RegExp(r'^[A-Za-z]{3,9},\s*'), '')
+          .replaceAll(RegExp(r'\s*\([^)]*\)\s*$'), '')
+          .trim();
   final match = RegExp(
-    r'^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?\s+([+-]\d{4})',
+    r'^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s+([+-]\d{4}|UT|UTC|GMT|Z)',
+    caseSensitive: false,
   ).firstMatch(cleaned);
   if (match == null) return null;
-  const months = {
-    'Jan': 1,
-    'Feb': 2,
-    'Mar': 3,
-    'Apr': 4,
-    'May': 5,
-    'Jun': 6,
-    'Jul': 7,
-    'Aug': 8,
-    'Sep': 9,
-    'Oct': 10,
-    'Nov': 11,
-    'Dec': 12,
-  };
-  final month = months[match.group(2)];
+  final month = _monthFromName(match.group(2)!);
   if (month == null) return null;
-  final offset = match.group(7)!;
-  final offsetSign = offset.startsWith('-') ? -1 : 1;
-  final offsetHours = int.parse(offset.substring(1, 3));
-  final offsetMinutes = int.parse(offset.substring(3, 5));
-  final local = DateTime.utc(
-    int.parse(match.group(3)!),
-    month,
-    int.parse(match.group(1)!),
-    int.parse(match.group(4)!),
-    int.parse(match.group(5)!),
-    int.parse(match.group(6) ?? '0'),
+  final year = _normalizedDateYear(match.group(3)!);
+  if (year == null) return null;
+  return _dateTimeFromOffsetParts(
+    year: year,
+    month: month,
+    day: int.parse(match.group(1)!),
+    hour: int.parse(match.group(4)!),
+    minute: int.parse(match.group(5)!),
+    second: int.parse(match.group(6) ?? '0'),
+    offset: match.group(7)!,
   );
+}
+
+DateTime? _parseImapInternalDate(String value) {
+  final match = RegExp(
+    r'"?(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\s+([+-]\d{4}|UT|UTC|GMT|Z)"?',
+    caseSensitive: false,
+  ).firstMatch(value.trim());
+  if (match == null) return null;
+  final month = _monthFromName(match.group(2)!);
+  if (month == null) return null;
+  return _dateTimeFromOffsetParts(
+    year: int.parse(match.group(3)!),
+    month: month,
+    day: int.parse(match.group(1)!),
+    hour: int.parse(match.group(4)!),
+    minute: int.parse(match.group(5)!),
+    second: int.parse(match.group(6)!),
+    offset: match.group(7)!,
+  );
+}
+
+int? _monthFromName(String value) {
+  return const {
+    'jan': 1,
+    'feb': 2,
+    'mar': 3,
+    'apr': 4,
+    'may': 5,
+    'jun': 6,
+    'jul': 7,
+    'aug': 8,
+    'sep': 9,
+    'oct': 10,
+    'nov': 11,
+    'dec': 12,
+  }[value.trim().toLowerCase()];
+}
+
+int? _normalizedDateYear(String value) {
+  final parsed = int.tryParse(value);
+  if (parsed == null) return null;
+  if (value.length != 2) return parsed;
+  return parsed >= 70 ? 1900 + parsed : 2000 + parsed;
+}
+
+DateTime? _dateTimeFromOffsetParts({
+  required int year,
+  required int month,
+  required int day,
+  required int hour,
+  required int minute,
+  required int second,
+  required String offset,
+}) {
+  final local = DateTime.utc(year, month, day, hour, minute, second);
+  final normalizedOffset = offset.toUpperCase();
+  if (const {'UT', 'UTC', 'GMT', 'Z'}.contains(normalizedOffset)) {
+    return local;
+  }
+  if (!RegExp(r'^[+-]\d{4}$').hasMatch(normalizedOffset)) return null;
+  final offsetSign = normalizedOffset.startsWith('-') ? -1 : 1;
+  final offsetHours = int.parse(normalizedOffset.substring(1, 3));
+  final offsetMinutes = int.parse(normalizedOffset.substring(3, 5));
   return local.subtract(
     Duration(minutes: offsetSign * (offsetHours * 60 + offsetMinutes)),
   );
@@ -1006,25 +1070,27 @@ class _ImapConnection {
 
   Future<_FetchedImapMessage> uidFetchMessage(int uid) async {
     final response = await _fetchLiteralBytes(
-      'UID FETCH $uid (FLAGS BODY.PEEK[])',
+      'UID FETCH $uid (FLAGS INTERNALDATE BODY.PEEK[])',
     );
     return _FetchedImapMessage(
       raw: response.chunks
           .map((bytes) => utf8.decode(bytes, allowMalformed: true))
           .join('\n'),
       flags: _parseFetchFlags(response.lines),
+      internalDate: _parseFetchInternalDate(response.lines),
     );
   }
 
   Future<_FetchedImapMessage> uidFetchMessagePreview(int uid) async {
     final response = await _fetchLiteralBytes(
-      'UID FETCH $uid (FLAGS BODY.PEEK[]<0.$_messagePreviewFetchBytes>)',
+      'UID FETCH $uid (FLAGS INTERNALDATE BODY.PEEK[]<0.$_messagePreviewFetchBytes>)',
     );
     return _FetchedImapMessage(
       raw: response.chunks
           .map((bytes) => utf8.decode(bytes, allowMalformed: true))
           .join('\n'),
       flags: _parseFetchFlags(response.lines),
+      internalDate: _parseFetchInternalDate(response.lines),
     );
   }
 
@@ -1362,10 +1428,15 @@ _ImapMailboxInfo _parseListLine(String line) {
 }
 
 class _FetchedImapMessage {
-  const _FetchedImapMessage({required this.raw, required this.flags});
+  const _FetchedImapMessage({
+    required this.raw,
+    required this.flags,
+    this.internalDate,
+  });
 
   final String raw;
   final Set<String> flags;
+  final DateTime? internalDate;
 }
 
 class _FetchLiteralResponse {
@@ -1388,6 +1459,19 @@ Set<String> _parseFetchFlags(List<String> lines) {
     }
   }
   return flags;
+}
+
+DateTime? _parseFetchInternalDate(List<String> lines) {
+  for (final line in lines) {
+    final match = RegExp(
+      r'INTERNALDATE\s+"([^"]+)"',
+      caseSensitive: false,
+    ).firstMatch(line);
+    if (match == null) continue;
+    final parsed = _parseImapInternalDate(match.group(1)!);
+    if (parsed != null) return parsed;
+  }
+  return null;
 }
 
 List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {

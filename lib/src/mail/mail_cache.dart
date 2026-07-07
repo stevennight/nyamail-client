@@ -18,6 +18,7 @@ abstract class MailMessageCache {
   });
   Future<void> updateMessage(MailMessage message);
   Future<void> deleteMessage(String messageId);
+  Future<void> clear();
 }
 
 class MailCache implements MailMessageCache {
@@ -107,6 +108,7 @@ class MailCache implements MailMessageCache {
     return File('${dir.path}/mail-cache/$namespace/messages.json');
   }
 
+  @override
   Future<void> clear() async {
     final file = await _cacheFile();
     final namespace = _safeCacheNamespace(this.namespace);
@@ -165,7 +167,7 @@ class MailCache implements MailMessageCache {
     htmlBody: json['html_body'] as String? ?? '',
     receivedAt:
         DateTime.tryParse(json['received_at'] as String? ?? '') ??
-        DateTime.now(),
+        DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
     to: _stringList(json['to']),
     cc: _stringList(json['cc']),
     replyTo: _stringList(json['reply_to']),
