@@ -134,19 +134,53 @@ MailHtmlRenderResult buildMailHtmlDocument({
 }
 html {
   background: ${palette.canvas};
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
+* {
+  box-sizing: border-box;
 }
 body {
   margin: 0;
   padding: 0;
+  min-width: 0 !important;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
   overflow-wrap: anywhere;
+  word-break: break-word;
   color: ${palette.text};
   background: ${palette.canvas};
   font-size: 15px;
   line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
 }
 a { color: ${palette.link}; }
-img { max-width: 100%; height: auto; }
-table { max-width: 100%; border-collapse: collapse; }
+img, video, canvas, svg, iframe {
+  max-width: 100% !important;
+  height: auto !important;
+}
+table {
+  max-width: 100% !important;
+  border-collapse: collapse;
+}
+tbody, thead, tfoot, tr, td, th {
+  min-width: 0 !important;
+}
+td, th {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+code {
+  overflow-wrap: anywhere;
+}
 .nyamail-img-placeholder {
   display: inline-flex;
   align-items: center;

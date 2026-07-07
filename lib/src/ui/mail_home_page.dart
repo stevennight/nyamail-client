@@ -183,6 +183,7 @@ class _MailHomePageState extends State<MailHomePage> {
   bool _mailUndoSnackBarVisible = false;
   int _mailUndoSnackBarGeneration = 0;
   String? _pendingPairingPackage;
+  final _mobileMessageNotifiers = <String, ValueNotifier<MailMessage>>{};
   final _startupService = const StartupService();
   final _systemSettingsStore = const SystemBehaviorSettingsStore();
   final _trayService = NyaMailTrayService();
@@ -209,6 +210,7 @@ class _MailHomePageState extends State<MailHomePage> {
   void dispose() {
     _newMailPollTimer?.cancel();
     unawaited(_trayService.dispose());
+    _mobileMessageNotifiers.clear();
     _search.dispose();
     super.dispose();
   }
@@ -3449,6 +3451,7 @@ class _MailHomePageState extends State<MailHomePage> {
     setState(() => _selected = message);
     _markReadWhenOpened(message);
     final notifier = ValueNotifier<MailMessage>(_selected ?? message);
+    _mobileMessageNotifiers[message.id] = notifier;
     var disposed = false;
     unawaited(
       _ensureMessageBody(message).then((loaded) {
@@ -3488,6 +3491,9 @@ class _MailHomePageState extends State<MailHomePage> {
       );
     } finally {
       disposed = true;
+      if (_mobileMessageNotifiers[message.id] == notifier) {
+        _mobileMessageNotifiers.remove(message.id);
+      }
       notifier.dispose();
     }
   }
@@ -3682,6 +3688,7 @@ class _MailHomePageState extends State<MailHomePage> {
     if (notice != null) {
       _showTransientNotice(notice);
     }
+    _updateMobileMessageNotifiers(snapshot.messages);
     _ensureSelectedMessageBody();
   }
 
@@ -3750,6 +3757,37 @@ class _MailHomePageState extends State<MailHomePage> {
     });
   }
 
+  void _runImmediateMailAction({
+    required String description,
+    required _MailUndoSnapshot snapshot,
+    required VoidCallback applyLocal,
+    required Future<void> Function() commitRemote,
+  }) {
+    applyLocal();
+    _showTransientNotice(description);
+    unawaited(
+      _commitImmediateMailAction(
+        snapshot: snapshot,
+        commitRemote: commitRemote,
+      ),
+    );
+  }
+
+  Future<void> _commitImmediateMailAction({
+    required _MailUndoSnapshot snapshot,
+    required Future<void> Function() commitRemote,
+  }) async {
+    try {
+      await _refreshOAuthVaultIfNeeded();
+      if (!mounted) return;
+      await commitRemote();
+    } catch (error) {
+      if (!mounted) return;
+      _restoreMailUndoSnapshot(snapshot, notice: null);
+      _showTransientNotice('Could not sync mail action: $error', error: true);
+    }
+  }
+
   void _scheduleTogglePinnedMessages(List<MailMessage> messages) {
     if (messages.isEmpty) return;
     final selectedIds = messages.map((message) => message.id).toSet();
@@ -3786,7 +3824,7 @@ class _MailHomePageState extends State<MailHomePage> {
     final updated = [
       for (final message in messages) message.copyWith(read: read),
     ];
-    _scheduleUndoableMailAction(
+    _runImmediateMailAction(
       description:
           read
               ? _messageCountLabel(
@@ -3820,7 +3858,7 @@ class _MailHomePageState extends State<MailHomePage> {
     final updated = [
       for (final message in messages) message.copyWith(starred: starred),
     ];
-    _scheduleUndoableMailAction(
+    _runImmediateMailAction(
       description:
           starred
               ? _messageCountLabel(
@@ -4046,10 +4084,20 @@ class _MailHomePageState extends State<MailHomePage> {
         }
       }
     });
+    _updateMobileMessageNotifiers(updatedMessages);
   }
 
   void _replaceMessage(MailMessage updated) {
     _replaceMessages([updated]);
+  }
+
+  void _updateMobileMessageNotifiers(Iterable<MailMessage> messages) {
+    for (final message in messages) {
+      final notifier = _mobileMessageNotifiers[message.id];
+      if (notifier != null) {
+        notifier.value = message;
+      }
+    }
   }
 
   void _removeMessages(Set<String> messageIds) {
@@ -5434,6 +5482,7 @@ class _MessageListState extends State<_MessageList> {
         widget.interactionSettings.mobileSwipeEnabled &&
         !selecting) {
       child = _SwipeActionTile(
+        message: message,
         leftLevel1: widget.interactionSettings.mobileSwipeLeftToRightLevel1,
         leftLevel2: widget.interactionSettings.mobileSwipeLeftToRightLevel2,
         rightLevel1: widget.interactionSettings.mobileSwipeRightToLeftLevel1,
@@ -5709,6 +5758,7 @@ class _MessageListTile extends StatelessWidget {
 
 class _SwipeActionTile extends StatefulWidget {
   const _SwipeActionTile({
+    required this.message,
     required this.leftLevel1,
     required this.leftLevel2,
     required this.rightLevel1,
@@ -5717,6 +5767,7 @@ class _SwipeActionTile extends StatefulWidget {
     required this.child,
   });
 
+  final MailMessage message;
   final MailListActionPreference leftLevel1;
   final MailListActionPreference leftLevel2;
   final MailListActionPreference rightLevel1;
@@ -5767,6 +5818,7 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
             children: [
               Positioned.fill(
                 child: _SwipeActionBackground(
+                  message: widget.message,
                   direction: direction,
                   revealExtent: visualDx.abs(),
                   level1Action:
@@ -5864,12 +5916,14 @@ class _SwipeActionSelection {
 
 class _SwipeActionBackground extends StatelessWidget {
   const _SwipeActionBackground({
+    required this.message,
     required this.direction,
     required this.revealExtent,
     required this.level1Action,
     required this.activeAction,
   });
 
+  final MailMessage message;
   final _SwipeDirection? direction;
   final double revealExtent;
   final MailListActionPreference level1Action;
@@ -5890,6 +5944,7 @@ class _SwipeActionBackground extends StatelessWidget {
                 ? Alignment.centerLeft
                 : Alignment.centerRight,
         child: _SwipeActionPane(
+          message: message,
           action: action,
           revealExtent: revealExtent,
           active: activeAction == action,
@@ -5901,11 +5956,13 @@ class _SwipeActionBackground extends StatelessWidget {
 
 class _SwipeActionPane extends StatelessWidget {
   const _SwipeActionPane({
+    required this.message,
     required this.action,
     required this.revealExtent,
     required this.active,
   });
 
+  final MailMessage message;
   final MailListActionPreference action;
   final double revealExtent;
   final bool active;
@@ -5928,7 +5985,7 @@ class _SwipeActionPane extends StatelessWidget {
             child: Transform.scale(
               scale: active ? 1.08 : 0.9 + (0.1 * progress),
               child: Icon(
-                _mailListActionIcon(action),
+                _mailListActionIcon(action, message: message),
                 color: _mailListActionForegroundColor(action, colorScheme),
                 size: active ? 24 : 22,
               ),

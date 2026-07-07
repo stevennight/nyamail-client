@@ -94,6 +94,9 @@ class _MailHtmlViewState extends State<MailHtmlView> {
                 transparentBackground: true,
                 disableContextMenu: true,
                 supportZoom: true,
+                useWideViewPort: true,
+                loadWithOverviewMode: true,
+                horizontalScrollBarEnabled: true,
                 verticalScrollBarEnabled: false,
               ),
               onWebViewCreated: (controller) {
@@ -207,6 +210,37 @@ class _MailHtmlViewState extends State<MailHtmlView> {
       await controller.evaluateJavascript(
         source: '''
 (function() {
+  function fitWideContent() {
+    function setImportant(node, name, value) {
+      if (node.style.getPropertyValue(name) === value &&
+          node.style.getPropertyPriority(name) === 'important') {
+        return;
+      }
+      node.style.setProperty(name, value, 'important');
+    }
+    var selectors = [
+      'img',
+      'video',
+      'canvas',
+      'svg',
+      'iframe',
+      'table',
+      'pre'
+    ];
+    selectors.forEach(function(selector) {
+      document.querySelectorAll(selector).forEach(function(node) {
+        setImportant(node, 'max-width', '100%');
+        setImportant(node, 'box-sizing', 'border-box');
+        if (selector === 'img' || selector === 'video' || selector === 'canvas') {
+          setImportant(node, 'height', 'auto');
+        }
+      });
+    });
+    document.querySelectorAll('td, th').forEach(function(node) {
+      setImportant(node, 'word-break', 'break-word');
+      setImportant(node, 'overflow-wrap', 'anywhere');
+    });
+  }
   function heightOf(node) {
     if (!node) return 0;
     return Math.max(
@@ -216,6 +250,7 @@ class _MailHtmlViewState extends State<MailHtmlView> {
     );
   }
   function postHeight() {
+    fitWideContent();
     var doc = document.documentElement;
     var body = document.body;
     var height = Math.ceil(Math.max(
@@ -233,6 +268,17 @@ class _MailHtmlViewState extends State<MailHtmlView> {
     window.__nyamailResizeObserver.observe(document.documentElement);
     if (document.body) window.__nyamailResizeObserver.observe(document.body);
   }
+  if (window.__nyamailMutationObserver) {
+    window.__nyamailMutationObserver.disconnect();
+  }
+  if (window.MutationObserver && document.body) {
+    window.__nyamailMutationObserver = new MutationObserver(postHeight);
+    window.__nyamailMutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+  fitWideContent();
   window.addEventListener('load', postHeight, { once: true });
   setTimeout(postHeight, 0);
   setTimeout(postHeight, 100);

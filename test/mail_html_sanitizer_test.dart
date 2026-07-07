@@ -196,6 +196,22 @@ void main() {
     expect(rendered.html, contains('color-scheme: light dark'));
   });
 
+  test('mail html renderer constrains wide content to the viewport', () {
+    final rendered = buildMailHtmlDocument(
+      htmlBody:
+          '<table style="width: 1200px"><tr><td>long content</td></tr></table>',
+      textBody: '',
+      policy: const MailHtmlRenderPolicy(
+        loadRemoteImages: false,
+        loadExternalStylesAndFonts: false,
+      ),
+    );
+
+    expect(rendered.html, contains('max-width: 100% !important'));
+    expect(rendered.html, contains('overflow-x: auto'));
+    expect(rendered.html, contains('word-break: break-word'));
+  });
+
   test('mail html renderer can force light canvas on dark hosts', () {
     final rendered = buildMailHtmlDocument(
       htmlBody: '<p>Hello</p>',
