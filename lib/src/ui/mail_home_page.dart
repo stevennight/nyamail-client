@@ -3693,9 +3693,26 @@ class _MailHomePageState extends State<MailHomePage> {
   }) {
     applyLocal();
     var undone = false;
+    var committing = false;
+    final messenger = ScaffoldMessenger.of(context);
+    final snackBarGeneration = ++_mailUndoSnackBarGeneration;
+    _mailUndoSnackBarVisible = true;
+    messenger.hideCurrentSnackBar();
+    late final ScaffoldFeatureController<SnackBar, SnackBarClosedReason>
+    snackBarController;
     late final Timer timer;
+
+    void markUndoSnackBarClosed() {
+      if (_mailUndoSnackBarGeneration == snackBarGeneration) {
+        _mailUndoSnackBarVisible = false;
+      }
+    }
+
     timer = Timer(_mailActionUndoWindow, () async {
       if (undone || !mounted) return;
+      committing = true;
+      markUndoSnackBarClosed();
+      snackBarController.close();
       try {
         await _refreshOAuthVaultIfNeeded();
         if (undone || !mounted) return;
@@ -3707,37 +3724,30 @@ class _MailHomePageState extends State<MailHomePage> {
       }
     });
 
-    final messenger = ScaffoldMessenger.of(context);
-    final snackBarGeneration = ++_mailUndoSnackBarGeneration;
-    _mailUndoSnackBarVisible = true;
-    messenger.hideCurrentSnackBar();
-    messenger
-        .showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                Expanded(child: Text(description)),
-                const SizedBox(width: 12),
-                _UndoCountdownIndicator(duration: _mailActionUndoWindow),
-              ],
-            ),
-            duration: _mailActionUndoWindow,
-            action: SnackBarAction(
-              label: 'Undo',
-              onPressed: () {
-                undone = true;
-                timer.cancel();
-                _restoreMailUndoSnapshot(snapshot);
-              },
-            ),
-          ),
-        )
-        .closed
-        .whenComplete(() {
-          if (_mailUndoSnackBarGeneration == snackBarGeneration) {
-            _mailUndoSnackBarVisible = false;
-          }
-        });
+    snackBarController = messenger.showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Expanded(child: Text(description)),
+            const SizedBox(width: 12),
+            _UndoCountdownIndicator(duration: _mailActionUndoWindow),
+          ],
+        ),
+        duration: _mailActionUndoWindow,
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            if (committing) return;
+            undone = true;
+            timer.cancel();
+            _restoreMailUndoSnapshot(snapshot);
+          },
+        ),
+      ),
+    );
+    snackBarController.closed.whenComplete(() {
+      markUndoSnackBarClosed();
+    });
   }
 
   void _scheduleTogglePinnedMessages(List<MailMessage> messages) {
