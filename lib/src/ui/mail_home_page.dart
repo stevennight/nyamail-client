@@ -3644,7 +3644,13 @@ class _MailHomePageState extends State<MailHomePage> {
     messenger.hideCurrentSnackBar();
     messenger.showSnackBar(
       SnackBar(
-        content: Text(description),
+        content: Row(
+          children: [
+            Expanded(child: Text(description)),
+            const SizedBox(width: 12),
+            _UndoCountdownIndicator(duration: _mailActionUndoWindow),
+          ],
+        ),
         duration: _mailActionUndoWindow,
         action: SnackBarAction(
           label: 'Undo',
@@ -4016,6 +4022,78 @@ class _MailUndoSnapshot {
   final Set<String> selectedMessageIds;
   final Set<String> pinnedMessageIds;
   final MailInteractionSettings interactionSettings;
+}
+
+class _UndoCountdownIndicator extends StatefulWidget {
+  const _UndoCountdownIndicator({required this.duration});
+
+  final Duration duration;
+
+  @override
+  State<_UndoCountdownIndicator> createState() => _UndoCountdownIndicatorState();
+}
+
+class _UndoCountdownIndicatorState extends State<_UndoCountdownIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this, duration: widget.duration)
+      ..forward();
+  }
+
+  @override
+  void didUpdateWidget(_UndoCountdownIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.duration == widget.duration) return;
+    _controller
+      ..duration = widget.duration
+      ..forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final remainingProgress = (1 - _controller.value).clamp(0.0, 1.0);
+        final remainingSeconds =
+            (widget.duration.inMilliseconds * remainingProgress / 1000).ceil();
+        return SizedBox.square(
+          dimension: 32,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              CircularProgressIndicator(
+                value: remainingProgress,
+                strokeWidth: 2.5,
+                color: colorScheme.inversePrimary,
+                backgroundColor: colorScheme.onInverseSurface.withValues(
+                  alpha: 0.22,
+                ),
+              ),
+              Text(
+                '$remainingSeconds',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: colorScheme.onInverseSurface,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 }
 
 class _UpdateDetailRow extends StatelessWidget {
@@ -5643,11 +5721,11 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
   }
 
   double _maxVisualOffset(double width) {
-    return math.min(width * 0.30, _actionPaneWidth);
+    return math.min(width * 0.58, _actionPaneWidth * 2.25);
   }
 
   double _maxDragDistance(double width) {
-    return _maxVisualOffset(width);
+    return math.min(width * 0.72, _actionPaneWidth * 3);
   }
 }
 
