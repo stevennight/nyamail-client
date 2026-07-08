@@ -22,6 +22,7 @@ void main() {
           'refreshToken': 'refresh-token',
           'expiresIn': 3600,
           'grantedScopes': ['https://mail.google.com/'],
+          'accountEmail': 'me@gmail.com',
         };
       });
       addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
@@ -34,6 +35,7 @@ void main() {
         provider: oauthProviderConfig('gmail'),
         clientId: 'android-client-id.apps.googleusercontent.com',
         loginHint: 'me@gmail.com',
+        forceAccountPicker: true,
         onProgress: progress.add,
       );
 
@@ -42,6 +44,7 @@ void main() {
       expect(calls.single.arguments, {
         'clientId': 'android-client-id.apps.googleusercontent.com',
         'loginHint': 'me@gmail.com',
+        'forceAccountPicker': true,
         'scopes': ['https://mail.google.com/'],
       });
       expect(progress, [
@@ -54,6 +57,34 @@ void main() {
       expect(tokenSet.scope, 'https://mail.google.com/');
     },
   );
+
+  test('android google client rejects a different selected account', () async {
+    const channel = MethodChannel('test_google_authorization_mismatch');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      return <String, Object?>{
+        'accessToken': 'access-token',
+        'tokenType': 'Bearer',
+        'expiresIn': 3600,
+        'grantedScopes': ['https://mail.google.com/'],
+        'accountEmail': 'other@gmail.com',
+      };
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    await expectLater(
+      const GoogleAndroidOAuthClient(
+        channel: channel,
+        isSupportedOverride: true,
+      ).authorize(
+        provider: oauthProviderConfig('gmail'),
+        clientId: 'android-client-id.apps.googleusercontent.com',
+        loginHint: 'me@gmail.com',
+      ),
+      throwsA(isA<OAuthLoopbackException>()),
+    );
+  });
 
   test('android google client rejects unsupported providers', () async {
     await expectLater(

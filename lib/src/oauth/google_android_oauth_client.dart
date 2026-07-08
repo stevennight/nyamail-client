@@ -23,6 +23,7 @@ class GoogleAndroidOAuthClient {
     required OAuthProviderConfig provider,
     String clientId = '',
     String? loginHint,
+    bool forceAccountPicker = false,
     OAuthAuthorizationProgressCallback? onProgress,
   }) async {
     if (!isSupported) {
@@ -41,11 +42,22 @@ class GoogleAndroidOAuthClient {
       {
         'clientId': clientId,
         'loginHint': loginHint ?? '',
+        'forceAccountPicker': forceAccountPicker,
         'scopes': provider.scopes,
       },
     );
     onProgress?.call(OAuthAuthorizationProgress.exchangingToken);
     final result = raw ?? const <String, Object?>{};
+    final expectedEmail = loginHint?.trim() ?? '';
+    final accountEmail = (result['accountEmail'] as String? ?? '').trim();
+    if (expectedEmail.isNotEmpty &&
+        accountEmail.isNotEmpty &&
+        expectedEmail.toLowerCase() != accountEmail.toLowerCase()) {
+      throw OAuthLoopbackException(
+        'Google authorization returned $accountEmail, but this mailbox is '
+        '$expectedEmail. Choose the same Google account as the mailbox address.',
+      );
+    }
     final accessToken = (result['accessToken'] as String? ?? '').trim();
     if (accessToken.isEmpty) {
       throw const OAuthLoopbackException(

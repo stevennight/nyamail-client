@@ -75,6 +75,7 @@ Future<OAuthTokenSet> _authorizeOAuthForCurrentPlatform({
   String? clientSecret,
   String? loginHint,
   Uri? mobileRedirectUri,
+  bool forceAccountPicker = false,
   OAuthAuthorizationProgressCallback? onProgress,
 }) {
   if (_usesGoogleAndroidOAuth(provider.provider)) {
@@ -82,6 +83,7 @@ Future<OAuthTokenSet> _authorizeOAuthForCurrentPlatform({
       provider: provider,
       clientId: clientId,
       loginHint: loginHint,
+      forceAccountPicker: forceAccountPicker,
       onProgress: onProgress,
     );
   }
@@ -2046,6 +2048,7 @@ class _MailHomePageState extends State<MailHomePage>
         clientSecret: clientSecret,
         loginHint: item.address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(item.provider),
+        forceAccountPicker: true,
         onProgress: (progress) {
           if (!mounted) return;
           setState(
@@ -11948,6 +11951,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
         clientSecret: clientSecret,
         loginHint: address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(_provider),
+        forceAccountPicker: true,
         onProgress: _setOAuthProgress,
       );
       final item = oauthMailboxItem(
@@ -11961,6 +11965,11 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
       );
       final credential = item.toCredential();
       _pendingCredential = credential;
+      if (mounted) {
+        setState(
+          () => _status = _oauthValidationMessage(oauthProvider.provider),
+        );
+      }
       await const SocketMailTransport().validateCredential(
         credential: credential,
       );
@@ -12355,6 +12364,15 @@ String _oauthProgressMessage(
       '$label callback received. Requesting token...',
     OAuthAuthorizationProgress.exchangingToken => 'Requesting $label token...',
   };
+}
+
+String _oauthValidationMessage(String provider) {
+  final label = switch (provider.trim().toLowerCase()) {
+    'gmail' || 'google' => 'Google mailbox',
+    'outlook' || 'microsoft' => 'Outlook mailbox',
+    _ => '${provider.trim().isEmpty ? 'OAuth' : provider.trim()} mailbox',
+  };
+  return 'Validating $label access...';
 }
 
 String _providerLabel(String provider) {
