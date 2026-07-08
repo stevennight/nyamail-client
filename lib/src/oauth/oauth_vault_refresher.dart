@@ -10,16 +10,27 @@ typedef OAuthTokenRefresh =
       required String refreshToken,
     });
 
+typedef OAuthAccessTokenReauthorize =
+    Future<OAuthTokenSet> Function({
+      required OAuthProviderConfig provider,
+      required String clientId,
+      String? clientSecret,
+      required String loginHint,
+    });
+
 class OAuthVaultRefresher {
   OAuthVaultRefresher({
     required OAuthTokenRefresh refreshTokens,
+    OAuthAccessTokenReauthorize? reauthorizeAccessToken,
     Duration refreshBefore = const Duration(minutes: 5),
     DateTime Function()? clock,
   }) : _refreshTokens = refreshTokens,
+       _reauthorizeAccessToken = reauthorizeAccessToken,
        _refreshBefore = refreshBefore,
        _clock = clock ?? (() => DateTime.now().toUtc());
 
   final OAuthTokenRefresh _refreshTokens;
+  final OAuthAccessTokenReauthorize? _reauthorizeAccessToken;
   final Duration _refreshBefore;
   final DateTime Function() _clock;
 
@@ -28,6 +39,7 @@ class OAuthVaultRefresher {
     required String Function(String provider) clientIdForProvider,
     String Function(String provider) clientSecretForProvider =
         _emptyOAuthClientSecret,
+    bool force = false,
   }) async {
     final now = _clock().toUtc();
     final threshold = now.add(_refreshBefore);
@@ -37,7 +49,7 @@ class OAuthVaultRefresher {
 
     for (final item in document.items) {
       var next = item;
-      if (_shouldRefresh(item, threshold)) {
+      if (_shouldRefresh(item, threshold, force: force)) {
         final clientId =
             item.oauthClientId.trim().isNotEmpty
                 ? item.oauthClientId.trim()
@@ -54,15 +66,24 @@ class OAuthVaultRefresher {
         } else {
           try {
             final provider = oauthProviderConfig(item.provider);
-            final tokenSet = await _refreshTokens(
-              provider: provider,
-              clientId: clientId,
-              clientSecret:
-                  item.oauthClientId.trim().isNotEmpty
-                      ? item.oauthClientSecret
-                      : clientSecretForProvider(item.provider),
-              refreshToken: item.refreshToken,
-            );
+            final clientSecret =
+                item.oauthClientId.trim().isNotEmpty
+                    ? item.oauthClientSecret
+                    : clientSecretForProvider(item.provider);
+            final tokenSet =
+                item.refreshToken.isNotEmpty
+                    ? await _refreshTokens(
+                      provider: provider,
+                      clientId: clientId,
+                      clientSecret: clientSecret,
+                      refreshToken: item.refreshToken,
+                    )
+                    : await _reauthorizeAccessToken!(
+                      provider: provider,
+                      clientId: clientId,
+                      clientSecret: clientSecret,
+                      loginHint: item.address,
+                    );
             next = item.copyWith(
               secret: tokenSet.accessToken,
               refreshToken:
@@ -98,10 +119,18 @@ class OAuthVaultRefresher {
     );
   }
 
-  bool _shouldRefresh(VaultMailboxItem item, DateTime threshold) {
-    if (item.kind != VaultItemKind.oauth || item.refreshToken.isEmpty) {
+  bool _shouldRefresh(
+    VaultMailboxItem item,
+    DateTime threshold, {
+    required bool force,
+  }) {
+    if (item.kind != VaultItemKind.oauth) {
       return false;
     }
+    if (item.refreshToken.isEmpty && _reauthorizeAccessToken == null) {
+      return false;
+    }
+    if (force) return true;
     if (item.secret.isEmpty) return true;
     final expiresAt = item.tokenExpiresAt;
     if (expiresAt == null) return true;

@@ -248,6 +248,33 @@ void main() {
     expect(loaded.single.preview, 'Preview text');
   });
 
+  test('mail cache serializes concurrent writes without dropping messages', () async {
+    final cacheA = MailCache(supportDirectoryProvider: () async => tempDir);
+    final cacheB = MailCache(supportDirectoryProvider: () async => tempDir);
+
+    await Future.wait([
+      for (var index = 0; index < 20; index++)
+        (index.isEven ? cacheA : cacheB).saveMessages([
+          MailMessage(
+            id: 'work:inbox:$index',
+            accountId: 'work',
+            from: 'Sender <sender@example.com>',
+            subject: 'Message $index',
+            preview: 'Preview $index',
+            body: '',
+            receivedAt: DateTime.utc(2026, 7, 2, 0, index),
+            bodyLoaded: false,
+          ),
+        ]),
+    ]);
+
+    final loaded = await cacheA.loadMessages();
+
+    expect(loaded.map((message) => message.id).toSet(), {
+      for (var index = 0; index < 20; index++) 'work:inbox:$index',
+    });
+  });
+
   test('mail cache clear removes only the selected user namespace', () async {
     final userACache = MailCache(
       namespace: mailCacheNamespaceForUser('user-a'),

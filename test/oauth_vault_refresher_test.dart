@@ -139,6 +139,58 @@ void main() {
     );
   });
 
+  test('reauthorizes expiring oauth items when refresh token is unavailable', () async {
+    final now = DateTime.utc(2026, 7, 1, 12);
+    final document = VaultDocument(
+      version: 1,
+      items: [
+        _oauthItem(
+          secret: 'old-access-token',
+          refreshToken: '',
+          tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
+        ),
+      ],
+    );
+
+    final result = await OAuthVaultRefresher(
+      clock: () => now,
+      refreshTokens: ({
+        required OAuthProviderConfig provider,
+        required String clientId,
+        String? clientSecret,
+        required String refreshToken,
+      }) async {
+        throw StateError('refresh token path should not be used');
+      },
+      reauthorizeAccessToken: ({
+        required OAuthProviderConfig provider,
+        required String clientId,
+        String? clientSecret,
+        required String loginHint,
+      }) async {
+        expect(provider.provider, 'gmail');
+        expect(clientId, 'client-id');
+        expect(loginHint, 'me@gmail.com');
+        return const OAuthTokenSet(
+          accessToken: 'new-android-access-token',
+          tokenType: 'Bearer',
+          expiresIn: 3300,
+        );
+      },
+    ).refreshExpiring(
+      document: document,
+      clientIdForProvider: (_) => 'client-id',
+    );
+
+    expect(result.changed, isTrue);
+    expect(result.document.items.single.secret, 'new-android-access-token');
+    expect(result.document.items.single.refreshToken, isEmpty);
+    expect(
+      result.document.items.single.tokenExpiresAt,
+      now.add(const Duration(seconds: 3300)),
+    );
+  });
+
   test('uses item oauth client for synced refresh tokens', () async {
     final now = DateTime.utc(2026, 7, 1, 12);
     final document = VaultDocument(

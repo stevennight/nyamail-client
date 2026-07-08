@@ -1235,6 +1235,72 @@ void main() {
     },
   );
 
+  test(
+    'messagePage preserves cached mail when preview fetch is incomplete',
+    () async {
+      final transport =
+          _RecordingTransport()
+            ..incompletePreviewFetch = true
+            ..messagesByMailbox[MailboxKind.inbox] = [
+              MailMessage(
+                id: 'work:inbox:42',
+                accountId: 'work',
+                from: 'Sender <sender@example.com>',
+                subject: 'Fetched partial page',
+                preview: 'Still remote',
+                body: 'Still remote',
+                receivedAt: DateTime.utc(2026, 7, 2),
+              ),
+            ];
+      final cache = _MemoryMailCache();
+      await cache.saveMessages([
+        MailMessage(
+          id: 'work:inbox:42',
+          accountId: 'work',
+          from: 'Sender <sender@example.com>',
+          subject: 'Fetched partial page',
+          preview: 'Still remote',
+          body: 'Still remote',
+          receivedAt: DateTime.utc(2026, 7, 2),
+        ),
+        MailMessage(
+          id: 'work:inbox:41',
+          accountId: 'work',
+          from: 'Cached <cached@example.com>',
+          subject: 'Keep until complete sync',
+          preview: 'Do not remove on partial fetch',
+          body: 'Do not remove on partial fetch',
+          receivedAt: DateTime.utc(2026, 7, 1),
+        ),
+      ]);
+      final repository = CachedTransportMailRepository(
+        cache: cache,
+        transport: transport,
+        credentials: const [
+          MailboxCredential(
+            accountId: 'work',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: 'imap.example.com',
+            imapPort: 993,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+          ),
+        ],
+      );
+
+      await repository.messagePage(mailbox: MailboxKind.inbox, limit: 30);
+      final cached = await cache.loadMessages(mailbox: MailboxKind.inbox);
+
+      expect(cached.map((message) => message.id).toSet(), {
+        'work:inbox:42',
+        'work:inbox:41',
+      });
+    },
+  );
+
   test('archive moves cached message into archive mailbox', () async {
     final transport =
         _RecordingTransport()
@@ -1852,6 +1918,7 @@ class _RecordingTransport implements MailTransport {
   final bodyById = <String, MailMessage>{};
   final fetchedCredentialIds = <String>[];
   final fetchedBeforeUids = <int?>[];
+  bool incompletePreviewFetch = false;
 
   @override
   Future<void> validateCredential({
@@ -1896,7 +1963,7 @@ class _RecordingTransport implements MailTransport {
   }
 
   @override
-  Future<List<MailMessage>> fetchMessagePreviews({
+  Future<MailPreviewPage> fetchMessagePreviews({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     int limit = 30,
@@ -1907,7 +1974,7 @@ class _RecordingTransport implements MailTransport {
     fetchedLimit = limit;
     fetchedBeforeUid = beforeUid;
     fetchedBeforeUids.add(beforeUid);
-    return [
+    final messages = [
       for (final message in _messageWindow(
         credential: credential,
         mailbox: mailbox,
@@ -1921,10 +1988,28 @@ class _RecordingTransport implements MailTransport {
           bodyLoaded: false,
         ),
     ];
+    final remoteUids = [
+      for (final message in _messagesForMailbox(credential, mailbox))
+        if (_uidFor(message) case final uid?) uid,
+    ];
+    return MailPreviewPage(
+      messages: messages,
+      selectedUids: [
+        for (final message in messages)
+          if (_uidFor(message) case final uid?) uid,
+      ],
+      remoteUids: remoteUids,
+      hasMore: _hasMoreMessages(
+        remoteUids,
+        limit: limit,
+        beforeUid: beforeUid,
+      ),
+      complete: !incompletePreviewFetch,
+    );
   }
 
   @override
-  Future<List<MailMessage>> fetchFolderMessagePreviews({
+  Future<MailPreviewPage> fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     int limit = 30,
@@ -1935,7 +2020,7 @@ class _RecordingTransport implements MailTransport {
     fetchedLimit = limit;
     fetchedBeforeUid = beforeUid;
     fetchedBeforeUids.add(beforeUid);
-    return [
+    final messages = [
       for (final message in _messageWindowForFolder(
         credential: credential,
         folder: folder,
@@ -1952,6 +2037,24 @@ class _RecordingTransport implements MailTransport {
           bodyLoaded: false,
         ),
     ];
+    final remoteUids = [
+      for (final message in _messagesForFolder(credential, folder))
+        if (_uidFor(message) case final uid?) uid,
+    ];
+    return MailPreviewPage(
+      messages: messages,
+      selectedUids: [
+        for (final message in messages)
+          if (_uidFor(message) case final uid?) uid,
+      ],
+      remoteUids: remoteUids,
+      hasMore: _hasMoreMessages(
+        remoteUids,
+        limit: limit,
+        beforeUid: beforeUid,
+      ),
+      complete: !incompletePreviewFetch,
+    );
   }
 
   @override
@@ -2029,8 +2132,37 @@ class _RecordingTransport implements MailTransport {
         DownloadedAttachment(
           filename: attachment.filename,
           contentType: attachment.contentType,
-          bytes: const [],
+            bytes: const [],
         );
+  }
+
+  List<MailMessage> _messagesForMailbox(
+    MailboxCredential credential,
+    MailboxKind mailbox,
+  ) {
+    return messagesByCredential[credential.accountId] ??
+        messagesByMailbox[mailbox] ??
+        const [];
+  }
+
+  List<MailMessage> _messagesForFolder(
+    MailboxCredential credential,
+    MailFolder folder,
+  ) {
+    return messagesByFolder[folder.key] ??
+        messagesByCredential[credential.accountId] ??
+        messagesByMailbox[folder.kind] ??
+        const [];
+  }
+
+  bool _hasMoreMessages(
+    List<int> uids, {
+    required int limit,
+    int? beforeUid,
+  }) {
+    final eligible =
+        beforeUid == null ? uids : uids.where((uid) => uid < beforeUid);
+    return eligible.length > limit;
   }
 
   List<MailMessage> _messageWindow({
@@ -2039,8 +2171,7 @@ class _RecordingTransport implements MailTransport {
     required int limit,
     int? beforeUid,
   }) {
-    final credentialMessages = messagesByCredential[credential.accountId];
-    final source = credentialMessages ?? messagesByMailbox[mailbox] ?? const [];
+    final source = _messagesForMailbox(credential, mailbox);
     final sorted = [...source]..sort((a, b) {
       final aUid = _uidFor(a);
       final bUid = _uidFor(b);
@@ -2062,11 +2193,7 @@ class _RecordingTransport implements MailTransport {
     required int limit,
     int? beforeUid,
   }) {
-    final source =
-        messagesByFolder[folder.key] ??
-        messagesByCredential[credential.accountId] ??
-        messagesByMailbox[folder.kind] ??
-        const [];
+    final source = _messagesForFolder(credential, folder);
     final sorted = [...source]..sort((a, b) {
       final aUid = _uidFor(a);
       final bUid = _uidFor(b);

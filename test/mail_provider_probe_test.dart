@@ -125,7 +125,7 @@ class _ProbeTransport implements MailTransport {
   }
 
   @override
-  Future<List<MailMessage>> fetchMessagePreviews({
+  Future<MailPreviewPage> fetchMessagePreviews({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     int limit = 30,
@@ -135,7 +135,7 @@ class _ProbeTransport implements MailTransport {
   }
 
   @override
-  Future<List<MailMessage>> fetchFolderMessagePreviews({
+  Future<MailPreviewPage> fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     int limit = 30,

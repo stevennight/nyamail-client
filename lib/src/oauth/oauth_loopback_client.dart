@@ -21,6 +21,8 @@ enum OAuthAuthorizationProgress {
   exchangingToken,
 }
 
+const _oauthTokenRequestTimeout = Duration(seconds: 20);
+
 class OAuthMobileRedirectConfig {
   const OAuthMobileRedirectConfig({
     this.scheme = 'com.nyatori.nyamail',
@@ -284,16 +286,18 @@ class OAuthLoopbackClient {
     String? clientSecret,
     required String refreshToken,
   }) async {
-    final response = await _httpClient.post(
-      provider.tokenEndpoint,
-      headers: const {'content-type': 'application/x-www-form-urlencoded'},
-      body: _tokenRequestBody({
-        'client_id': clientId,
-        'client_secret': clientSecret,
-        'grant_type': 'refresh_token',
-        'refresh_token': refreshToken,
-      }),
-    );
+    final response = await _httpClient
+        .post(
+          provider.tokenEndpoint,
+          headers: const {'content-type': 'application/x-www-form-urlencoded'},
+          body: _tokenRequestBody({
+            'client_id': clientId,
+            'client_secret': clientSecret,
+            'grant_type': 'refresh_token',
+            'refresh_token': refreshToken,
+          }),
+        )
+        .timeout(_oauthTokenRequestTimeout);
     return OAuthTokenSet.fromJson(_decodeJson(response));
   }
 
@@ -392,18 +396,20 @@ class OAuthLoopbackClient {
     required Uri redirectUri,
     required String codeVerifier,
   }) async {
-    final response = await _httpClient.post(
-      provider.tokenEndpoint,
-      headers: const {'content-type': 'application/x-www-form-urlencoded'},
-      body: _tokenRequestBody({
-        'client_id': clientId,
-        'client_secret': clientSecret,
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': redirectUri.toString(),
-        'code_verifier': codeVerifier,
-      }),
-    );
+    final response = await _httpClient
+        .post(
+          provider.tokenEndpoint,
+          headers: const {'content-type': 'application/x-www-form-urlencoded'},
+          body: _tokenRequestBody({
+            'client_id': clientId,
+            'client_secret': clientSecret,
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirectUri.toString(),
+            'code_verifier': codeVerifier,
+          }),
+        )
+        .timeout(_oauthTokenRequestTimeout);
     return OAuthTokenSet.fromJson(_decodeJson(response));
   }
 

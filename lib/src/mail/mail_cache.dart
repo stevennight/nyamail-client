@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -31,33 +32,29 @@ class MailCache implements MailMessageCache {
   final String? namespace;
   final String? localCacheSecret;
   final Future<Directory> Function()? supportDirectoryProvider;
+  static final Map<String, _AsyncMutex> _locks = <String, _AsyncMutex>{};
 
   @override
   Future<void> saveMessages(List<MailMessage> messages) async {
     final file = await _cacheFile();
-    final existing = await loadMessages();
-    final byId = {for (final message in existing) message.id: message};
-    for (final message in messages) {
-      final current = byId[message.id];
-      byId[message.id] =
-          current != null && current.bodyLoaded && !message.bodyLoaded
-              ? message.copyWith(
-                body: current.body,
-                htmlBody: current.htmlBody,
-                hasAttachments: current.hasAttachments,
-                attachments: current.attachments,
-                bodyLoaded: true,
-              )
-              : message;
-    }
-    final encoded =
-        byId.values.map(_messageToJson).toList()..sort(
-          (a, b) => (b['received_at'] as String).compareTo(
-            a['received_at'] as String,
-          ),
-        );
-    await file.parent.create(recursive: true);
-    await _writeCacheText(file, jsonEncode(encoded));
+    await _lockFor(file).synchronized(() async {
+      final existing = await _loadMessagesFromFile(file);
+      final byId = {for (final message in existing) message.id: message};
+      for (final message in messages) {
+        final current = byId[message.id];
+        byId[message.id] =
+            current != null && current.bodyLoaded && !message.bodyLoaded
+                ? message.copyWith(
+                  body: current.body,
+                  htmlBody: current.htmlBody,
+                  hasAttachments: current.hasAttachments,
+                  attachments: current.attachments,
+                  bodyLoaded: true,
+                )
+                : message;
+      }
+      await _writeMessagesToFile(file, byId.values);
+    });
   }
 
   @override
@@ -68,8 +65,31 @@ class MailCache implements MailMessageCache {
     String? query,
   }) async {
     final file = await _cacheFile();
+    return _lockFor(file).synchronized(() async {
+      final decoded = await _loadMessagesFromFile(file);
+      final scoped =
+          decoded.where((message) {
+            if (mailbox != null && message.effectiveMailbox != mailbox) {
+              return false;
+            }
+            if (accountId != null && message.accountId != accountId) {
+              return false;
+            }
+            if (folderPath != null &&
+                message.effectiveFolderPath != folderPath) {
+              return false;
+            }
+            return true;
+          }).toList();
+      if (query == null || query.trim().isEmpty) return scoped;
+      return scoped
+          .where((message) => mailMessageMatchesQuery(message, query))
+          .toList();
+    });
+  }
+
+  Future<List<MailMessage>> _loadMessagesFromFile(File file) async {
     if (!await file.exists()) return const [];
-    final List<MailMessage> decoded;
     try {
       final raw = await _readCacheText(file);
       if (raw == null) return const [];
@@ -78,13 +98,14 @@ class MailCache implements MailMessageCache {
         await _quarantineUnreadableCache(file);
         return const [];
       }
-      decoded =
+      final decoded =
           decodedJson
               .map(
                 (item) =>
                     _messageFromJson((item as Map).cast<String, Object?>()),
               )
               .toList();
+      return decoded;
     } catch (error) {
       if (_isCacheFormatError(error)) {
         await _quarantineUnreadableCache(file);
@@ -92,23 +113,6 @@ class MailCache implements MailMessageCache {
       }
       rethrow;
     }
-    final scoped =
-        decoded.where((message) {
-          if (mailbox != null && message.effectiveMailbox != mailbox) {
-            return false;
-          }
-          if (accountId != null && message.accountId != accountId) {
-            return false;
-          }
-          if (folderPath != null && message.effectiveFolderPath != folderPath) {
-            return false;
-          }
-          return true;
-        }).toList();
-    if (query == null || query.trim().isEmpty) return scoped;
-    return scoped
-        .where((message) => mailMessageMatchesQuery(message, query))
-        .toList();
   }
 
   Future<File> _cacheFile() async {
@@ -124,17 +128,19 @@ class MailCache implements MailMessageCache {
   @override
   Future<void> clear() async {
     final file = await _cacheFile();
-    final namespace = _safeCacheNamespace(this.namespace);
-    if (namespace == null) {
-      if (await file.exists()) {
-        await file.delete();
+    await _lockFor(file).synchronized(() async {
+      final namespace = _safeCacheNamespace(this.namespace);
+      if (namespace == null) {
+        if (await file.exists()) {
+          await file.delete();
+        }
+        return;
       }
-      return;
-    }
-    final dir = file.parent;
-    if (await dir.exists()) {
-      await dir.delete(recursive: true);
-    }
+      final dir = file.parent;
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
   }
 
   Map<String, Object?> _messageToJson(MailMessage message) => {
@@ -209,29 +215,45 @@ class MailCache implements MailMessageCache {
 
   @override
   Future<void> updateMessage(MailMessage message) async {
-    final existing = await loadMessages();
-    await saveMessages([
-      for (final item in existing)
-        if (item.id == message.id) message else item,
-      if (!existing.any((item) => item.id == message.id)) message,
-    ]);
+    final file = await _cacheFile();
+    await _lockFor(file).synchronized(() async {
+      final existing = await _loadMessagesFromFile(file);
+      await _writeMessagesToFile(file, [
+        for (final item in existing)
+          if (item.id == message.id) message else item,
+        if (!existing.any((item) => item.id == message.id)) message,
+      ]);
+    });
   }
 
   @override
   Future<void> deleteMessage(String messageId) async {
     final file = await _cacheFile();
-    final remaining =
-        (await loadMessages())
-            .where((message) => message.id != messageId)
-            .map(_messageToJson)
-            .toList()
-          ..sort(
-            (a, b) => (b['received_at'] as String).compareTo(
-              a['received_at'] as String,
-            ),
-          );
+    await _lockFor(file).synchronized(() async {
+      final remaining =
+          (await _loadMessagesFromFile(file))
+              .where((message) => message.id != messageId)
+              .toList(growable: false);
+      await _writeMessagesToFile(file, remaining);
+    });
+  }
+
+  _AsyncMutex _lockFor(File file) {
+    return _locks.putIfAbsent(file.path, _AsyncMutex.new);
+  }
+
+  Future<void> _writeMessagesToFile(
+    File file,
+    Iterable<MailMessage> messages,
+  ) async {
+    final encoded =
+        messages.map(_messageToJson).toList()..sort(
+          (a, b) => (b['received_at'] as String).compareTo(
+            a['received_at'] as String,
+          ),
+        );
     await file.parent.create(recursive: true);
-    await _writeCacheText(file, jsonEncode(remaining));
+    await _writeCacheText(file, jsonEncode(encoded));
   }
 
   LocalCacheCipher? get _localCacheCipher {
@@ -272,7 +294,35 @@ class MailCache implements MailMessageCache {
     final cipher = _localCacheCipher;
     final output =
         cipher == null ? plaintext : await cipher.encryptText(plaintext);
-    await file.writeAsString(output, encoding: utf8);
+    final temp = File(
+      '${file.path}.tmp-${DateTime.now().toUtc().microsecondsSinceEpoch}',
+    );
+    await temp.writeAsString(output, encoding: utf8, flush: true);
+    try {
+      await temp.rename(file.path);
+    } on FileSystemException {
+      if (await file.exists()) {
+        await file.delete();
+      }
+      await temp.rename(file.path);
+    }
+  }
+}
+
+class _AsyncMutex {
+  Future<void> _tail = Future.value();
+
+  Future<T> synchronized<T>(Future<T> Function() action) {
+    final previous = _tail;
+    final completer = Completer<void>();
+    _tail = completer.future;
+    return previous.then((_) async {
+      try {
+        return await action();
+      } finally {
+        completer.complete();
+      }
+    });
   }
 }
 

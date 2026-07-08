@@ -52,7 +52,7 @@ class GoogleAndroidOAuthClient {
         'Google Android authorization did not return an access token.',
       );
     }
-    final expiresIn = int.tryParse('${result['expiresIn'] ?? ''}');
+    final expiresIn = int.tryParse('${result['expiresIn'] ?? ''}') ?? 3300;
     final grantedScopes = _scopeValue(result['grantedScopes']).trim();
     return OAuthTokenSet(
       accessToken: accessToken,

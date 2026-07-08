@@ -57,6 +57,10 @@ import 'mail_html_view.dart';
 
 const _maxOutgoingAttachmentBytes = 25 * 1024 * 1024;
 const _googleAndroidOAuthClient = GoogleAndroidOAuthClient();
+const _mailRefreshTimeout = Duration(seconds: 90);
+const _mailLoadMoreTimeout = Duration(seconds: 60);
+const _oauthRefreshTimeout = Duration(seconds: 20);
+const _folderDiscoveryTimeout = Duration(seconds: 45);
 
 bool _usesGoogleAndroidOAuth(String provider) {
   return !kIsWeb &&
@@ -457,8 +461,7 @@ class _MailHomePageState extends State<MailHomePage>
     }
     _pollingNewMail = true;
     try {
-      await _refreshOAuthVaultIfNeeded();
-      final page = await _mailRepository.viewPage(
+      final page = await _loadRemoteViewPage(
         view: const MailboxView.smart(MailSmartFolder.allIncoming),
         limit: _messagePageSize,
       );
@@ -471,6 +474,64 @@ class _MailHomePageState extends State<MailHomePage>
     } finally {
       _pollingNewMail = false;
     }
+  }
+
+  Future<MailMessagePage> _loadRemoteViewPage({
+    required MailboxView view,
+    String? query,
+    required int limit,
+  }) async {
+    await _refreshOAuthVaultIfNeeded();
+    try {
+      return await _mailRepository
+          .viewPage(view: view, query: query, limit: limit)
+          .timeout(_mailRefreshTimeout);
+    } catch (error) {
+      if (!_looksLikeMailAuthFailure(error)) rethrow;
+      await _refreshOAuthVaultIfNeeded(force: true);
+      return _mailRepository
+          .viewPage(view: view, query: query, limit: limit)
+          .timeout(_mailRefreshTimeout);
+    }
+  }
+
+  Future<MailMessagePage> _loadOlderRemoteViewPage({
+    required MailboxView view,
+    String? query,
+    required int visibleCount,
+    required int limit,
+  }) async {
+    await _refreshOAuthVaultIfNeeded();
+    try {
+      return await _mailRepository
+          .loadOlderViewMessages(
+            view: view,
+            query: query,
+            visibleCount: visibleCount,
+            limit: limit,
+          )
+          .timeout(_mailLoadMoreTimeout);
+    } catch (error) {
+      if (!_looksLikeMailAuthFailure(error)) rethrow;
+      await _refreshOAuthVaultIfNeeded(force: true);
+      return _mailRepository
+          .loadOlderViewMessages(
+            view: view,
+            query: query,
+            visibleCount: visibleCount,
+            limit: limit,
+          )
+          .timeout(_mailLoadMoreTimeout);
+    }
+  }
+
+  bool _looksLikeMailAuthFailure(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('auth') ||
+        text.contains('xoauth') ||
+        text.contains('invalid credentials') ||
+        text.contains('invalid_grant') ||
+        text.contains('token');
   }
 
   void _primeNewMailNotificationBaseline(Iterable<MailMessage> messages) {
@@ -1188,9 +1249,7 @@ class _MailHomePageState extends State<MailHomePage>
       _beginMailRefresh(requestId);
     }
     try {
-      await _refreshOAuthVaultIfNeeded();
-      if (!_isCurrentMessageLoad(requestId)) return;
-      final page = await _mailRepository.viewPage(
+      final page = await _loadRemoteViewPage(
         view: _view,
         query: _search.text,
         limit: _messagePageSize,
@@ -1264,9 +1323,7 @@ class _MailHomePageState extends State<MailHomePage>
     final requestId = _messageLoadGeneration;
     setState(() => _loadingMore = true);
     try {
-      await _refreshOAuthVaultIfNeeded();
-      if (!_isCurrentMessageLoad(requestId)) return;
-      final page = await _mailRepository.loadOlderViewMessages(
+      final page = await _loadOlderRemoteViewPage(
         view: _view,
         query: _search.text,
         visibleCount: _messages.length,
@@ -2220,9 +2277,7 @@ class _MailHomePageState extends State<MailHomePage>
       if (mounted) {
         setState(() => _banner = 'Mail cache cleared. Rebuilding index...');
       }
-      await _refreshOAuthVaultIfNeeded();
-      if (!_isCurrentMessageLoad(requestId)) return true;
-      final page = await _mailRepository.viewPage(
+      final page = await _loadRemoteViewPage(
         view: _view,
         query: _search.text,
         limit: _messagePageSize,
@@ -3120,7 +3175,10 @@ class _MailHomePageState extends State<MailHomePage>
     final List<MailFolder> folders;
     if (discoverFolders && document.toCredentials().isNotEmpty) {
       _debugVault('apply vault: discovering folders');
-      final discoveredFolders = await _mailRepository.folders();
+      final discoveredFolders = await _mailRepository.folders().timeout(
+        _folderDiscoveryTimeout,
+        onTimeout: () => const <MailFolder>[],
+      );
       folders =
           discoveredFolders.isEmpty
               ? _localFoldersForDocument(document)
@@ -3219,11 +3277,18 @@ class _MailHomePageState extends State<MailHomePage>
     return null;
   }
 
-  Future<void> _refreshOAuthVaultIfNeeded() {
+  Future<void> _refreshOAuthVaultIfNeeded({bool force = false}) {
+    if (force) {
+      return _refreshOAuthVaultIfNeededUnshared(force: true).timeout(
+        _oauthRefreshTimeout,
+      );
+    }
     final current = _oauthRefreshFuture;
     if (current != null) return current;
     late final Future<void> refresh;
-    refresh = _refreshOAuthVaultIfNeededUnshared().whenComplete(() {
+    refresh = _refreshOAuthVaultIfNeededUnshared()
+        .timeout(_oauthRefreshTimeout)
+        .whenComplete(() {
       if (identical(_oauthRefreshFuture, refresh)) {
         _oauthRefreshFuture = null;
       }
@@ -3232,7 +3297,7 @@ class _MailHomePageState extends State<MailHomePage>
     return refresh;
   }
 
-  Future<void> _refreshOAuthVaultIfNeededUnshared() async {
+  Future<void> _refreshOAuthVaultIfNeededUnshared({bool force = false}) async {
     final profile = _profile;
     final session = _session;
     final document = _vaultDocument;
@@ -3257,10 +3322,33 @@ class _MailHomePageState extends State<MailHomePage>
     try {
       final result = await OAuthVaultRefresher(
         refreshTokens: widget.oauthClient.refresh,
+        reauthorizeAccessToken: ({
+          required OAuthProviderConfig provider,
+          required String clientId,
+          String? clientSecret,
+          required String loginHint,
+        }) {
+          if (!_usesGoogleAndroidOAuth(provider.provider)) {
+            throw StateError(
+              'OAuth refresh token is not available for ${provider.provider}.',
+            );
+          }
+          return _authorizeOAuthForCurrentPlatform(
+            oauthClient: widget.oauthClient,
+            provider: provider,
+            clientId: clientId,
+            clientSecret: clientSecret,
+            loginHint: loginHint,
+            mobileRedirectUri: _oauthMobileRedirectUriForProvider(
+              provider.provider,
+            ),
+          );
+        },
       ).refreshExpiring(
         document: document,
         clientIdForProvider: _oauthClientIdForProvider,
         clientSecretForProvider: _oauthClientSecretForProvider,
+        force: force,
       );
       if (!isCurrentVaultContext()) return;
       if (result.changed) {

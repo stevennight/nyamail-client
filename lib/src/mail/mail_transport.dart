@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
@@ -97,6 +98,50 @@ class MailMoveResult {
   final int? destinationUid;
 }
 
+class MailPreviewPage extends IterableBase<MailMessage> {
+  const MailPreviewPage({
+    required this.messages,
+    this.selectedUids = const [],
+    this.remoteUids,
+    this.hasMore = false,
+    this.complete = true,
+  });
+
+  factory MailPreviewPage.fromMessages(
+    List<MailMessage> messages, {
+    int? limit,
+    int? beforeUid,
+    bool complete = true,
+  }) {
+    final selectedUids = [
+      for (final message in messages)
+        if (_uidFromMessageId(message.id) case final uid?) uid,
+    ];
+    final ordered = [...selectedUids]..sort((a, b) => b.compareTo(a));
+    final visible =
+        beforeUid == null
+            ? ordered
+            : ordered.where((uid) => uid < beforeUid).toList(growable: false);
+    final effectiveLimit = limit ?? messages.length;
+    return MailPreviewPage(
+      messages: messages,
+      selectedUids: selectedUids,
+      remoteUids: selectedUids,
+      hasMore: visible.length > effectiveLimit,
+      complete: complete,
+    );
+  }
+
+  final List<MailMessage> messages;
+  final List<int> selectedUids;
+  final List<int>? remoteUids;
+  final bool hasMore;
+  final bool complete;
+
+  @override
+  Iterator<MailMessage> get iterator => messages.iterator;
+}
+
 abstract class MailTransport {
   Future<void> validateCredential({required MailboxCredential credential});
 
@@ -108,14 +153,14 @@ abstract class MailTransport {
     int limit = 30,
   });
 
-  Future<List<MailMessage>> fetchMessagePreviews({
+  Future<MailPreviewPage> fetchMessagePreviews({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     int limit = 30,
     int? beforeUid,
   });
 
-  Future<List<MailMessage>> fetchFolderMessagePreviews({
+  Future<MailPreviewPage> fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     int limit = 30,
@@ -240,7 +285,7 @@ class SocketMailTransport implements MailTransport {
   }
 
   @override
-  Future<List<MailMessage>> fetchMessagePreviews({
+  Future<MailPreviewPage> fetchMessagePreviews({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     int limit = 30,
@@ -257,43 +302,55 @@ class SocketMailTransport implements MailTransport {
       );
       await imap.selectMailbox(folder.path);
       final uids = await imap.uidSearchAll();
-      final messages = <MailMessage>[];
-      for (final uid in _selectUidPage(
+      final selectedUids = _selectUidPage(
         uids,
         limit: limit,
         beforeUid: beforeUid,
-      )) {
-        final fetched = await imap.uidFetchMessagePreview(uid);
-        final parsed = parseRfc822Message(
-          fetched.raw,
-          id: _messageId(credential.accountId, mailbox, uid),
-          accountId: credential.accountId,
-          mailbox: mailbox,
-          folderPath: folder.path,
-          folderDisplayName: folder.displayName,
-          read: fetched.flags.contains(r'\Seen'),
-          starred: fetched.flags.contains(r'\Flagged'),
-          bodyLoaded: false,
-          receivedAt: fetched.internalDate,
-        );
-        messages.add(
-          parsed.copyWith(
-            body: '',
-            htmlBody: '',
-            hasAttachments: false,
-            attachments: const [],
+      );
+      final messages = <MailMessage>[];
+      var complete = true;
+      for (final uid in selectedUids) {
+        try {
+          final fetched = await imap.uidFetchMessagePreview(uid);
+          final parsed = parseRfc822Message(
+            fetched.raw,
+            id: _messageId(credential.accountId, mailbox, uid),
+            accountId: credential.accountId,
+            mailbox: mailbox,
+            folderPath: folder.path,
+            folderDisplayName: folder.displayName,
+            read: fetched.flags.contains(r'\Seen'),
+            starred: fetched.flags.contains(r'\Flagged'),
             bodyLoaded: false,
-          ),
-        );
+            receivedAt: fetched.internalDate,
+          );
+          messages.add(
+            parsed.copyWith(
+              body: '',
+              htmlBody: '',
+              hasAttachments: false,
+              attachments: const [],
+              bodyLoaded: false,
+            ),
+          );
+        } catch (_) {
+          complete = false;
+        }
       }
-      return messages;
+      return MailPreviewPage(
+        messages: messages,
+        selectedUids: selectedUids,
+        remoteUids: uids,
+        hasMore: _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid),
+        complete: complete,
+      );
     } finally {
       await imap.close();
     }
   }
 
   @override
-  Future<List<MailMessage>> fetchFolderMessagePreviews({
+  Future<MailPreviewPage> fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     int limit = 30,
@@ -304,36 +361,48 @@ class SocketMailTransport implements MailTransport {
       await imap.login();
       await imap.selectMailbox(folder.path);
       final uids = await imap.uidSearchAll();
-      final messages = <MailMessage>[];
-      for (final uid in _selectUidPage(
+      final selectedUids = _selectUidPage(
         uids,
         limit: limit,
         beforeUid: beforeUid,
-      )) {
-        final fetched = await imap.uidFetchMessagePreview(uid);
-        final parsed = parseRfc822Message(
-          fetched.raw,
-          id: _messageIdForFolder(credential.accountId, folder, uid),
-          accountId: credential.accountId,
-          mailbox: folder.kind,
-          folderPath: folder.path,
-          folderDisplayName: folder.displayName,
-          read: fetched.flags.contains(r'\Seen'),
-          starred: fetched.flags.contains(r'\Flagged'),
-          bodyLoaded: false,
-          receivedAt: fetched.internalDate,
-        );
-        messages.add(
-          parsed.copyWith(
-            body: '',
-            htmlBody: '',
-            hasAttachments: false,
-            attachments: const [],
+      );
+      final messages = <MailMessage>[];
+      var complete = true;
+      for (final uid in selectedUids) {
+        try {
+          final fetched = await imap.uidFetchMessagePreview(uid);
+          final parsed = parseRfc822Message(
+            fetched.raw,
+            id: _messageIdForFolder(credential.accountId, folder, uid),
+            accountId: credential.accountId,
+            mailbox: folder.kind,
+            folderPath: folder.path,
+            folderDisplayName: folder.displayName,
+            read: fetched.flags.contains(r'\Seen'),
+            starred: fetched.flags.contains(r'\Flagged'),
             bodyLoaded: false,
-          ),
-        );
+            receivedAt: fetched.internalDate,
+          );
+          messages.add(
+            parsed.copyWith(
+              body: '',
+              htmlBody: '',
+              hasAttachments: false,
+              attachments: const [],
+              bodyLoaded: false,
+            ),
+          );
+        } catch (_) {
+          complete = false;
+        }
       }
-      return messages;
+      return MailPreviewPage(
+        messages: messages,
+        selectedUids: selectedUids,
+        remoteUids: uids,
+        hasMore: _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid),
+        complete: complete,
+      );
     } finally {
       await imap.close();
     }
@@ -1531,6 +1600,12 @@ List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {
       .toList(growable: false);
 }
 
+bool _hasMoreUidPage(List<int> uids, {required int limit, int? beforeUid}) {
+  final eligible =
+      beforeUid == null ? uids : uids.where((uid) => uid < beforeUid);
+  return eligible.length > limit;
+}
+
 String _messageId(String accountId, MailboxKind mailbox, int uid) {
   return '$accountId:${mailbox.name}:$uid';
 }
@@ -1544,11 +1619,17 @@ String _messageIdForFolder(String accountId, MailFolder folder, int uid) {
 }
 
 int _imapUid(String messageId) {
-  final raw = messageId.contains(':') ? messageId.split(':').last : messageId;
-  final parsed = int.tryParse(raw);
+  final parsed = _uidFromMessageId(messageId);
   if (parsed == null || parsed <= 0) {
     throw MailTransportException('Invalid IMAP UID in message id: $messageId');
   }
+  return parsed;
+}
+
+int? _uidFromMessageId(String messageId) {
+  final raw = messageId.contains(':') ? messageId.split(':').last : messageId;
+  final parsed = int.tryParse(raw);
+  if (parsed == null || parsed <= 0) return null;
   return parsed;
 }
 

@@ -212,7 +212,7 @@ class _SmokeTransport implements MailTransport {
   }
 
   @override
-  Future<List<MailMessage>> fetchMessagePreviews({
+  Future<MailPreviewPage> fetchMessagePreviews({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     int limit = 30,
@@ -222,11 +222,11 @@ class _SmokeTransport implements MailTransport {
       credential: credential,
       mailbox: mailbox,
       limit: limit,
-    );
+    ).then((messages) => MailPreviewPage.fromMessages(messages, limit: limit));
   }
 
   @override
-  Future<List<MailMessage>> fetchFolderMessagePreviews({
+  Future<MailPreviewPage> fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     int limit = 30,
@@ -236,7 +236,7 @@ class _SmokeTransport implements MailTransport {
       credential: credential,
       mailbox: folder.kind,
       limit: limit,
-    );
+    ).then((messages) => MailPreviewPage.fromMessages(messages, limit: limit));
   }
 
   @override

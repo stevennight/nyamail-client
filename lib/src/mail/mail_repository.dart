@@ -407,6 +407,7 @@ class CachedTransportMailRepository implements MailRepository {
   final bool _backgroundIndexingEnabled;
   final Future<Directory> Function() _supportDirectoryProvider;
   static final Set<String> _backgroundIndexing = <String>{};
+  static const Duration _previewFetchTimeout = Duration(seconds: 45);
 
   @override
   Future<List<MailAccount>> accounts() async {
@@ -471,16 +472,21 @@ class CachedTransportMailRepository implements MailRepository {
       );
     }
     var hasFullRemotePage = false;
+    var attemptedFetches = 0;
+    final failures = <Object>[];
     for (final folder in await _foldersForView(view)) {
       final credential = _credentialForAccount(folder.accountId);
       if (credential == null) continue;
+      attemptedFetches++;
       final fetched = await _fetchPreviewPageForFolder(
         credential: credential,
         folder: folder,
         limit: limit,
       );
+      if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
+    _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
     final cached = await _scopedCachedMessagesForView(view: view, query: query);
     _scheduleBackgroundIndexForView(view: view, pageSize: limit);
     return MailMessagePage(
@@ -508,9 +514,12 @@ class CachedTransportMailRepository implements MailRepository {
     var cached = await _scopedCachedMessagesForView(view: view, query: query);
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
+      var attemptedFetches = 0;
+      final failures = <Object>[];
       for (final folder in await _foldersForView(view)) {
         final credential = _credentialForAccount(folder.accountId);
         if (credential == null) continue;
+        attemptedFetches++;
         final beforeUid = await _oldestCachedUidForFolder(folder);
         final fetched = await _fetchPreviewPageForFolder(
           credential: credential,
@@ -518,8 +527,10 @@ class CachedTransportMailRepository implements MailRepository {
           limit: limit,
           beforeUid: beforeUid,
         );
+        if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
+      _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
       cached = await _scopedCachedMessagesForView(view: view, query: query);
     }
     _scheduleBackgroundIndexForView(view: view, pageSize: limit);
@@ -571,14 +582,19 @@ class CachedTransportMailRepository implements MailRepository {
       );
     }
     var hasFullRemotePage = false;
+    var attemptedFetches = 0;
+    final failures = <Object>[];
     for (final credential in _scopedCredentials(accountId)) {
+      attemptedFetches++;
       final fetched = await _fetchPreviewPage(
         credential: credential,
         mailbox: mailbox,
         limit: limit,
       );
+      if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
+    _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
     final cached = await _scopedCachedMessages(
       mailbox: mailbox,
       accountId: accountId,
@@ -620,7 +636,10 @@ class CachedTransportMailRepository implements MailRepository {
     );
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
+      var attemptedFetches = 0;
+      final failures = <Object>[];
       for (final credential in _scopedCredentials(accountId)) {
+        attemptedFetches++;
         final beforeUid = await _oldestCachedUid(
           accountId: credential.accountId,
           mailbox: mailbox,
@@ -631,8 +650,10 @@ class CachedTransportMailRepository implements MailRepository {
           limit: limit,
           beforeUid: beforeUid,
         );
+        if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
+      _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
       cached = await _scopedCachedMessages(
         mailbox: mailbox,
         accountId: accountId,
@@ -998,26 +1019,38 @@ class CachedTransportMailRepository implements MailRepository {
     required MailboxKind mailbox,
     required int limit,
     int? beforeUid,
+    bool reconcile = true,
   }) async {
     try {
-      final fetched = await _transport.fetchMessagePreviews(
-        credential: credential,
-        mailbox: mailbox,
-        limit: limit,
-        beforeUid: beforeUid,
+      final fetched = await _transport
+          .fetchMessagePreviews(
+            credential: credential,
+            mailbox: mailbox,
+            limit: limit,
+            beforeUid: beforeUid,
+          )
+          .timeout(_previewFetchTimeout);
+      await _cache.saveMessages(fetched.messages);
+      if (reconcile && fetched.complete && fetched.remoteUids != null) {
+        await _reconcileCompleteRemoteUids(
+          credential: credential,
+          mailbox: mailbox,
+          remoteUids: fetched.remoteUids!,
+        );
+      }
+      return _PreviewFetchResult(
+        messages: fetched.messages,
+        hasMore: fetched.hasMore,
+        complete: fetched.complete,
       );
-      await _cache.saveMessages(fetched);
-      await _reconcileFetchedPreviewWindow(
-        credential: credential,
-        mailbox: mailbox,
-        messages: fetched,
-        limit: limit,
-        beforeUid: beforeUid,
-      );
-      return _PreviewFetchResult(messages: fetched, requestedLimit: limit);
-    } catch (_) {
+    } catch (error) {
       // Keep cached mail available when the provider is offline or credentials need attention.
-      return const _PreviewFetchResult(messages: [], requestedLimit: 0);
+      return _PreviewFetchResult(
+        messages: const [],
+        hasMore: false,
+        complete: false,
+        error: error,
+      );
     }
   }
 
@@ -1026,87 +1059,61 @@ class CachedTransportMailRepository implements MailRepository {
     required MailFolder folder,
     required int limit,
     int? beforeUid,
+    bool reconcile = true,
   }) async {
     try {
-      final fetched = await _transport.fetchFolderMessagePreviews(
-        credential: credential,
-        folder: folder,
-        limit: limit,
-        beforeUid: beforeUid,
+      final fetched = await _transport
+          .fetchFolderMessagePreviews(
+            credential: credential,
+            folder: folder,
+            limit: limit,
+            beforeUid: beforeUid,
+          )
+          .timeout(_previewFetchTimeout);
+      await _cache.saveMessages(fetched.messages);
+      if (reconcile && fetched.complete && fetched.remoteUids != null) {
+        await _reconcileCompleteRemoteUidsForFolder(
+          credential: credential,
+          folder: folder,
+          remoteUids: fetched.remoteUids!,
+        );
+      }
+      return _PreviewFetchResult(
+        messages: fetched.messages,
+        hasMore: fetched.hasMore,
+        complete: fetched.complete,
       );
-      await _cache.saveMessages(fetched);
-      await _reconcileFetchedPreviewWindowForFolder(
-        credential: credential,
-        folder: folder,
-        messages: fetched,
-        limit: limit,
-        beforeUid: beforeUid,
+    } catch (error) {
+      return _PreviewFetchResult(
+        messages: const [],
+        hasMore: false,
+        complete: false,
+        error: error,
       );
-      return _PreviewFetchResult(messages: fetched, requestedLimit: limit);
-    } catch (_) {
-      return const _PreviewFetchResult(messages: [], requestedLimit: 0);
     }
   }
 
-  Future<void> _reconcileFetchedPreviewWindow({
+  Future<void> _reconcileCompleteRemoteUids({
     required MailboxCredential credential,
     required MailboxKind mailbox,
-    required List<MailMessage> messages,
-    required int limit,
-    int? beforeUid,
+    required List<int> remoteUids,
   }) async {
-    final fetchedUids = <int>{
-      for (final message in messages)
-        if (_messageUid(message.id) case final uid?) uid,
-    };
-    final fetchedIds = {for (final message in messages) message.id};
-    final fetchedAllRemaining = messages.length < limit;
-    final minFetchedUid =
-        fetchedUids.isEmpty
-            ? null
-            : fetchedUids.reduce((a, b) => a < b ? a : b);
+    final remoteUidSet = remoteUids.toSet();
     final cached = await _cache.loadMessages(mailbox: mailbox);
     for (final message in cached) {
       if (message.accountId != credential.accountId) continue;
       final uid = _messageUid(message.id);
       if (uid == null) continue;
-      final inFetchedWindow =
-          beforeUid == null
-              ? (fetchedAllRemaining ||
-                  minFetchedUid == null ||
-                  uid >= minFetchedUid)
-              : uid < beforeUid &&
-                  (fetchedAllRemaining ||
-                      minFetchedUid == null ||
-                      uid >= minFetchedUid);
-      if (!inFetchedWindow) continue;
-      if (fetchedUids.contains(uid)) {
-        if (!fetchedIds.contains(message.id)) {
-          await _cache.deleteMessage(message.id);
-        }
-        continue;
-      }
-      await _cache.deleteMessage(message.id);
+      if (!remoteUidSet.contains(uid)) await _cache.deleteMessage(message.id);
     }
   }
 
-  Future<void> _reconcileFetchedPreviewWindowForFolder({
+  Future<void> _reconcileCompleteRemoteUidsForFolder({
     required MailboxCredential credential,
     required MailFolder folder,
-    required List<MailMessage> messages,
-    required int limit,
-    int? beforeUid,
+    required List<int> remoteUids,
   }) async {
-    final fetchedUids = <int>{
-      for (final message in messages)
-        if (_messageUid(message.id) case final uid?) uid,
-    };
-    final fetchedIds = {for (final message in messages) message.id};
-    final fetchedAllRemaining = messages.length < limit;
-    final minFetchedUid =
-        fetchedUids.isEmpty
-            ? null
-            : fetchedUids.reduce((a, b) => a < b ? a : b);
+    final remoteUidSet = remoteUids.toSet();
     final cached = await _cache.loadMessages(
       mailbox: folder.kind,
       accountId: credential.accountId,
@@ -1115,24 +1122,16 @@ class CachedTransportMailRepository implements MailRepository {
     for (final message in cached) {
       final uid = _messageUid(message.id);
       if (uid == null) continue;
-      final inFetchedWindow =
-          beforeUid == null
-              ? (fetchedAllRemaining ||
-                  minFetchedUid == null ||
-                  uid >= minFetchedUid)
-              : uid < beforeUid &&
-                  (fetchedAllRemaining ||
-                      minFetchedUid == null ||
-                      uid >= minFetchedUid);
-      if (!inFetchedWindow) continue;
-      if (fetchedUids.contains(uid)) {
-        if (!fetchedIds.contains(message.id)) {
-          await _cache.deleteMessage(message.id);
-        }
-        continue;
-      }
-      await _cache.deleteMessage(message.id);
+      if (!remoteUidSet.contains(uid)) await _cache.deleteMessage(message.id);
     }
+  }
+
+  void _throwIfAllPreviewFetchesFailed(
+    int attemptedFetches,
+    List<Object> failures,
+  ) {
+    if (attemptedFetches == 0 || failures.length < attemptedFetches) return;
+    throw failures.first;
   }
 
   Future<List<MailMessage>> _scopedCachedMessages({
@@ -1349,6 +1348,7 @@ class CachedTransportMailRepository implements MailRepository {
       mailbox: mailbox,
       limit: pageSize,
       beforeUid: beforeUid,
+      reconcile: false,
     );
   }
 
@@ -1364,6 +1364,7 @@ class CachedTransportMailRepository implements MailRepository {
       folder: folder,
       limit: pageSize,
       beforeUid: beforeUid,
+      reconcile: false,
     );
   }
 
@@ -1404,13 +1405,17 @@ class CachedTransportMailRepository implements MailRepository {
 class _PreviewFetchResult {
   const _PreviewFetchResult({
     required this.messages,
-    required this.requestedLimit,
+    required this.hasMore,
+    required this.complete,
+    this.error,
   });
 
   final List<MailMessage> messages;
-  final int requestedLimit;
+  final bool hasMore;
+  final bool complete;
+  final Object? error;
 
-  bool get hasMore => messages.length >= requestedLimit && requestedLimit > 0;
+  bool get failed => error != null;
 }
 
 const _encryptedAttachmentExtension = '.nyacache';
