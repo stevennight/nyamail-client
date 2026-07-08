@@ -43,6 +43,28 @@ void main() {
     expect(lines.any((line) => line.startsWith('Reply-To ')), isFalse);
   });
 
+  test('mail message labels use client friendly fallbacks', () {
+    expect(mailMessageSubjectLabel('  '), '(No subject)');
+    expect(mailMessageSubjectLabel(' Planning '), 'Planning');
+  });
+
+  test('mailMessageCompactDisplayDate uses list-friendly dates', () {
+    final now = DateTime(2026, 7, 8, 14, 30);
+
+    expect(
+      mailMessageCompactDisplayDate(DateTime(2026, 7, 8, 9, 5), now: now),
+      '09:05',
+    );
+    expect(
+      mailMessageCompactDisplayDate(DateTime(2026, 7, 7, 22, 10), now: now),
+      '7/7',
+    );
+    expect(
+      mailMessageCompactDisplayDate(DateTime(2025, 12, 31, 22, 10), now: now),
+      '2025/12/31',
+    );
+  });
+
   test('mailMessageMatchesQuery searches body recipients and attachments', () {
     final message = MailMessage(
       id: 'work:inbox:3',

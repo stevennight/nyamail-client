@@ -513,8 +513,7 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   String _notificationLineFor(MailMessage message) {
-    final subject =
-        message.subject.trim().isEmpty ? '(No subject)' : message.subject;
+    final subject = mailMessageSubjectLabel(message.subject);
     final preview = message.preview.trim();
     if (preview.isEmpty) return subject;
     return '$subject - $preview';
@@ -4201,14 +4200,27 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   void _scheduleArchiveMessages(List<MailMessage> messages) {
-    if (messages.isEmpty) return;
+    final archiveable = messages
+        .where(
+          (message) => _mailListActionAppliesToMessage(
+            MailListActionPreference.archive,
+            message,
+          ),
+        )
+        .toList(growable: false);
+    if (archiveable.isEmpty) {
+      if (mounted) {
+        _showTransientNotice('Selected messages are already archived.');
+      }
+      return;
+    }
     _schedulePendingMailAction(
       description: _messageCountLabel(
-        messages.length,
+        archiveable.length,
         'Message archived.',
         pluralNoun: 'messages archived.',
       ),
-      messages: messages,
+      messages: archiveable,
       commitRemote:
           (pendingMessages) =>
               _commitPendingMessages(pendingMessages, _mailRepository.archive),
@@ -4216,14 +4228,27 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   void _scheduleDeleteMessages(List<MailMessage> messages) {
-    if (messages.isEmpty) return;
+    final deletable = messages
+        .where(
+          (message) => _mailListActionAppliesToMessage(
+            MailListActionPreference.delete,
+            message,
+          ),
+        )
+        .toList(growable: false);
+    if (deletable.isEmpty) {
+      if (mounted) {
+        _showTransientNotice('Selected messages are already in Trash.');
+      }
+      return;
+    }
     _schedulePendingMailAction(
       description: _messageCountLabel(
-        messages.length,
+        deletable.length,
         'Message moved to trash.',
         pluralNoun: 'messages moved to trash.',
       ),
-      messages: messages,
+      messages: deletable,
       commitRemote:
           (pendingMessages) =>
               _commitPendingMessages(pendingMessages, _mailRepository.delete),
@@ -4258,14 +4283,24 @@ class _MailHomePageState extends State<MailHomePage>
     List<MailMessage> messages,
     MailboxKind destination,
   ) {
-    if (messages.isEmpty) return;
+    final movable = messages
+        .where((message) => message.effectiveMailbox != destination)
+        .toList(growable: false);
+    if (movable.isEmpty) {
+      if (mounted) {
+        _showTransientNotice(
+          'Selected messages are already in ${_labelForMailbox(destination)}.',
+        );
+      }
+      return;
+    }
     _schedulePendingMailAction(
       description: _messageCountLabel(
-        messages.length,
+        movable.length,
         'Message moved to ${_labelForMailbox(destination)}.',
         pluralNoun: 'messages moved to ${_labelForMailbox(destination)}.',
       ),
-      messages: messages,
+      messages: movable,
       commitRemote:
           (pendingMessages) => _commitPendingMessages(
             pendingMessages,
@@ -4806,7 +4841,10 @@ class _TopBar extends StatelessWidget {
         Text('NyaMail', style: Theme.of(context).textTheme.titleLarge),
         const Spacer(),
         IconButton(
-          tooltip: 'New message',
+          tooltip:
+              onCompose == null
+                  ? 'Add a mailbox before composing'
+                  : 'New message',
           onPressed: onCompose,
           icon: const Icon(Icons.edit_outlined),
         ),
@@ -4843,7 +4881,10 @@ class _TopBar extends StatelessWidget {
           ),
         ),
         IconButton(
-          tooltip: 'New message',
+          tooltip:
+              onCompose == null
+                  ? 'Add a mailbox before composing'
+                  : 'New message',
           onPressed: onCompose,
           icon: const Icon(Icons.edit_outlined),
         ),
@@ -5667,8 +5708,10 @@ class _MessageList extends StatefulWidget {
 
 class _MessageListState extends State<_MessageList> {
   static const _loadMoreThreshold = 480.0;
+  static const _searchDebounceDelay = Duration(milliseconds: 450);
 
   final _scrollController = ScrollController();
+  Timer? _searchDebounce;
   bool _viewportCheckScheduled = false;
   int? _lastAutoLoadMessageCount;
 
@@ -5695,9 +5738,28 @@ class _MessageListState extends State<_MessageList> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _scrollController.removeListener(_maybeLoadMore);
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _handleSearchTextChanged() {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(_searchDebounceDelay, widget.onSearch);
+    if (mounted) setState(() {});
+  }
+
+  void _clearSearch() {
+    _searchDebounce?.cancel();
+    widget.search.clear();
+    if (mounted) setState(() {});
+    widget.onSearch();
+  }
+
+  void _submitSearch() {
+    _searchDebounce?.cancel();
+    widget.onSearch();
   }
 
   void _scheduleViewportCheck() {
@@ -5752,7 +5814,18 @@ class _MessageListState extends State<_MessageList> {
             controller: widget.search,
             hintText: 'Search mail',
             leading: const Icon(Icons.search),
-            onSubmitted: (_) => widget.onSearch(),
+            trailing:
+                widget.search.text.trim().isEmpty
+                    ? null
+                    : [
+                      IconButton(
+                        tooltip: 'Clear search',
+                        onPressed: _clearSearch,
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+            onChanged: (_) => _handleSearchTextChanged(),
+            onSubmitted: (_) => _submitSearch(),
           ),
         ),
         if (selecting)
@@ -5775,6 +5848,8 @@ class _MessageListState extends State<_MessageList> {
                   canLoadMore: widget.canLoadMore,
                   loadingMore: widget.loadingMore,
                   refreshing: widget.refreshing,
+                  hasAccounts: widget.accounts.isNotEmpty,
+                  hasSearchQuery: widget.search.text.trim().isNotEmpty,
                   onLoadMore: widget.onLoadMore,
                 );
               }
@@ -5859,14 +5934,15 @@ class _MessageListState extends State<_MessageList> {
       position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, 0),
       items: [
         for (final action in actions)
-          PopupMenuItem(
-            value: action,
-            child: ListTile(
-              leading: Icon(_mailListActionIcon(action, message: message)),
-              title: Text(_mailListActionLabel(action, message: message)),
-              dense: true,
+          if (_mailListActionAppliesToMessage(action, message))
+            PopupMenuItem(
+              value: action,
+              child: ListTile(
+                leading: Icon(_mailListActionIcon(action, message: message)),
+                title: Text(_mailListActionLabel(action, message: message)),
+                dense: true,
+              ),
             ),
-          ),
       ],
     );
     if (action != null) {
@@ -5895,15 +5971,28 @@ class _MessageBatchToolbar extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final markRead = selectedMessages.any((message) => !message.read);
     final star = selectedMessages.any((message) => !message.starred);
+    final canArchive = selectedMessages.any(
+      (message) => _mailListActionAppliesToMessage(
+        MailListActionPreference.archive,
+        message,
+      ),
+    );
     final canMoveToInbox = selectedMessages.any(
-      (message) => _canMoveToInbox(message.effectiveMailbox),
+      (message) => _mailListActionAppliesToMessage(
+        MailListActionPreference.moveToInbox,
+        message,
+      ),
+    );
+    final canDelete = selectedMessages.any(
+      (message) => _mailListActionAppliesToMessage(
+        MailListActionPreference.delete,
+        message,
+      ),
     );
     final actions = [
-      if (canMoveToInbox)
-        MailListActionPreference.moveToInbox
-      else
-        MailListActionPreference.archive,
-      MailListActionPreference.delete,
+      if (canArchive) MailListActionPreference.archive,
+      if (canMoveToInbox) MailListActionPreference.moveToInbox,
+      if (canDelete) MailListActionPreference.delete,
       MailListActionPreference.toggleStar,
       MailListActionPreference.toggleRead,
       MailListActionPreference.pin,
@@ -6011,6 +6100,7 @@ class _MessageListTile extends StatelessWidget {
     final textTheme = Theme.of(context).textTheme;
     final colorScheme = Theme.of(context).colorScheme;
     final secondary = colorScheme.onSurfaceVariant;
+    final receivedLabel = mailMessageCompactDisplayDate(message.receivedAt);
     return ListTile(
       selected: selected,
       leading:
@@ -6031,7 +6121,7 @@ class _MessageListTile extends StatelessWidget {
           ],
           Expanded(
             child: Text(
-              message.subject,
+              mailMessageSubjectLabel(message.subject),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -6066,6 +6156,13 @@ class _MessageListTile extends StatelessWidget {
                   color: secondary,
                 ),
                 const Spacer(),
+                const SizedBox(width: 8),
+                Text(
+                  receivedLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: textTheme.labelSmall?.copyWith(color: secondary),
+                ),
                 const SizedBox(width: 8),
                 Flexible(
                   child: Align(
@@ -6356,6 +6453,8 @@ class _MessageListFooter extends StatelessWidget {
     required this.canLoadMore,
     required this.loadingMore,
     required this.refreshing,
+    required this.hasAccounts,
+    required this.hasSearchQuery,
     required this.onLoadMore,
   });
 
@@ -6363,6 +6462,8 @@ class _MessageListFooter extends StatelessWidget {
   final bool canLoadMore;
   final bool loadingMore;
   final bool refreshing;
+  final bool hasAccounts;
+  final bool hasSearchQuery;
   final VoidCallback onLoadMore;
 
   @override
@@ -6420,7 +6521,13 @@ class _MessageListFooter extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       child: Center(
         child: Text(
-          isEmpty ? 'No messages' : 'No more mail',
+          isEmpty
+              ? !hasAccounts
+                  ? 'No mailbox accounts'
+                  : hasSearchQuery
+                  ? 'No matching messages'
+                  : 'No messages'
+              : 'No more mail',
           style: labelStyle,
         ),
       ),
@@ -6607,7 +6714,11 @@ class _ComposeDialogState extends State<_ComposeDialog> {
                 for (final account in widget.accounts)
                   DropdownMenuItem(
                     value: account.id,
-                    child: Text('${account.displayName} <${account.address}>'),
+                    child: Text(
+                      '${account.displayName} <${account.address}>',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
               ],
               onChanged:
@@ -6987,11 +7098,20 @@ class _ComposeDialogState extends State<_ComposeDialog> {
 
   Future<void> _send() async {
     final body = await _currentComposeContent();
-    if ((_to.text.trim().isEmpty &&
-            _cc.text.trim().isEmpty &&
-            _bcc.text.trim().isEmpty) ||
-        body.textBody.trim().isEmpty) {
-      setState(() => _error = 'Recipient and message are required.');
+    final hasRecipient =
+        _to.text.trim().isNotEmpty ||
+        _cc.text.trim().isNotEmpty ||
+        _bcc.text.trim().isNotEmpty;
+    if (!hasRecipient) {
+      setState(() => _error = 'At least one recipient is required.');
+      return;
+    }
+    if (!_hasSendableMailContent(
+      subject: _subject.text,
+      textBody: body.textBody,
+      attachments: _attachments,
+    )) {
+      setState(() => _error = 'Add a subject, message, or attachment.');
       return;
     }
     setState(() {
@@ -7132,8 +7252,10 @@ class _ReaderBodyState extends State<_ReaderBody> {
         message.to.isNotEmpty ||
         message.cc.isNotEmpty ||
         message.replyTo.isNotEmpty;
+    final effectiveMailbox = message.effectiveMailbox;
+    final canDelete = effectiveMailbox != MailboxKind.trash;
     final moveDestinations = standardMailboxKinds
-        .where((kind) => kind != message.mailbox)
+        .where((kind) => kind != effectiveMailbox)
         .toList(growable: false);
     final hostIsDark =
         Theme.of(context).colorScheme.brightness == Brightness.dark;
@@ -7155,22 +7277,28 @@ class _ReaderBodyState extends State<_ReaderBody> {
       policy: renderPolicy,
     );
     final title = Text(
-      message.subject,
+      mailMessageSubjectLabel(message.subject),
       style: Theme.of(context).textTheme.headlineSmall,
       maxLines: widget.mobileFullScreen ? 3 : 2,
       overflow: TextOverflow.ellipsis,
     );
     final actionButtons = <Widget>[
-      if (_canMoveToInbox(message.mailbox))
+      if (_canMoveToInbox(effectiveMailbox))
         IconButton(
           tooltip: 'Move to Inbox',
-          onPressed: _acting ? null : () => _runAction(widget.onMoveToInbox),
+          onPressed:
+              _acting
+                  ? null
+                  : () => _runAction(widget.onMoveToInbox, closeAfter: true),
           icon: const Icon(Icons.move_to_inbox_outlined),
         )
       else
         IconButton(
           tooltip: 'Archive',
-          onPressed: _acting ? null : () => _runAction(widget.onArchive),
+          onPressed:
+              _acting
+                  ? null
+                  : () => _runAction(widget.onArchive, closeAfter: true),
           icon: const Icon(Icons.archive_outlined),
         ),
       PopupMenuButton<MailboxKind>(
@@ -7180,6 +7308,7 @@ class _ReaderBodyState extends State<_ReaderBody> {
         onSelected:
             (destination) => _runAction(
               (message) => widget.onMoveToMailbox(message, destination),
+              closeAfter: true,
             ),
         itemBuilder:
             (context) => [
@@ -7221,8 +7350,11 @@ class _ReaderBodyState extends State<_ReaderBody> {
         ),
       ),
       IconButton(
-        tooltip: 'Delete',
-        onPressed: _acting ? null : () => _runAction(widget.onDelete),
+        tooltip: canDelete ? 'Delete' : 'Already in Trash',
+        onPressed:
+            _acting || !canDelete
+                ? null
+                : () => _runAction(widget.onDelete, closeAfter: true),
         icon: const Icon(Icons.delete_outline),
       ),
       IconButton(
@@ -7613,15 +7745,20 @@ class _ReaderBodyState extends State<_ReaderBody> {
   }
 
   Future<void> _runAction(
-    Future<void> Function(MailMessage message) action,
-  ) async {
+    Future<void> Function(MailMessage message) action, {
+    bool closeAfter = false,
+  }) async {
     setState(() {
       _acting = true;
       _error = null;
     });
     try {
       await action(widget.message);
-      if (mounted) setState(() => _acting = false);
+      if (!mounted) return;
+      setState(() => _acting = false);
+      if (closeAfter && widget.mobileFullScreen) {
+        widget.onClose?.call();
+      }
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -7755,8 +7892,7 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
             if (widget.fullScreen)
               IconButton(
                 tooltip: 'Back',
-                onPressed:
-                    _finishing ? null : () => Navigator.of(context).pop(),
+                onPressed: _finishing ? null : _requestClose,
                 icon: const Icon(Icons.arrow_back),
               ),
             Expanded(
@@ -7769,7 +7905,7 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
             ),
             IconButton(
               tooltip: 'Close',
-              onPressed: _finishing ? null : () => Navigator.of(context).pop(),
+              onPressed: _finishing ? null : _requestClose,
               icon: const Icon(Icons.close),
             ),
           ],
@@ -7867,7 +8003,7 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
             TextButton(
-              onPressed: _finishing ? null : () => Navigator.of(context).pop(),
+              onPressed: _finishing ? null : _requestClose,
               child: const Text('Cancel'),
             ),
             const SizedBox(width: 8),
@@ -8083,10 +8219,13 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
     });
     try {
       final result = await _currentContent();
-      if (result.textBody.trim().isEmpty) {
+      if (!_hasSendableMailContent(
+        textBody: result.textBody,
+        attachments: result.attachments,
+      )) {
         if (mounted) {
           setState(() {
-            _error = 'Reply cannot be empty.';
+            _error = 'Add a message or attachment.';
             _finishing = false;
           });
         }
@@ -8100,6 +8239,51 @@ class _ReplyComposerSurfaceState extends State<_ReplyComposerSurface> {
           _finishing = false;
         });
       }
+    }
+  }
+
+  Future<void> _requestClose() async {
+    try {
+      final result = await _currentContent();
+      final hasDraft = _hasSendableMailContent(
+        textBody: result.textBody,
+        attachments: result.attachments,
+      );
+      if (!hasDraft) {
+        if (mounted) Navigator.of(context).pop();
+        return;
+      }
+      if (!mounted) return;
+      final discard =
+          await showDialog<bool>(
+            context: context,
+            builder:
+                (context) => AlertDialog(
+                  title: const Text('Discard reply?'),
+                  content: const Text(
+                    'This reply has unsent content or attachments.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(context).pop(false),
+                      child: const Text('Keep editing'),
+                    ),
+                    FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Theme.of(context).colorScheme.error,
+                        foregroundColor: Theme.of(context).colorScheme.onError,
+                      ),
+                      onPressed: () => Navigator.of(context).pop(true),
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('Discard'),
+                    ),
+                  ],
+                ),
+          ) ??
+          false;
+      if (discard && mounted) Navigator.of(context).pop();
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
     }
   }
 
@@ -8359,6 +8543,16 @@ String _normalizeReplyHtml(String html, String text) {
 String _plainTextToOutgoingHtml(String text) {
   final escaped = const HtmlEscape(HtmlEscapeMode.element).convert(text.trim());
   return '<div>${escaped.replaceAll('\n', '<br>')}</div>';
+}
+
+bool _hasSendableMailContent({
+  String subject = '',
+  String textBody = '',
+  List<OutgoingAttachment> attachments = const [],
+}) {
+  return subject.trim().isNotEmpty ||
+      textBody.trim().isNotEmpty ||
+      attachments.isNotEmpty;
 }
 
 String? _normalizeComposerLink(String? raw) {
@@ -11915,6 +12109,21 @@ bool _canMoveToInbox(MailboxKind kind) {
     MailboxKind.trash ||
     MailboxKind.custom => true,
     MailboxKind.inbox || MailboxKind.sent || MailboxKind.drafts => false,
+  };
+}
+
+bool _mailListActionAppliesToMessage(
+  MailListActionPreference action,
+  MailMessage message,
+) {
+  final mailbox = message.effectiveMailbox;
+  return switch (action) {
+    MailListActionPreference.archive => mailbox != MailboxKind.archive,
+    MailListActionPreference.delete => mailbox != MailboxKind.trash,
+    MailListActionPreference.moveToInbox => _canMoveToInbox(mailbox),
+    MailListActionPreference.pin ||
+    MailListActionPreference.toggleRead ||
+    MailListActionPreference.toggleStar => true,
   };
 }
 

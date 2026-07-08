@@ -238,11 +238,31 @@ List<String> mailMessageDetailLines(MailMessage message) {
   return lines;
 }
 
+String mailMessageSubjectLabel(String subject) {
+  final trimmed = subject.trim();
+  return trimmed.isEmpty ? '(No subject)' : trimmed;
+}
+
 String mailMessageDisplayDate(DateTime date) {
   final local = date.toLocal();
   String two(int value) => value.toString().padLeft(2, '0');
   return '${local.year}-${two(local.month)}-${two(local.day)} '
       '${two(local.hour)}:${two(local.minute)}';
+}
+
+String mailMessageCompactDisplayDate(DateTime date, {DateTime? now}) {
+  final local = date.toLocal();
+  final reference = (now ?? DateTime.now()).toLocal();
+  String two(int value) => value.toString().padLeft(2, '0');
+  if (local.year == reference.year &&
+      local.month == reference.month &&
+      local.day == reference.day) {
+    return '${two(local.hour)}:${two(local.minute)}';
+  }
+  if (local.year == reference.year) {
+    return '${local.month}/${local.day}';
+  }
+  return '${local.year}/${local.month}/${local.day}';
 }
 
 bool mailMessageMatchesQuery(MailMessage message, String query) {
