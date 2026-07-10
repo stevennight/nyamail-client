@@ -33,6 +33,14 @@ void main() {
         bcc: 'audit@example.com',
         subject: 'Status',
         body: 'Draft body',
+        htmlBody: '<div><strong>Draft body</strong></div>',
+        attachments: const [
+          MailDraftAttachment(
+            filename: 'status.txt',
+            contentType: 'text/plain',
+            bytes: [83, 116, 97, 116, 117, 115],
+          ),
+        ],
         updatedAt: updatedAt,
       ),
     );
@@ -46,6 +54,11 @@ void main() {
     expect(draft.bcc, 'audit@example.com');
     expect(draft.subject, 'Status');
     expect(draft.body, 'Draft body');
+    expect(draft.htmlBody, '<div><strong>Draft body</strong></div>');
+    expect(draft.attachments, hasLength(1));
+    expect(draft.attachments.single.filename, 'status.txt');
+    expect(draft.attachments.single.contentType, 'text/plain');
+    expect(draft.attachments.single.bytes, [83, 116, 97, 116, 117, 115]);
     expect(draft.updatedAt.toUtc(), updatedAt);
   });
 
@@ -69,6 +82,62 @@ void main() {
     expect(await cache.loadComposeDraft(), isNull);
   });
 
+  test('legacy plain-text compose draft loads without HTML content', () async {
+    final namespace = mailCacheNamespaceForUser('user-a');
+    final cache = MailDraftCache(
+      namespace: namespace,
+      supportDirectoryProvider: () async => tempDir,
+    );
+    final file = File('${tempDir.path}/mail-drafts/$namespace/compose.json');
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      jsonEncode({
+        'account_id': 'work',
+        'subject': 'Legacy draft',
+        'body': 'Plain text only',
+        'updated_at': DateTime.utc(2026, 7, 2).toIso8601String(),
+      }),
+      encoding: utf8,
+    );
+
+    final draft = await cache.loadComposeDraft();
+
+    expect(draft?.subject, 'Legacy draft');
+    expect(draft?.body, 'Plain text only');
+    expect(draft?.htmlBody, isEmpty);
+  });
+
+  test('compose draft serializes concurrent writes', () async {
+    final cache = MailDraftCache(
+      namespace: mailCacheNamespaceForUser('user-a'),
+      supportDirectoryProvider: () async => tempDir,
+    );
+
+    await Future.wait([
+      cache.saveComposeDraft(
+        MailDraft(
+          accountId: 'work',
+          subject: 'First save',
+          body: 'First body',
+          updatedAt: DateTime.utc(2026, 7, 2, 10),
+        ),
+      ),
+      cache.saveComposeDraft(
+        MailDraft(
+          accountId: 'work',
+          subject: 'Second save',
+          body: 'Second body',
+          updatedAt: DateTime.utc(2026, 7, 2, 10, 1),
+        ),
+      ),
+    ]);
+
+    final draft = await cache.loadComposeDraft();
+
+    expect(draft?.subject, 'Second save');
+    expect(draft?.body, 'Second body');
+  });
+
   test(
     'compose draft encrypts saved content when a secret is available',
     () async {
@@ -85,6 +154,14 @@ void main() {
           to: 'alice@example.com',
           subject: 'Sensitive subject',
           body: 'Sensitive draft body',
+          htmlBody: '<div><em>Sensitive draft body</em></div>',
+          attachments: const [
+            MailDraftAttachment(
+              filename: 'private.txt',
+              contentType: 'text/plain',
+              bytes: [112, 114, 105, 118, 97, 116, 101],
+            ),
+          ],
           updatedAt: DateTime.utc(2026, 7, 2),
         ),
       );
@@ -96,8 +173,12 @@ void main() {
       expect(raw, contains('nyamail-local-cache-aes256gcm-v1'));
       expect(raw, isNot(contains('alice@example.com')));
       expect(raw, isNot(contains('Sensitive draft body')));
+      expect(raw, isNot(contains('<em>')));
+      expect(raw, isNot(contains('private.txt')));
       expect(draft?.to, 'alice@example.com');
       expect(draft?.body, 'Sensitive draft body');
+      expect(draft?.htmlBody, '<div><em>Sensitive draft body</em></div>');
+      expect(draft?.attachments.single.filename, 'private.txt');
     },
   );
 
