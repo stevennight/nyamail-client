@@ -40,9 +40,10 @@ class MailCache implements MailMessageCache {
     await _lockFor(file).synchronized(() async {
       final existing = await _loadMessagesFromFile(file);
       final byId = {for (final message in existing) message.id: message};
+      var changed = false;
       for (final message in messages) {
         final current = byId[message.id];
-        byId[message.id] =
+        final next =
             current != null && current.bodyLoaded && !message.bodyLoaded
                 ? message.copyWith(
                   body: current.body,
@@ -52,7 +53,12 @@ class MailCache implements MailMessageCache {
                   bodyLoaded: true,
                 )
                 : message;
+        if (current == null || !_sameCachedMessage(current, next)) {
+          changed = true;
+        }
+        byId[message.id] = next;
       }
+      if (!changed) return;
       await _writeMessagesToFile(file, byId.values);
     });
   }
@@ -175,6 +181,11 @@ class MailCache implements MailMessageCache {
             )
             .toList(),
   };
+
+  bool _sameCachedMessage(MailMessage first, MailMessage second) {
+    return jsonEncode(_messageToJson(first)) ==
+        jsonEncode(_messageToJson(second));
+  }
 
   MailMessage _messageFromJson(Map<String, Object?> json) => MailMessage(
     id: json['id'] as String? ?? '',

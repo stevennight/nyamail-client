@@ -61,6 +61,7 @@ const _mailRefreshTimeout = Duration(seconds: 90);
 const _mailLoadMoreTimeout = Duration(seconds: 60);
 const _oauthRefreshTimeout = Duration(seconds: 20);
 const _folderDiscoveryTimeout = Duration(seconds: 45);
+const _automaticMailRefreshInterval = Duration(minutes: 2);
 
 const _mailHomeShortcuts = <ShortcutActivator, Intent>{
   SingleActivator(LogicalKeyboardKey.keyN, control: true): _ComposeMailIntent(),
@@ -257,7 +258,10 @@ class _MailHomePageState extends State<MailHomePage>
   bool _hasMoreMessages = true;
   int _messageLoadGeneration = 0;
   SystemBehaviorSettings _systemSettings = SystemBehaviorSettings.defaults;
-  Timer? _newMailPollTimer;
+  Timer? _automaticMailRefreshTimer;
+  bool _automaticMailRefreshInProgress = false;
+  bool _appIsInForeground = true;
+  int _pendingStartupMailboxWork = 0;
   bool _pollingNewMail = false;
   final _newMailNotificationBaseline = MailNotificationBaseline();
   late final LocalVaultAuthenticator _vaultAuthenticator =
@@ -275,7 +279,7 @@ class _MailHomePageState extends State<MailHomePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _newMailPollTimer?.cancel();
+    _automaticMailRefreshTimer?.cancel();
     unawaited(_flushPendingMailActions());
     unawaited(_trayService.dispose());
     _mobileMessageNotifiers.clear();
@@ -290,9 +294,16 @@ class _MailHomePageState extends State<MailHomePage>
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
+        _appIsInForeground = false;
+        _automaticMailRefreshTimer?.cancel();
+        _automaticMailRefreshTimer = null;
         unawaited(_flushPendingMailActions());
         break;
       case AppLifecycleState.resumed:
+        _appIsInForeground = true;
+        _syncAutomaticMailRefresh();
+        unawaited(_refreshMailboxAutomatically());
+        break;
       case AppLifecycleState.inactive:
         break;
     }
@@ -368,7 +379,7 @@ class _MailHomePageState extends State<MailHomePage>
       enabled: settings.newMailNotifications,
       onNotificationSelected: _showMainWindowFromSystemSurface,
     );
-    _syncNewMailPolling(settings.newMailNotifications);
+    _syncAutomaticMailRefresh();
   }
 
   Future<void> _showMainWindowFromSystemSurface() async {
@@ -480,31 +491,90 @@ class _MailHomePageState extends State<MailHomePage>
     });
     _debugVault('finish bootstrap: unlocked frame ready');
     _resetNewMailNotificationBaseline();
-    _syncNewMailPolling(_systemSettings.newMailNotifications);
     final requestId = _nextMessageLoadGeneration();
-    unawaited(_discoverFoldersInBackground());
-    // Keep the first unlocked frame local-only; network work continues behind it.
+    _pendingStartupMailboxWork++;
     unawaited(
-      _refreshMessagesInBackground(
-        requestId: requestId,
-        suppressNewMailNotifications: true,
-      ),
+      _finishLocalBootstrapNetworkWork(requestId: requestId, session: session),
     );
-    if (session != null) {
-      unawaited(_tryUnlockStoredVault(session));
-    }
-    unawaited(_checkUpdates(silent: true));
   }
 
-  void _syncNewMailPolling(bool enabled) {
-    _newMailPollTimer?.cancel();
-    _newMailPollTimer = null;
-    if (!enabled || !_hasUnlockedLocalVault || _accounts.isEmpty) return;
-    _newMailPollTimer = Timer.periodic(
-      const Duration(minutes: 5),
-      (_) => unawaited(_pollNewMailForNotifications()),
+  Future<void> _finishLocalBootstrapNetworkWork({
+    required int requestId,
+    required LocalSession? session,
+  }) async {
+    try {
+      // Keep the first unlocked frame local-only, then avoid competing IMAP work.
+      await _refreshMessagesInBackground(
+        requestId: requestId,
+        suppressNewMailNotifications: true,
+        completeStartupNotificationBaseline:
+            _viewCanPrimeNewMailNotificationBaseline(),
+      );
+      if (!mounted) return;
+      if (_systemSettings.newMailNotifications &&
+          _newMailNotificationBaseline.startupPending) {
+        await _pollNewMailForNotifications();
+      }
+      if (!mounted) return;
+      await _discoverFoldersInBackground();
+      if (!mounted) return;
+      if (session != null) {
+        await _tryUnlockStoredVault(session);
+      }
+      if (!mounted) return;
+      await _checkUpdates(silent: true);
+    } finally {
+      _pendingStartupMailboxWork--;
+      if (mounted && _pendingStartupMailboxWork == 0) {
+        _syncAutomaticMailRefresh();
+      }
+    }
+  }
+
+  void _syncAutomaticMailRefresh() {
+    _automaticMailRefreshTimer?.cancel();
+    _automaticMailRefreshTimer = null;
+    if (_pendingStartupMailboxWork > 0 ||
+        !_appIsInForeground ||
+        !_hasUnlockedLocalVault ||
+        _accounts.isEmpty) {
+      return;
+    }
+    _automaticMailRefreshTimer = Timer.periodic(
+      _automaticMailRefreshInterval,
+      (_) => unawaited(_refreshMailboxAutomatically()),
     );
-    unawaited(_pollNewMailForNotifications());
+  }
+
+  Future<void> _refreshMailboxAutomatically() async {
+    if (!_appIsInForeground ||
+        _automaticMailRefreshInProgress ||
+        _refreshingMail ||
+        _pendingStartupMailboxWork > 0 ||
+        !_hasUnlockedLocalVault ||
+        _accounts.isEmpty) {
+      return;
+    }
+    _automaticMailRefreshInProgress = true;
+    try {
+      final requestId = _nextMessageLoadGeneration();
+      final completesNotificationBaseline =
+          _systemSettings.newMailNotifications &&
+          _newMailNotificationBaseline.startupPending &&
+          _viewCanPrimeNewMailNotificationBaseline();
+      await _refreshMessagesInBackground(
+        requestId: requestId,
+        completeStartupNotificationBaseline: completesNotificationBaseline,
+      );
+      if (!mounted) return;
+      if (_systemSettings.newMailNotifications &&
+          (!completesNotificationBaseline ||
+              _newMailNotificationBaseline.startupPending)) {
+        await _pollNewMailForNotifications();
+      }
+    } finally {
+      _automaticMailRefreshInProgress = false;
+    }
   }
 
   Future<void> _pollNewMailForNotifications() async {
@@ -589,10 +659,25 @@ class _MailHomePageState extends State<MailHomePage>
         text.contains('token');
   }
 
-  void _primeNewMailNotificationBaseline(Iterable<MailMessage> messages) {
-    _newMailNotificationBaseline.prime(
-      messages.where(_isNotifiableIncomingUnread),
-    );
+  void _primeNewMailNotificationBaseline(
+    Iterable<MailMessage> messages, {
+    bool completeStartupBaseline = false,
+  }) {
+    final incomingUnread = messages.where(_isNotifiableIncomingUnread);
+    if (completeStartupBaseline) {
+      _newMailNotificationBaseline.freshMessages(
+        incomingUnread,
+        completeStartupBaseline: true,
+      );
+      return;
+    }
+    _newMailNotificationBaseline.prime(incomingUnread);
+  }
+
+  bool _viewCanPrimeNewMailNotificationBaseline() {
+    return _search.text.trim().isEmpty &&
+        _view.folder == null &&
+        _view.smartFolder == MailSmartFolder.allIncoming;
   }
 
   void _resetNewMailNotificationBaseline() {
@@ -1298,6 +1383,7 @@ class _MailHomePageState extends State<MailHomePage>
     bool showErrors = false,
     bool preserveSelection = true,
     bool suppressNewMailNotifications = false,
+    bool completeStartupNotificationBaseline = false,
     bool showRefreshIndicator = true,
   }) async {
     if (showRefreshIndicator) {
@@ -1311,9 +1397,17 @@ class _MailHomePageState extends State<MailHomePage>
       );
       if (!_isCurrentMessageLoad(requestId)) return;
       if (suppressNewMailNotifications) {
-        _primeNewMailNotificationBaseline(page.messages);
+        _primeNewMailNotificationBaseline(
+          page.messages,
+          completeStartupBaseline: completeStartupNotificationBaseline,
+        );
       } else {
-        unawaited(_notifyForNewIncomingMail(page.messages));
+        unawaited(
+          _notifyForNewIncomingMail(
+            page.messages,
+            completeStartupBaseline: completeStartupNotificationBaseline,
+          ),
+        );
       }
       final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
@@ -3417,7 +3511,7 @@ class _MailHomePageState extends State<MailHomePage>
     final accountsChanged = !setEquals(previousAccountIds, nextAccountIds);
     if (accountsChanged) {
       _resetNewMailNotificationBaseline();
-      _syncNewMailPolling(_systemSettings.newMailNotifications);
+      _syncAutomaticMailRefresh();
     }
     _debugVault('apply vault: state updated');
     if (requestId != null) {
@@ -3462,7 +3556,7 @@ class _MailHomePageState extends State<MailHomePage>
       credentials: document.toCredentials(),
       cacheNamespace: cacheNamespace,
       localCacheSecret: localCacheSecret,
-      backgroundIndexing: true,
+      backgroundIndexing: false,
     );
   }
 

@@ -120,6 +120,31 @@ void main() {
     expect(loaded.single.attachments.single.filename, '报告.pdf');
   });
 
+  test('mail cache skips disk rewrites for unchanged messages', () async {
+    final cache = MailCache(
+      localCacheSecret: _testSecret(),
+      supportDirectoryProvider: () async => tempDir,
+    );
+    final message = MailMessage(
+      id: 'work:inbox:unchanged',
+      accountId: 'work',
+      from: 'Alice <alice@example.com>',
+      subject: 'No changes',
+      preview: 'Same preview',
+      body: '',
+      receivedAt: DateTime.utc(2026, 7, 2),
+      bodyLoaded: false,
+    );
+
+    await cache.saveMessages([message]);
+    final file = File('${tempDir.path}/mail-cache/messages.json');
+    final firstWrite = await file.readAsString(encoding: utf8);
+
+    await cache.saveMessages([message]);
+
+    expect(await file.readAsString(encoding: utf8), firstWrite);
+  });
+
   test(
     'mail cache quarantines unreadable json instead of failing load',
     () async {

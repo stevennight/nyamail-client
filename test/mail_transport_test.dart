@@ -376,6 +376,7 @@ void main() {
         'acc:inbox:502',
         'acc:inbox:501',
       ]);
+      expect(server.previewFetchCommandCount, 1);
       expect(messages.first.bodyLoaded, isFalse);
       expect(messages.first.body, isEmpty);
       expect(messages.first.preview, contains('Body 502'));
@@ -912,6 +913,16 @@ class _FakeImapServer {
     return _commands.any((command) => command.contains(' BODY.PEEK[]<0.'));
   }
 
+  int get previewFetchCommandCount {
+    return _commands
+        .where(
+          (command) =>
+              command.contains(' UID FETCH ') &&
+              command.contains(' BODY.PEEK[]<0.'),
+        )
+        .length;
+  }
+
   bool get sawLogin {
     return _commands.any((command) => command.contains(' LOGIN '));
   }
@@ -1023,31 +1034,35 @@ class _FakeImapServer {
           );
         }
       } else if (command.contains(' UID FETCH ')) {
-        final uid = RegExp(r' UID FETCH (\d+) ').firstMatch(command)?.group(1);
-        if (uid == null) {
+        final requestedUids = RegExp(
+          r' UID FETCH ([0-9,]+) ',
+        ).firstMatch(command)?.group(1);
+        if (requestedUids == null) {
           socket.write('$tag BAD invalid fetch\r\n');
           continue;
         }
-        final parsedUid = int.parse(uid);
-        fetchedUids.add(parsedUid);
-        final raw =
-            messagesByUid[parsedUid] ??
-            [
-              'From: Alice <alice@example.com>',
-              'Subject: Message $parsedUid',
-              'Date: 2026-07-01T08:00:00Z',
-              '',
-              'Body $parsedUid',
-            ].join('\r\n');
-        final internalDate =
-            internalDatesByUid[parsedUid] ?? '01-Jul-2026 08:00:00 +0000';
-        socket.write(
-          '* 1 FETCH (UID $parsedUid FLAGS (\\Seen \\Flagged) '
-          'INTERNALDATE "$internalDate" BODY[] '
-          '{${utf8.encode(raw).length}}\r\n',
-        );
-        socket.add(utf8.encode(raw));
-        socket.write(')\r\n');
+        final parsedUids = requestedUids.split(',').map(int.parse).toList();
+        fetchedUids.addAll(parsedUids);
+        for (final parsedUid in parsedUids) {
+          final raw =
+              messagesByUid[parsedUid] ??
+              [
+                'From: Alice <alice@example.com>',
+                'Subject: Message $parsedUid',
+                'Date: 2026-07-01T08:00:00Z',
+                '',
+                'Body $parsedUid',
+              ].join('\r\n');
+          final internalDate =
+              internalDatesByUid[parsedUid] ?? '01-Jul-2026 08:00:00 +0000';
+          socket.write(
+            '* 1 FETCH (UID $parsedUid FLAGS (\\Seen \\Flagged) '
+            'INTERNALDATE "$internalDate" BODY[] '
+            '{${utf8.encode(raw).length}}\r\n',
+          );
+          socket.add(utf8.encode(raw));
+          socket.write(')\r\n');
+        }
         socket.write('$tag OK FETCH completed\r\n');
       } else if (command.contains(' APPEND ')) {
         final literalLength = int.parse(

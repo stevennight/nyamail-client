@@ -5,7 +5,7 @@ import 'dart:io';
 
 import 'mail_models.dart';
 
-const _messagePreviewFetchBytes = 32 * 1024;
+const _messagePreviewFetchBytes = 8 * 1024;
 
 class MailboxCredential {
   const MailboxCredential({
@@ -309,9 +309,20 @@ class SocketMailTransport implements MailTransport {
       );
       final messages = <MailMessage>[];
       var complete = true;
+      Map<int, _FetchedImapMessage> fetchedByUid;
+      try {
+        fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
+      } catch (_) {
+        complete = false;
+        fetchedByUid = const <int, _FetchedImapMessage>{};
+      }
       for (final uid in selectedUids) {
+        final fetched = fetchedByUid[uid];
+        if (fetched == null) {
+          complete = false;
+          continue;
+        }
         try {
-          final fetched = await imap.uidFetchMessagePreview(uid);
           final parsed = parseRfc822Message(
             fetched.raw,
             id: _messageId(credential.accountId, mailbox, uid),
@@ -368,9 +379,20 @@ class SocketMailTransport implements MailTransport {
       );
       final messages = <MailMessage>[];
       var complete = true;
+      Map<int, _FetchedImapMessage> fetchedByUid;
+      try {
+        fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
+      } catch (_) {
+        complete = false;
+        fetchedByUid = const <int, _FetchedImapMessage>{};
+      }
       for (final uid in selectedUids) {
+        final fetched = fetchedByUid[uid];
+        if (fetched == null) {
+          complete = false;
+          continue;
+        }
         try {
-          final fetched = await imap.uidFetchMessagePreview(uid);
           final parsed = parseRfc822Message(
             fetched.raw,
             id: _messageIdForFolder(credential.accountId, folder, uid),
@@ -1169,6 +1191,38 @@ class _ImapConnection {
     );
   }
 
+  Future<Map<int, _FetchedImapMessage>> uidFetchMessagePreviews(
+    Iterable<int> uids,
+  ) async {
+    final requested = LinkedHashSet<int>.of(
+      uids.where((uid) => uid > 0),
+    ).toList(growable: false);
+    if (requested.isEmpty) return const <int, _FetchedImapMessage>{};
+
+    final responses = await _fetchLiteralResponses(
+      'UID FETCH ${requested.join(',')} '
+      '(FLAGS INTERNALDATE BODY.PEEK[]<0.$_messagePreviewFetchBytes>)',
+    );
+    final requestedUids = requested.toSet();
+    final fetchedByUid = <int, _FetchedImapMessage>{};
+    for (final response in responses) {
+      final uid = _parseFetchUid(response.lines);
+      if (uid == null ||
+          !requestedUids.contains(uid) ||
+          response.chunks.isEmpty) {
+        continue;
+      }
+      fetchedByUid[uid] = _FetchedImapMessage(
+        raw: response.chunks
+            .map((bytes) => utf8.decode(bytes, allowMalformed: true))
+            .join('\n'),
+        flags: _parseFetchFlags(response.lines),
+        internalDate: _parseFetchInternalDate(response.lines),
+      );
+    }
+    return fetchedByUid;
+  }
+
   Future<List<int>> fetchBodyPartBytes(int id, String partId) async {
     return uidFetchBodyPartBytes(id, partId);
   }
@@ -1209,6 +1263,57 @@ class _ImapConnection {
             .readBytes(length)
             .timeout(const Duration(seconds: 30));
         chunks.add(bytes);
+      }
+    }
+  }
+
+  Future<List<_FetchLiteralResponse>> _fetchLiteralResponses(
+    String command,
+  ) async {
+    final tag = _nextTag();
+    final responses = <_FetchLiteralResponse>[];
+    List<String>? currentLines;
+    List<List<int>>? currentChunks;
+
+    void finishCurrentResponse() {
+      final lines = currentLines;
+      final chunks = currentChunks;
+      if (lines == null || chunks == null) return;
+      responses.add(_FetchLiteralResponse(lines: lines, chunks: chunks));
+      currentLines = null;
+      currentChunks = null;
+    }
+
+    _socket.write('$tag $command\r\n');
+    while (true) {
+      final line = await _reader.readLine().timeout(
+        const Duration(seconds: 30),
+      );
+      if (line.startsWith('$tag OK')) {
+        finishCurrentResponse();
+        return responses;
+      }
+      if (line.startsWith('$tag NO') || line.startsWith('$tag BAD')) {
+        throw MailTransportException('IMAP fetch failed: $line');
+      }
+
+      final startsFetch =
+          line.startsWith('* ') && line.toUpperCase().contains(' FETCH ');
+      if (startsFetch) {
+        finishCurrentResponse();
+        currentLines = [line];
+        currentChunks = <List<int>>[];
+      } else {
+        currentLines?.add(line);
+      }
+
+      final literal = RegExp(r'\{(\d+)\}$').firstMatch(line);
+      if (literal != null) {
+        final length = int.parse(literal.group(1)!);
+        final bytes = await _reader
+            .readBytes(length)
+            .timeout(const Duration(seconds: 30));
+        currentChunks?.add(bytes);
       }
     }
   }
@@ -1521,6 +1626,17 @@ class _FetchLiteralResponse {
 
   final List<String> lines;
   final List<List<int>> chunks;
+}
+
+int? _parseFetchUid(List<String> lines) {
+  for (final line in lines) {
+    final match = RegExp(
+      r'\bUID\s+(\d+)\b',
+      caseSensitive: false,
+    ).firstMatch(line);
+    if (match != null) return int.tryParse(match.group(1)!);
+  }
+  return null;
 }
 
 Set<String> _parseFetchFlags(List<String> lines) {

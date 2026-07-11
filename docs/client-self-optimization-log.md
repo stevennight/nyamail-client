@@ -508,3 +508,51 @@ Completion audit:
 - Those larger changes are deliberately deferred so this autonomous pass does
   not invent provider behavior or weaken the local-first/sanitized-rendering
   decisions.
+
+## 2026-07-11 Round 18 - Android Refresh Responsiveness
+
+Focus: remove avoidable startup contention on Android, make foreground mail
+data refresh reliably without depending on notification settings, and reduce
+the work required for each IMAP preview page.
+
+Implemented:
+
+- Reordered post-unlock work so the cached mailbox frame remains first and the
+  current remote mailbox refresh completes before notification baseline work,
+  folder discovery, server-vault synchronization, and update checking begin.
+  This prevents several simultaneous IMAP connections and cache writes when
+  the app first opens.
+- Replaced the notification-only five-minute poll with a foreground mailbox
+  refresh timer that runs every two minutes whenever an unlocked account is
+  available. It refreshes the visible mailbox and updates the list even when
+  new-mail notifications are disabled.
+- Added an immediate refresh when the Android app resumes. Timers stop while
+  the app is paused, hidden, or detached, avoiding background polling and
+  unnecessary battery/network work.
+- Kept notification behavior in the unified refresh path. The initial
+  all-incoming refresh establishes the no-notify startup baseline; other views
+  perform the baseline poll only after the visible mailbox refresh is done.
+- Disabled automatic historical-page indexing in the interactive app
+  repository. Older mail remains available through the existing explicit
+  load-more cursor flow, but opening a mailbox no longer launches competing
+  background preview fetches.
+- Changed IMAP preview retrieval from one `UID FETCH` round trip per message
+  to one batched `UID FETCH` command for the page. The batch parser preserves
+  the UID, flags, and internal date for each returned literal.
+- Reduced the preview body window from 32 KiB to 8 KiB. Full MIME bodies still
+  load only when a message is opened, while list rows retain the headers and
+  normal preview text they need.
+- Avoided rewriting the encrypted on-disk message cache when a refresh returns
+  identical message data, reducing Android storage, encryption, and UI-isolate
+  pressure during periodic refreshes.
+
+Validation:
+
+- Added a transport test proving a two-message preview page uses one batch
+  `UID FETCH` command while preserving order and parsed preview data.
+- Added an encrypted-cache test proving an unchanged refresh leaves the cache
+  file untouched.
+- `flutter analyze --no-pub` completed with no issues.
+- `flutter test --no-pub` completed with 195 passing tests. The test suite uses
+  fake loopback IMAP and local caches only; no real mailbox or provider network
+  access was used.
