@@ -675,6 +675,55 @@ void main() {
     },
   );
 
+  test('smart view reuses a recent folder listing', () async {
+    const inbox = MailFolder(
+      accountId: 'work',
+      path: 'INBOX',
+      displayName: 'Inbox',
+      kind: MailboxKind.inbox,
+    );
+    final transport =
+        _RecordingTransport()
+          ..foldersByCredential['work'] = [inbox]
+          ..messagesByFolder[inbox.key] = [
+            MailMessage(
+              id: 'work:inbox:1',
+              accountId: 'work',
+              from: 'Alice <alice@example.com>',
+              subject: 'One',
+              preview: 'One',
+              body: 'One',
+              receivedAt: DateTime.utc(2026, 7, 2),
+            ),
+          ];
+    final repository = CachedTransportMailRepository(
+      cache: _MemoryMailCache(),
+      transport: transport,
+      credentials: const [
+        MailboxCredential(
+          accountId: 'work',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: 'imap.example.com',
+          imapPort: 993,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+        ),
+      ],
+    );
+
+    await repository.viewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+    await repository.viewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+
+    expect(transport.folderListRequestCount, 1);
+  });
+
   test('account folder view fetches only the selected real folder', () async {
     final projects = MailFolder(
       accountId: 'work',
@@ -1888,6 +1937,13 @@ class _MemoryMailCache implements MailMessageCache {
   }
 
   @override
+  Future<void> deleteMessages(Iterable<String> messageIds) async {
+    for (final messageId in messageIds) {
+      _messages.remove(messageId);
+    }
+  }
+
+  @override
   Future<void> clear() async {
     _messages.clear();
   }
@@ -1918,6 +1974,7 @@ class _RecordingTransport implements MailTransport {
   final bodyById = <String, MailMessage>{};
   final fetchedCredentialIds = <String>[];
   final fetchedBeforeUids = <int?>[];
+  int folderListRequestCount = 0;
   bool incompletePreviewFetch = false;
 
   @override
@@ -1929,6 +1986,7 @@ class _RecordingTransport implements MailTransport {
   Future<List<MailFolder>> listFolders({
     required MailboxCredential credential,
   }) async {
+    folderListRequestCount++;
     return foldersByCredential[credential.accountId] ??
         [
           MailFolder(
@@ -1999,11 +2057,7 @@ class _RecordingTransport implements MailTransport {
           if (_uidFor(message) case final uid?) uid,
       ],
       remoteUids: remoteUids,
-      hasMore: _hasMoreMessages(
-        remoteUids,
-        limit: limit,
-        beforeUid: beforeUid,
-      ),
+      hasMore: _hasMoreMessages(remoteUids, limit: limit, beforeUid: beforeUid),
       complete: !incompletePreviewFetch,
     );
   }
@@ -2048,11 +2102,7 @@ class _RecordingTransport implements MailTransport {
           if (_uidFor(message) case final uid?) uid,
       ],
       remoteUids: remoteUids,
-      hasMore: _hasMoreMessages(
-        remoteUids,
-        limit: limit,
-        beforeUid: beforeUid,
-      ),
+      hasMore: _hasMoreMessages(remoteUids, limit: limit, beforeUid: beforeUid),
       complete: !incompletePreviewFetch,
     );
   }
@@ -2132,7 +2182,7 @@ class _RecordingTransport implements MailTransport {
         DownloadedAttachment(
           filename: attachment.filename,
           contentType: attachment.contentType,
-            bytes: const [],
+          bytes: const [],
         );
   }
 
@@ -2155,11 +2205,7 @@ class _RecordingTransport implements MailTransport {
         const [];
   }
 
-  bool _hasMoreMessages(
-    List<int> uids, {
-    required int limit,
-    int? beforeUid,
-  }) {
+  bool _hasMoreMessages(List<int> uids, {required int limit, int? beforeUid}) {
     final eligible =
         beforeUid == null ? uids : uids.where((uid) => uid < beforeUid);
     return eligible.length > limit;

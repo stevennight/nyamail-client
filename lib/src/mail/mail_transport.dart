@@ -2,10 +2,14 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'mail_models.dart';
 
 const _messagePreviewFetchBytes = 8 * 1024;
+const _rfc822BackgroundParseThreshold = 48 * 1024;
+const _uidSearchBackgroundParseThreshold = 48 * 1024;
+const _uidPageBackgroundSelectionThreshold = 4096;
 
 class MailboxCredential {
   const MailboxCredential({
@@ -262,19 +266,21 @@ class SocketMailTransport implements MailTransport {
       await imap.selectMailbox(folder.path);
       final uids = await imap.uidSearchAll();
       final messages = <MailMessage>[];
-      for (final uid in _selectUidPage(uids, limit: limit)) {
+      for (final uid in await _selectUidPageInBackground(uids, limit: limit)) {
         final fetched = await imap.uidFetchMessage(uid);
         messages.add(
-          parseRfc822Message(
-            fetched.raw,
-            id: _messageId(credential.accountId, mailbox, uid),
-            accountId: credential.accountId,
-            mailbox: mailbox,
-            folderPath: folder.path,
-            folderDisplayName: folder.displayName,
-            read: fetched.flags.contains(r'\Seen'),
-            starred: fetched.flags.contains(r'\Flagged'),
-            receivedAt: fetched.internalDate,
+          await _parseFetchedRfc822Message(
+            _Rfc822ParseRequest(
+              raw: fetched.raw,
+              id: _messageId(credential.accountId, mailbox, uid),
+              accountId: credential.accountId,
+              mailbox: mailbox,
+              folderPath: folder.path,
+              folderDisplayName: folder.displayName,
+              read: fetched.flags.contains(r'\Seen'),
+              starred: fetched.flags.contains(r'\Flagged'),
+              receivedAt: fetched.internalDate,
+            ),
           ),
         );
       }
@@ -302,7 +308,7 @@ class SocketMailTransport implements MailTransport {
       );
       await imap.selectMailbox(folder.path);
       final uids = await imap.uidSearchAll();
-      final selectedUids = _selectUidPage(
+      final selectedUids = await _selectUidPageInBackground(
         uids,
         limit: limit,
         beforeUid: beforeUid,
@@ -316,15 +322,16 @@ class SocketMailTransport implements MailTransport {
         complete = false;
         fetchedByUid = const <int, _FetchedImapMessage>{};
       }
+      final requests = <_Rfc822ParseRequest>[];
       for (final uid in selectedUids) {
         final fetched = fetchedByUid[uid];
         if (fetched == null) {
           complete = false;
           continue;
         }
-        try {
-          final parsed = parseRfc822Message(
-            fetched.raw,
+        requests.add(
+          _Rfc822ParseRequest(
+            raw: fetched.raw,
             id: _messageId(credential.accountId, mailbox, uid),
             accountId: credential.accountId,
             mailbox: mailbox,
@@ -334,19 +341,24 @@ class SocketMailTransport implements MailTransport {
             starred: fetched.flags.contains(r'\Flagged'),
             bodyLoaded: false,
             receivedAt: fetched.internalDate,
-          );
-          messages.add(
-            parsed.copyWith(
-              body: '',
-              htmlBody: '',
-              hasAttachments: false,
-              attachments: const [],
-              bodyLoaded: false,
-            ),
-          );
-        } catch (_) {
+          ),
+        );
+      }
+      for (final result in await _parseFetchedRfc822Previews(requests)) {
+        final parsed = result.message;
+        if (parsed == null) {
           complete = false;
+          continue;
         }
+        messages.add(
+          parsed.copyWith(
+            body: '',
+            htmlBody: '',
+            hasAttachments: false,
+            attachments: const [],
+            bodyLoaded: false,
+          ),
+        );
       }
       return MailPreviewPage(
         messages: messages,
@@ -372,7 +384,7 @@ class SocketMailTransport implements MailTransport {
       await imap.login();
       await imap.selectMailbox(folder.path);
       final uids = await imap.uidSearchAll();
-      final selectedUids = _selectUidPage(
+      final selectedUids = await _selectUidPageInBackground(
         uids,
         limit: limit,
         beforeUid: beforeUid,
@@ -386,15 +398,16 @@ class SocketMailTransport implements MailTransport {
         complete = false;
         fetchedByUid = const <int, _FetchedImapMessage>{};
       }
+      final requests = <_Rfc822ParseRequest>[];
       for (final uid in selectedUids) {
         final fetched = fetchedByUid[uid];
         if (fetched == null) {
           complete = false;
           continue;
         }
-        try {
-          final parsed = parseRfc822Message(
-            fetched.raw,
+        requests.add(
+          _Rfc822ParseRequest(
+            raw: fetched.raw,
             id: _messageIdForFolder(credential.accountId, folder, uid),
             accountId: credential.accountId,
             mailbox: folder.kind,
@@ -404,19 +417,24 @@ class SocketMailTransport implements MailTransport {
             starred: fetched.flags.contains(r'\Flagged'),
             bodyLoaded: false,
             receivedAt: fetched.internalDate,
-          );
-          messages.add(
-            parsed.copyWith(
-              body: '',
-              htmlBody: '',
-              hasAttachments: false,
-              attachments: const [],
-              bodyLoaded: false,
-            ),
-          );
-        } catch (_) {
+          ),
+        );
+      }
+      for (final result in await _parseFetchedRfc822Previews(requests)) {
+        final parsed = result.message;
+        if (parsed == null) {
           complete = false;
+          continue;
         }
+        messages.add(
+          parsed.copyWith(
+            body: '',
+            htmlBody: '',
+            hasAttachments: false,
+            attachments: const [],
+            bodyLoaded: false,
+          ),
+        );
       }
       return MailPreviewPage(
         messages: messages,
@@ -442,18 +460,20 @@ class SocketMailTransport implements MailTransport {
       final folderName = _folderNameForMessage(resolver, message);
       await imap.selectMailbox(folderName);
       final fetched = await imap.uidFetchMessage(_imapUid(message.id));
-      return parseRfc822Message(
-        fetched.raw,
-        id: message.id,
-        accountId: credential.accountId,
-        mailbox: message.mailbox,
-        folderPath: folderName,
-        folderDisplayName: message.folderDisplayName,
-        read: fetched.flags.contains(r'\Seen'),
-        starred: fetched.flags.contains(r'\Flagged'),
-        bodyLoaded: true,
-        receivedAt: fetched.internalDate,
-        fallbackReceivedAt: message.receivedAt,
+      return _parseFetchedRfc822Message(
+        _Rfc822ParseRequest(
+          raw: fetched.raw,
+          id: message.id,
+          accountId: credential.accountId,
+          mailbox: message.mailbox,
+          folderPath: folderName,
+          folderDisplayName: message.folderDisplayName,
+          read: fetched.flags.contains(r'\Seen'),
+          starred: fetched.flags.contains(r'\Flagged'),
+          bodyLoaded: true,
+          receivedAt: fetched.internalDate,
+          fallbackReceivedAt: message.receivedAt,
+        ),
       );
     } finally {
       await imap.close();
@@ -589,6 +609,104 @@ class SocketMailTransport implements MailTransport {
       await imap.close();
     }
   }
+}
+
+class _Rfc822ParseRequest {
+  const _Rfc822ParseRequest({
+    required this.raw,
+    required this.id,
+    required this.accountId,
+    required this.mailbox,
+    required this.folderPath,
+    required this.folderDisplayName,
+    required this.read,
+    required this.starred,
+    this.bodyLoaded = true,
+    this.receivedAt,
+    this.fallbackReceivedAt,
+  });
+
+  final String raw;
+  final String id;
+  final String accountId;
+  final MailboxKind mailbox;
+  final String folderPath;
+  final String folderDisplayName;
+  final bool read;
+  final bool starred;
+  final bool bodyLoaded;
+  final DateTime? receivedAt;
+  final DateTime? fallbackReceivedAt;
+}
+
+class _Rfc822PreviewParseResult {
+  const _Rfc822PreviewParseResult.success(this.message);
+  const _Rfc822PreviewParseResult.failure() : message = null;
+
+  final MailMessage? message;
+}
+
+Future<MailMessage> _parseFetchedRfc822Message(
+  _Rfc822ParseRequest request,
+) async {
+  if (request.raw.length < _rfc822BackgroundParseThreshold) {
+    return _parseRfc822Request(request);
+  }
+  try {
+    return await Isolate.run(() => _parseRfc822Request(request));
+  } catch (_) {
+    return _parseRfc822Request(request);
+  }
+}
+
+Future<List<_Rfc822PreviewParseResult>> _parseFetchedRfc822Previews(
+  List<_Rfc822ParseRequest> requests,
+) async {
+  if (requests.isEmpty) return const [];
+  final totalLength = requests.fold<int>(
+    0,
+    (total, request) => total + request.raw.length,
+  );
+  if (totalLength < _rfc822BackgroundParseThreshold) {
+    return _parseRfc822PreviewRequests(requests);
+  }
+  try {
+    return await Isolate.run(() => _parseRfc822PreviewRequests(requests));
+  } catch (_) {
+    return _parseRfc822PreviewRequests(requests);
+  }
+}
+
+MailMessage _parseRfc822Request(_Rfc822ParseRequest request) {
+  return parseRfc822Message(
+    request.raw,
+    id: request.id,
+    accountId: request.accountId,
+    mailbox: request.mailbox,
+    folderPath: request.folderPath,
+    folderDisplayName: request.folderDisplayName,
+    read: request.read,
+    starred: request.starred,
+    bodyLoaded: request.bodyLoaded,
+    receivedAt: request.receivedAt,
+    fallbackReceivedAt: request.fallbackReceivedAt,
+  );
+}
+
+List<_Rfc822PreviewParseResult> _parseRfc822PreviewRequests(
+  List<_Rfc822ParseRequest> requests,
+) {
+  final results = <_Rfc822PreviewParseResult>[];
+  for (final request in requests) {
+    try {
+      results.add(
+        _Rfc822PreviewParseResult.success(_parseRfc822Request(request)),
+      );
+    } catch (_) {
+      results.add(const _Rfc822PreviewParseResult.failure());
+    }
+  }
+  return results;
 }
 
 MailMessage parseRfc822Message(
@@ -1145,13 +1263,11 @@ class _ImapConnection {
     final lines = await _commandLines('UID SEARCH ALL');
     for (final line in lines) {
       if (line.startsWith('* SEARCH')) {
-        return line
-            .substring('* SEARCH'.length)
-            .trim()
-            .split(' ')
-            .where((part) => part.trim().isNotEmpty)
-            .map(int.parse)
-            .toList();
+        final values = line.substring('* SEARCH'.length).trim();
+        if (values.length < _uidSearchBackgroundParseThreshold) {
+          return _parseUidSearchValues(values);
+        }
+        return Isolate.run(() => _parseUidSearchValues(values));
       }
     }
     return const [];
@@ -1708,6 +1824,30 @@ List<int> _expandUidSet(String value) {
   return output;
 }
 
+List<int> _parseUidSearchValues(String values) {
+  if (values.isEmpty) return const [];
+  return values
+      .split(' ')
+      .where((part) => part.trim().isNotEmpty)
+      .map(int.parse)
+      .toList(growable: false);
+}
+
+Future<List<int>> _selectUidPageInBackground(
+  List<int> uids, {
+  required int limit,
+  int? beforeUid,
+}) {
+  if (uids.length < _uidPageBackgroundSelectionThreshold) {
+    return Future.value(
+      _selectUidPage(uids, limit: limit, beforeUid: beforeUid),
+    );
+  }
+  return Isolate.run(
+    () => _selectUidPage(uids, limit: limit, beforeUid: beforeUid),
+  );
+}
+
 List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {
   final selected = [...uids]..sort((a, b) => b.compareTo(a));
   return selected
@@ -1717,9 +1857,14 @@ List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {
 }
 
 bool _hasMoreUidPage(List<int> uids, {required int limit, int? beforeUid}) {
-  final eligible =
-      beforeUid == null ? uids : uids.where((uid) => uid < beforeUid);
-  return eligible.length > limit;
+  if (beforeUid == null) return uids.length > limit;
+  var eligibleCount = 0;
+  for (final uid in uids) {
+    if (uid >= beforeUid) continue;
+    eligibleCount++;
+    if (eligibleCount > limit) return true;
+  }
+  return false;
 }
 
 String _messageId(String accountId, MailboxKind mailbox, int uid) {

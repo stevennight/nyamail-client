@@ -145,6 +145,58 @@ void main() {
     expect(await file.readAsString(encoding: utf8), firstWrite);
   });
 
+  test('mail cache round trips a large encrypted payload', () async {
+    final cache = MailCache(
+      localCacheSecret: _testSecret(),
+      supportDirectoryProvider: () async => tempDir,
+    );
+    final message = MailMessage(
+      id: 'work:inbox:large',
+      accountId: 'work',
+      from: 'Alice <alice@example.com>',
+      subject: 'Large local cache entry',
+      preview: 'A large body is stored locally.',
+      body: List<String>.filled(72 * 1024, 'x').join(),
+      receivedAt: DateTime.utc(2026, 7, 2),
+    );
+
+    await cache.saveMessages([message]);
+    final file = File('${tempDir.path}/mail-cache/messages.json');
+    final encrypted = await file.readAsString(encoding: utf8);
+
+    await cache.clear();
+    await file.parent.create(recursive: true);
+    await file.writeAsString(encrypted, encoding: utf8);
+
+    final loaded = await cache.loadMessages();
+
+    expect(loaded, hasLength(1));
+    expect(loaded.single.id, message.id);
+    expect(loaded.single.body, message.body);
+  });
+
+  test('mail cache deletes a batch in one logical update', () async {
+    final cache = MailCache(supportDirectoryProvider: () async => tempDir);
+    await cache.saveMessages([
+      for (final id in ['one', 'two', 'three'])
+        MailMessage(
+          id: 'work:inbox:$id',
+          accountId: 'work',
+          from: 'Sender <sender@example.com>',
+          subject: id,
+          preview: id,
+          body: id,
+          receivedAt: DateTime.utc(2026, 7, 2),
+        ),
+    ]);
+
+    await cache.deleteMessages(['work:inbox:one', 'work:inbox:three']);
+
+    expect((await cache.loadMessages()).map((message) => message.id), [
+      'work:inbox:two',
+    ]);
+  });
+
   test(
     'mail cache quarantines unreadable json instead of failing load',
     () async {
@@ -273,32 +325,35 @@ void main() {
     expect(loaded.single.preview, 'Preview text');
   });
 
-  test('mail cache serializes concurrent writes without dropping messages', () async {
-    final cacheA = MailCache(supportDirectoryProvider: () async => tempDir);
-    final cacheB = MailCache(supportDirectoryProvider: () async => tempDir);
+  test(
+    'mail cache serializes concurrent writes without dropping messages',
+    () async {
+      final cacheA = MailCache(supportDirectoryProvider: () async => tempDir);
+      final cacheB = MailCache(supportDirectoryProvider: () async => tempDir);
 
-    await Future.wait([
-      for (var index = 0; index < 20; index++)
-        (index.isEven ? cacheA : cacheB).saveMessages([
-          MailMessage(
-            id: 'work:inbox:$index',
-            accountId: 'work',
-            from: 'Sender <sender@example.com>',
-            subject: 'Message $index',
-            preview: 'Preview $index',
-            body: '',
-            receivedAt: DateTime.utc(2026, 7, 2, 0, index),
-            bodyLoaded: false,
-          ),
-        ]),
-    ]);
+      await Future.wait([
+        for (var index = 0; index < 20; index++)
+          (index.isEven ? cacheA : cacheB).saveMessages([
+            MailMessage(
+              id: 'work:inbox:$index',
+              accountId: 'work',
+              from: 'Sender <sender@example.com>',
+              subject: 'Message $index',
+              preview: 'Preview $index',
+              body: '',
+              receivedAt: DateTime.utc(2026, 7, 2, 0, index),
+              bodyLoaded: false,
+            ),
+          ]),
+      ]);
 
-    final loaded = await cacheA.loadMessages();
+      final loaded = await cacheA.loadMessages();
 
-    expect(loaded.map((message) => message.id).toSet(), {
-      for (var index = 0; index < 20; index++) 'work:inbox:$index',
-    });
-  });
+      expect(loaded.map((message) => message.id).toSet(), {
+        for (var index = 0; index < 20; index++) 'work:inbox:$index',
+      });
+    },
+  );
 
   test('mail cache clear removes only the selected user namespace', () async {
     final userACache = MailCache(

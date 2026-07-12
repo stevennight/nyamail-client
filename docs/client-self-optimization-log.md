@@ -556,3 +556,69 @@ Validation:
 - `flutter test --no-pub` completed with 195 passing tests. The test suite uses
   fake loopback IMAP and local caches only; no real mailbox or provider network
   access was used.
+
+## 2026-07-11 Round 19 - Android Interaction and Large Mailbox Isolation
+
+Focus: keep scrolling, continuous swipe gestures, undo/redo mail actions, and
+the refresh spinner responsive while mail data is being refreshed on Android.
+
+Root-cause findings:
+
+- The message list already uses Flutter's lazy `ListView.separated`, so it is
+  virtualized and does not build every row at once. Replacing it with a web
+  virtual-list implementation would not address the observed frame stalls.
+- Network socket waits are asynchronous, but MIME parsing, JSON encode/decode,
+  AES-GCM cache work, UID parsing/sorting, and full-cache reconciliation had
+  been running on the UI isolate. That explains why a swipe and the refresh
+  icon animation could freeze together.
+- A repeated delete/undo sequence could also repeatedly request the selected
+  message body. On mobile, removing an unselected row could implicitly select
+  the first remaining row and begin an unnecessary body request.
+
+Implemented:
+
+- Reworked mobile swipe rendering so drag updates use a local
+  `ValueNotifier` and transform only the active tile instead of calling the
+  page-level `setState` for every pointer update. The message row is isolated
+  by a repaint boundary while the action background is updated locally.
+- Kept a `GlobalKey` only for the current keyboard-navigation target; all
+  ordinary rows now use lightweight value keys. Message-list updates no longer
+  create a full visible-ID set solely to clean up keyboard keys.
+- Deduplicated in-flight full-body loads by message ID. Removing an unselected
+  item no longer auto-selects and preloads the first remaining mobile row.
+- Moved large RFC822/MIME parse batches and large full-body parses into
+  `Isolate.run`. The worker threshold is 48 KiB, avoiding isolate startup cost
+  for ordinary small previews while keeping expensive MIME decoding off the UI
+  isolate.
+- Moved large IMAP UID-search parsing and UID page sorting into worker
+  isolates. The search-text threshold is 48 KiB and page sorting moves to a
+  worker at 4,096 UIDs. `hasMore` now short-circuits instead of scanning the
+  entire UID list when possible.
+- Reworked the message cache hot path: large JSON/AES-GCM read and write work
+  runs in a worker isolate, unchanged messages avoid rewrites, and the current
+  cache snapshot is reused in memory rather than being decrypted and decoded
+  again for every refresh/action. The in-memory cache key includes a hash of
+  the local cache secret and retains only the two most-recent snapshots.
+- Replaced JSON-string equality checks with structural message comparison and
+  added batched cache deletion. Refresh reconciliation now writes the cache
+  once for multiple stale messages instead of once per deleted UID.
+- Limited cached page preparation to the requested page plus one extra row for
+  `hasMore`; normal refreshes no longer filter and re-sort the whole local mail
+  store just to display a 30-message page.
+- For large complete UID windows, deferred stale-cache reconciliation until
+  after the visible page is available and calculated the UID difference in a
+  worker isolate. Small windows retain synchronous reconciliation behavior.
+- Cached successful folder listings for ten minutes (one minute for an offline
+  fallback), removing repeated IMAP `LIST` round trips from foreground refresh
+  cycles.
+
+Validation:
+
+- Added tests for a large encrypted cache round trip, batched cache deletion,
+  a large MIME preview batch, a 12,000-UID IMAP search result, and reuse of a
+  recent folder listing.
+- Formatted the edited source and tests with the workspace Flutter Dart SDK.
+- `flutter analyze --no-pub` completed with no issues.
+- `flutter test --no-pub` completed with 200 passing tests. Tests use fake
+  loopback IMAP/cache data only; no live mailbox was accessed.
+- No git commit or release build was made in this round.

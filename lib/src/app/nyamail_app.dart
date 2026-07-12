@@ -143,7 +143,7 @@ class _NyaMailAppState extends State<NyaMailApp> {
                     _config.outlookAndroidOAuthClientSecret,
                 outlookAndroidOAuthRedirectUri:
                     _config.outlookAndroidOAuthRedirectUri,
-                mailRepository: const CachedTransportMailRepository(
+                mailRepository: CachedTransportMailRepository(
                   cache: MailCache(),
                   transport: SocketMailTransport(),
                 ),

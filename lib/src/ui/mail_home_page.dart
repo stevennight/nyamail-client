@@ -249,6 +249,7 @@ class _MailHomePageState extends State<MailHomePage>
   final _pendingMailActions = <int, _PendingMailAction>{};
   String? _pendingPairingPackage;
   final _mobileMessageNotifiers = <String, ValueNotifier<MailMessage>>{};
+  final _messageBodyLoads = <String, Future<MailMessage?>>{};
   final _startupService = const StartupService();
   final _systemSettingsStore = const SystemBehaviorSettingsStore();
   final _trayService = NyaMailTrayService();
@@ -283,6 +284,7 @@ class _MailHomePageState extends State<MailHomePage>
     unawaited(_flushPendingMailActions());
     unawaited(_trayService.dispose());
     _mobileMessageNotifiers.clear();
+    _messageBodyLoads.clear();
     _searchFocusNode.dispose();
     _search.dispose();
     super.dispose();
@@ -3898,8 +3900,22 @@ class _MailHomePageState extends State<MailHomePage>
     }
   }
 
-  Future<MailMessage?> _ensureMessageBody(MailMessage message) async {
-    if (message.bodyLoaded) return message;
+  Future<MailMessage?> _ensureMessageBody(MailMessage message) {
+    if (message.bodyLoaded) return Future.value(message);
+    final current = _messageBodyLoads[message.id];
+    if (current != null) return current;
+
+    late final Future<MailMessage?> load;
+    load = _loadMessageBody(message).whenComplete(() {
+      if (identical(_messageBodyLoads[message.id], load)) {
+        _messageBodyLoads.remove(message.id);
+      }
+    });
+    _messageBodyLoads[message.id] = load;
+    return load;
+  }
+
+  Future<MailMessage?> _loadMessageBody(MailMessage message) async {
     try {
       await _refreshOAuthVaultIfNeeded();
       final loaded = await _mailRepository.loadMessageBody(message);
@@ -4847,12 +4863,17 @@ class _MailHomePageState extends State<MailHomePage>
 
   void _removeMessages(Set<String> messageIds) {
     if (messageIds.isEmpty) return;
+    final selectedMessageId = _selected?.id;
     setState(() {
       _messages =
           _messages
               .where((message) => !messageIds.contains(message.id))
               .toList();
-      _selected = _messageFor(_messages, _selected?.id);
+      _selected = _messageFor(
+        _messages,
+        selectedMessageId,
+        fallbackToFirst: selectedMessageId != null,
+      );
       _selectedMessageIds = _selectedMessageIds.difference(messageIds);
     });
     _ensureSelectedMessageBody();
@@ -6282,11 +6303,10 @@ class _MessageListState extends State<_MessageList> {
   @override
   void didUpdateWidget(covariant _MessageList oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.messages != widget.messages) {
-      final visibleMessageIds =
-          widget.messages.map((message) => message.id).toSet();
+    if (oldWidget.messages != widget.messages && _messageItemKeys.isNotEmpty) {
       _messageItemKeys.removeWhere(
-        (messageId, _) => !visibleMessageIds.contains(messageId),
+        (messageId, _) =>
+            !widget.messages.any((message) => message.id == messageId),
       );
     }
     if (oldWidget.messages.length != widget.messages.length ||
@@ -6300,6 +6320,10 @@ class _MessageListState extends State<_MessageList> {
     }
     if (oldWidget.keyboardNavigationMessageId !=
         widget.keyboardNavigationMessageId) {
+      final targetMessageId = widget.keyboardNavigationMessageId;
+      _messageItemKeys.removeWhere(
+        (messageId, _) => messageId != targetMessageId,
+      );
       _scheduleKeyboardNavigationScroll();
     }
   }
@@ -6360,7 +6384,10 @@ class _MessageListState extends State<_MessageList> {
     }
   }
 
-  GlobalKey _messageItemKeyFor(String messageId) {
+  Key _messageItemKeyFor(String messageId) {
+    if (widget.keyboardNavigationMessageId != messageId) {
+      return ValueKey<String>(messageId);
+    }
     return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
   }
 
@@ -6998,78 +7025,98 @@ class _SwipeActionTile extends StatefulWidget {
   State<_SwipeActionTile> createState() => _SwipeActionTileState();
 }
 
-class _SwipeActionTileState extends State<_SwipeActionTile> {
+class _SwipeActionTileState extends State<_SwipeActionTile>
+    with SingleTickerProviderStateMixin {
   static const _actionPaneWidth = 72.0;
   static const _resetDuration = Duration(milliseconds: 180);
 
-  double _dragDx = 0;
-  bool _dragging = false;
+  final _dragDx = ValueNotifier<double>(0);
+  late final AnimationController _resetController;
+  double _resetStart = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _resetController = AnimationController(
+      vsync: this,
+      duration: _resetDuration,
+    )..addListener(_applyResetFrame);
+  }
+
+  @override
+  void dispose() {
+    _resetController.dispose();
+    _dragDx.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final width = constraints.maxWidth <= 0 ? 1.0 : constraints.maxWidth;
-        final selection = _currentSelection(width);
-        final visualDx = _visualOffset(width);
-        final direction = _swipeDirection;
         return GestureDetector(
           behavior: HitTestBehavior.translucent,
-          onHorizontalDragStart:
-              (_) => setState(() {
-                _dragging = true;
-              }),
+          onHorizontalDragStart: (_) => _resetController.stop(),
           onHorizontalDragUpdate:
-              (details) => setState(() {
-                final next = _dragDx + (details.primaryDelta ?? 0);
-                _dragDx =
-                    next
-                        .clamp(
-                          -_maxDragDistance(width),
-                          _maxDragDistance(width),
-                        )
-                        .toDouble();
-              }),
+              (details) => _updateDrag(width, details.primaryDelta ?? 0),
           onHorizontalDragEnd: (_) => _finishDrag(width),
-          onHorizontalDragCancel: _resetDrag,
-          child: Stack(
-            clipBehavior: Clip.hardEdge,
-            children: [
-              Positioned.fill(
-                child: _SwipeActionBackground(
-                  message: widget.message,
-                  direction: direction,
-                  revealExtent: visualDx.abs(),
-                  level1Action:
-                      direction == _SwipeDirection.leftToRight
-                          ? widget.leftLevel1
-                          : widget.rightLevel1,
-                  activeAction: selection?.action,
-                ),
+          onHorizontalDragCancel: _animateReset,
+          child: ValueListenableBuilder<double>(
+            valueListenable: _dragDx,
+            child: RepaintBoundary(
+              child: ColoredBox(
+                color: Theme.of(context).colorScheme.surface,
+                child: widget.child,
               ),
-              AnimatedContainer(
-                duration: _dragging ? Duration.zero : _resetDuration,
-                curve: Curves.easeOutCubic,
-                transform: Matrix4.translationValues(visualDx, 0, 0),
-                child: ColoredBox(
-                  color: Theme.of(context).colorScheme.surface,
-                  child: widget.child,
-                ),
-              ),
-            ],
+            ),
+            builder: (context, dragDx, child) {
+              final selection = _currentSelection(width, dragDx);
+              final visualDx = _visualOffset(width, dragDx);
+              final direction = _swipeDirectionFor(dragDx);
+              return Stack(
+                clipBehavior: Clip.hardEdge,
+                children: [
+                  Positioned.fill(
+                    child: _SwipeActionBackground(
+                      message: widget.message,
+                      direction: direction,
+                      revealExtent: visualDx.abs(),
+                      level1Action:
+                          direction == _SwipeDirection.leftToRight
+                              ? widget.leftLevel1
+                              : widget.rightLevel1,
+                      activeAction: selection?.action,
+                    ),
+                  ),
+                  Transform.translate(
+                    offset: Offset(visualDx, 0),
+                    child: child!,
+                  ),
+                ],
+              );
+            },
           ),
         );
       },
     );
   }
 
-  _SwipeActionSelection? _currentSelection(double width) {
-    final distance = _dragDx.abs();
+  void _updateDrag(double width, double delta) {
+    final next = _dragDx.value + delta;
+    _dragDx.value =
+        next
+            .clamp(-_maxDragDistance(width), _maxDragDistance(width))
+            .toDouble();
+  }
+
+  _SwipeActionSelection? _currentSelection(double width, double dragDx) {
+    final distance = dragDx.abs();
     if (distance < _level1Distance(width)) return null;
     final level2 = distance >= _level2Distance(width);
-    final direction = _swipeDirection;
+    final direction = _swipeDirectionFor(dragDx);
     if (direction == null) return null;
-    if (_dragDx < 0) {
+    if (dragDx < 0) {
       return _SwipeActionSelection(
         action: level2 ? widget.rightLevel2 : widget.rightLevel1,
       );
@@ -7080,29 +7127,33 @@ class _SwipeActionTileState extends State<_SwipeActionTile> {
   }
 
   Future<void> _finishDrag(double width) async {
-    final selection = _currentSelection(width);
-    _resetDrag();
+    final selection = _currentSelection(width, _dragDx.value);
+    _animateReset();
     if (selection != null) {
       await widget.onAction(selection.action);
     }
   }
 
-  void _resetDrag() {
-    if (!mounted) return;
-    setState(() {
-      _dragging = false;
-      _dragDx = 0;
-    });
+  void _animateReset() {
+    _resetController.stop();
+    _resetStart = _dragDx.value;
+    if (_resetStart == 0) return;
+    _resetController.forward(from: 0);
   }
 
-  _SwipeDirection? get _swipeDirection {
-    if (_dragDx > 0) return _SwipeDirection.leftToRight;
-    if (_dragDx < 0) return _SwipeDirection.rightToLeft;
+  void _applyResetFrame() {
+    final progress = Curves.easeOutCubic.transform(_resetController.value);
+    _dragDx.value = _resetStart * (1 - progress);
+  }
+
+  _SwipeDirection? _swipeDirectionFor(double dragDx) {
+    if (dragDx > 0) return _SwipeDirection.leftToRight;
+    if (dragDx < 0) return _SwipeDirection.rightToLeft;
     return null;
   }
 
-  double _visualOffset(double width) {
-    return _dragDx
+  double _visualOffset(double width, double dragDx) {
+    return dragDx
         .clamp(-_maxVisualOffset(width), _maxVisualOffset(width))
         .toDouble();
   }

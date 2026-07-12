@@ -386,6 +386,81 @@ void main() {
     }
   });
 
+  test('SocketMailTransport parses a large preview batch', () async {
+    final uids = [507, 506, 505, 504, 503, 502, 501];
+    final body = List<String>.filled(8 * 1024, 'x').join();
+    final server = await _FakeImapServer.start(
+      searchUids: uids,
+      messagesByUid: {
+        for (final uid in uids)
+          uid: [
+            'From: Sender $uid <sender@example.com>',
+            'Subject: Large preview $uid',
+            'Date: 2026-07-01T08:00:00Z',
+            '',
+            body,
+          ].join('\r\n'),
+      },
+    );
+    try {
+      final page = await const SocketMailTransport().fetchMessagePreviews(
+        credential: MailboxCredential(
+          accountId: 'acc',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: InternetAddress.loopbackIPv4.address,
+          imapPort: server.port,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+          useTls: false,
+        ),
+        mailbox: MailboxKind.inbox,
+        limit: uids.length,
+      );
+
+      expect(page.messages.map((message) => message.id), [
+        for (final uid in uids) 'acc:inbox:$uid',
+      ]);
+      expect(page.messages.every((message) => !message.bodyLoaded), isTrue);
+      expect(page.messages.map((message) => message.preview).first, isNotEmpty);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('SocketMailTransport handles a large UID search result', () async {
+    final uids = [for (var uid = 1; uid <= 12000; uid++) uid];
+    final server = await _FakeImapServer.start(searchUids: uids);
+    try {
+      final page = await const SocketMailTransport().fetchMessagePreviews(
+        credential: MailboxCredential(
+          accountId: 'acc',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: InternetAddress.loopbackIPv4.address,
+          imapPort: server.port,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+          useTls: false,
+        ),
+        mailbox: MailboxKind.inbox,
+        limit: 2,
+      );
+
+      expect(page.messages.map((message) => message.id), [
+        'acc:inbox:12000',
+        'acc:inbox:11999',
+      ]);
+      expect(page.hasMore, isTrue);
+    } finally {
+      await server.close();
+    }
+  });
+
   test('SocketMailTransport returns COPYUID destination for moves', () async {
     final server = await _FakeImapServer.start(moveDestinationUid: 777);
     try {

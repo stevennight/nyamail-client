@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:path_provider/path_provider.dart';
 
@@ -382,7 +383,7 @@ class DemoMailRepository implements MailRepository {
 }
 
 class CachedTransportMailRepository implements MailRepository {
-  const CachedTransportMailRepository({
+  CachedTransportMailRepository({
     required MailMessageCache cache,
     required MailTransport transport,
     List<MailboxCredential> credentials = const [],
@@ -406,8 +407,13 @@ class CachedTransportMailRepository implements MailRepository {
   final String? _localCacheSecret;
   final bool _backgroundIndexingEnabled;
   final Future<Directory> Function() _supportDirectoryProvider;
+  final _folderListings = <String, _CachedFolderListing>{};
+  final _folderLoads = <String, Future<List<MailFolder>>>{};
   static final Set<String> _backgroundIndexing = <String>{};
   static const Duration _previewFetchTimeout = Duration(seconds: 45);
+  static const _backgroundReconcileUidThreshold = 4096;
+  static const _folderListingCacheDuration = Duration(minutes: 10);
+  static const _fallbackFolderListingCacheDuration = Duration(minutes: 1);
 
   @override
   Future<List<MailAccount>> accounts() async {
@@ -451,7 +457,11 @@ class CachedTransportMailRepository implements MailRepository {
         limit: limit,
       );
     }
-    final cached = await _scopedCachedMessagesForView(view: view, query: query);
+    final cached = await _scopedCachedMessagesForView(
+      view: view,
+      query: query,
+      maxResults: limit + 1,
+    );
     return MailMessagePage(
       messages: cached.take(limit).toList(),
       hasMore: cached.length > limit,
@@ -487,7 +497,11 @@ class CachedTransportMailRepository implements MailRepository {
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
     _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
-    final cached = await _scopedCachedMessagesForView(view: view, query: query);
+    final cached = await _scopedCachedMessagesForView(
+      view: view,
+      query: query,
+      maxResults: limit + 1,
+    );
     _scheduleBackgroundIndexForView(view: view, pageSize: limit);
     return MailMessagePage(
       messages: cached.take(limit).toList(),
@@ -511,7 +525,11 @@ class CachedTransportMailRepository implements MailRepository {
       );
     }
     final targetLimit = visibleCount + limit;
-    var cached = await _scopedCachedMessagesForView(view: view, query: query);
+    var cached = await _scopedCachedMessagesForView(
+      view: view,
+      query: query,
+      maxResults: targetLimit + 1,
+    );
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
       var attemptedFetches = 0;
@@ -531,7 +549,11 @@ class CachedTransportMailRepository implements MailRepository {
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
       _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
-      cached = await _scopedCachedMessagesForView(view: view, query: query);
+      cached = await _scopedCachedMessagesForView(
+        view: view,
+        query: query,
+        maxResults: targetLimit + 1,
+      );
     }
     _scheduleBackgroundIndexForView(view: view, pageSize: limit);
     return MailMessagePage(
@@ -559,6 +581,7 @@ class CachedTransportMailRepository implements MailRepository {
       mailbox: mailbox,
       accountId: accountId,
       query: query,
+      maxResults: limit + 1,
     );
     return MailMessagePage(
       messages: cached.take(limit).toList(),
@@ -599,6 +622,7 @@ class CachedTransportMailRepository implements MailRepository {
       mailbox: mailbox,
       accountId: accountId,
       query: query,
+      maxResults: limit + 1,
     );
     _scheduleBackgroundIndex(
       mailbox: mailbox,
@@ -633,6 +657,7 @@ class CachedTransportMailRepository implements MailRepository {
       mailbox: mailbox,
       accountId: accountId,
       query: query,
+      maxResults: targetLimit + 1,
     );
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
@@ -658,6 +683,7 @@ class CachedTransportMailRepository implements MailRepository {
         mailbox: mailbox,
         accountId: accountId,
         query: query,
+        maxResults: targetLimit + 1,
       );
     }
     _scheduleBackgroundIndex(
@@ -1032,11 +1058,20 @@ class CachedTransportMailRepository implements MailRepository {
           .timeout(_previewFetchTimeout);
       await _cache.saveMessages(fetched.messages);
       if (reconcile && fetched.complete && fetched.remoteUids != null) {
-        await _reconcileCompleteRemoteUids(
-          credential: credential,
-          mailbox: mailbox,
-          remoteUids: fetched.remoteUids!,
-        );
+        final remoteUids = fetched.remoteUids!;
+        if (remoteUids.length >= _backgroundReconcileUidThreshold) {
+          _scheduleRemoteUidReconciliation(
+            credential: credential,
+            mailbox: mailbox,
+            remoteUids: remoteUids,
+          );
+        } else {
+          await _reconcileCompleteRemoteUids(
+            credential: credential,
+            mailbox: mailbox,
+            remoteUids: remoteUids,
+          );
+        }
       }
       return _PreviewFetchResult(
         messages: fetched.messages,
@@ -1072,11 +1107,20 @@ class CachedTransportMailRepository implements MailRepository {
           .timeout(_previewFetchTimeout);
       await _cache.saveMessages(fetched.messages);
       if (reconcile && fetched.complete && fetched.remoteUids != null) {
-        await _reconcileCompleteRemoteUidsForFolder(
-          credential: credential,
-          folder: folder,
-          remoteUids: fetched.remoteUids!,
-        );
+        final remoteUids = fetched.remoteUids!;
+        if (remoteUids.length >= _backgroundReconcileUidThreshold) {
+          _scheduleFolderRemoteUidReconciliation(
+            credential: credential,
+            folder: folder,
+            remoteUids: remoteUids,
+          );
+        } else {
+          await _reconcileCompleteRemoteUidsForFolder(
+            credential: credential,
+            folder: folder,
+            remoteUids: remoteUids,
+          );
+        }
       }
       return _PreviewFetchResult(
         messages: fetched.messages,
@@ -1093,19 +1137,57 @@ class CachedTransportMailRepository implements MailRepository {
     }
   }
 
+  void _scheduleRemoteUidReconciliation({
+    required MailboxCredential credential,
+    required MailboxKind mailbox,
+    required List<int> remoteUids,
+  }) {
+    unawaited(
+      Future<void>(() async {
+        try {
+          await _reconcileCompleteRemoteUids(
+            credential: credential,
+            mailbox: mailbox,
+            remoteUids: remoteUids,
+          );
+        } catch (_) {
+          // A later foreground refresh can reconcile stale local entries.
+        }
+      }),
+    );
+  }
+
+  void _scheduleFolderRemoteUidReconciliation({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required List<int> remoteUids,
+  }) {
+    unawaited(
+      Future<void>(() async {
+        try {
+          await _reconcileCompleteRemoteUidsForFolder(
+            credential: credential,
+            folder: folder,
+            remoteUids: remoteUids,
+          );
+        } catch (_) {
+          // A later foreground refresh can reconcile stale local entries.
+        }
+      }),
+    );
+  }
+
   Future<void> _reconcileCompleteRemoteUids({
     required MailboxCredential credential,
     required MailboxKind mailbox,
     required List<int> remoteUids,
   }) async {
-    final remoteUidSet = remoteUids.toSet();
     final cached = await _cache.loadMessages(mailbox: mailbox);
-    for (final message in cached) {
-      if (message.accountId != credential.accountId) continue;
-      final uid = _messageUid(message.id);
-      if (uid == null) continue;
-      if (!remoteUidSet.contains(uid)) await _cache.deleteMessage(message.id);
-    }
+    final staleIds = await _staleMessageIdsForRemoteUids([
+      for (final message in cached)
+        if (message.accountId == credential.accountId) message.id,
+    ], remoteUids);
+    await _cache.deleteMessages(staleIds);
   }
 
   Future<void> _reconcileCompleteRemoteUidsForFolder({
@@ -1113,17 +1195,26 @@ class CachedTransportMailRepository implements MailRepository {
     required MailFolder folder,
     required List<int> remoteUids,
   }) async {
-    final remoteUidSet = remoteUids.toSet();
     final cached = await _cache.loadMessages(
       mailbox: folder.kind,
       accountId: credential.accountId,
       folderPath: folder.path,
     );
-    for (final message in cached) {
-      final uid = _messageUid(message.id);
-      if (uid == null) continue;
-      if (!remoteUidSet.contains(uid)) await _cache.deleteMessage(message.id);
+    final staleIds = await _staleMessageIdsForRemoteUids([
+      for (final message in cached) message.id,
+    ], remoteUids);
+    await _cache.deleteMessages(staleIds);
+  }
+
+  Future<List<String>> _staleMessageIdsForRemoteUids(
+    List<String> messageIds,
+    List<int> remoteUids,
+  ) {
+    if (messageIds.length + remoteUids.length <
+        _backgroundReconcileUidThreshold) {
+      return Future.value(_findStaleMessageIds(messageIds, remoteUids));
     }
+    return Isolate.run(() => _findStaleMessageIds(messageIds, remoteUids));
   }
 
   void _throwIfAllPreviewFetchesFailed(
@@ -1138,55 +1229,63 @@ class CachedTransportMailRepository implements MailRepository {
     required MailboxKind mailbox,
     String? accountId,
     String? query,
+    int? maxResults,
   }) async {
-    final cached = await _cache.loadMessages(mailbox: mailbox, query: query);
+    final cached = await _cache.loadMessages(query: query);
     final activeAccountIds =
         _credentials.map((credential) => credential.accountId).toSet();
-    final scoped =
-        cached
-            .where(
-              (message) =>
-                  activeAccountIds.contains(message.accountId) &&
-                  (accountId == null || message.accountId == accountId),
-            )
-            .toList()
-          ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+    final scoped = <MailMessage>[];
+    for (final message in cached) {
+      if (!activeAccountIds.contains(message.accountId) ||
+          message.effectiveMailbox != mailbox ||
+          (accountId != null && message.accountId != accountId)) {
+        continue;
+      }
+      scoped.add(message);
+      if (maxResults != null && scoped.length >= maxResults) break;
+    }
     return scoped;
   }
 
   Future<List<MailMessage>> _scopedCachedMessagesForView({
     required MailboxView view,
     String? query,
+    int? maxResults,
   }) async {
     final cached = await _cache.loadMessages(query: query);
     final activeAccountIds =
         _credentials.map((credential) => credential.accountId).toSet();
-    final scoped =
-        _dedupeCachedMessages(
-            cached.where((message) {
-              if (!activeAccountIds.contains(message.accountId)) return false;
-              final smart = view.smartFolder;
-              if (smart != null) {
-                return mailMessageMatchesSmartFolder(message, smart);
-              }
-              return mailMessageMatchesFolder(message, view.folder!);
-            }),
-          ).toList()
-          ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
-    return scoped;
+    return _dedupeCachedMessages(
+      cached.where((message) {
+        if (!activeAccountIds.contains(message.accountId)) return false;
+        final smart = view.smartFolder;
+        if (smart != null) {
+          return mailMessageMatchesSmartFolder(message, smart);
+        }
+        return mailMessageMatchesFolder(message, view.folder!);
+      }),
+      maxResults: maxResults,
+    );
   }
 
-  List<MailMessage> _dedupeCachedMessages(Iterable<MailMessage> messages) {
+  List<MailMessage> _dedupeCachedMessages(
+    Iterable<MailMessage> messages, {
+    int? maxResults,
+  }) {
     final byRemoteLocation = <String, MailMessage>{};
     for (final message in messages) {
       final key = _remoteLocationKey(message);
       final existing = byRemoteLocation[key];
-      byRemoteLocation[key] =
-          existing == null
-              ? message
-              : _preferredCachedMessage(existing, message);
+      if (existing == null) {
+        byRemoteLocation[key] = message;
+        if (maxResults != null && byRemoteLocation.length >= maxResults) {
+          break;
+        }
+      } else {
+        byRemoteLocation[key] = _preferredCachedMessage(existing, message);
+      }
     }
-    return byRemoteLocation.values.toList();
+    return byRemoteLocation.values.toList(growable: false);
   }
 
   String _remoteLocationKey(MailMessage message) {
@@ -1262,15 +1361,55 @@ class CachedTransportMailRepository implements MailRepository {
     return folders;
   }
 
-  Future<List<MailFolder>> _foldersForCredential(
+  Future<List<MailFolder>> _foldersForCredential(MailboxCredential credential) {
+    final key = _folderListingKey(credential);
+    final cached = _folderListings[key];
+    if (cached != null && !cached.isExpired) {
+      return Future.value(cached.folders);
+    }
+    final current = _folderLoads[key];
+    if (current != null) return current;
+
+    late final Future<List<MailFolder>> load;
+    load = _loadFoldersForCredential(credential).whenComplete(() {
+      if (identical(_folderLoads[key], load)) {
+        _folderLoads.remove(key);
+      }
+    });
+    _folderLoads[key] = load;
+    return load;
+  }
+
+  Future<List<MailFolder>> _loadFoldersForCredential(
     MailboxCredential credential,
   ) async {
+    var fetchedFromProvider = false;
+    List<MailFolder> folders;
     try {
-      final folders = await _transport.listFolders(credential: credential);
-      if (folders.isNotEmpty) return folders;
+      final listed = await _transport.listFolders(credential: credential);
+      if (listed.isNotEmpty) {
+        folders = listed;
+        fetchedFromProvider = true;
+      } else {
+        folders = _fallbackFoldersForCredential(credential);
+      }
     } catch (_) {
       // Fall back to common folders so cached mail and basic providers stay usable.
+      folders = _fallbackFoldersForCredential(credential);
     }
+    final snapshot = List<MailFolder>.unmodifiable(folders);
+    _folderListings[_folderListingKey(credential)] = _CachedFolderListing(
+      folders: snapshot,
+      expiresAt: DateTime.now().add(
+        fetchedFromProvider
+            ? _folderListingCacheDuration
+            : _fallbackFolderListingCacheDuration,
+      ),
+    );
+    return snapshot;
+  }
+
+  List<MailFolder> _fallbackFoldersForCredential(MailboxCredential credential) {
     return [
       for (final mailbox in standardMailboxKinds)
         MailFolder(
@@ -1283,6 +1422,15 @@ class CachedTransportMailRepository implements MailRepository {
           kind: mailbox,
         ),
     ];
+  }
+
+  String _folderListingKey(MailboxCredential credential) {
+    return [
+      credential.accountId,
+      credential.imapHost,
+      credential.imapPort.toString(),
+      credential.username,
+    ].join('\u0000');
   }
 
   void _scheduleBackgroundIndex({
@@ -1400,6 +1548,31 @@ class CachedTransportMailRepository implements MailRepository {
     if (secret == null || secret.isEmpty) return null;
     return LocalCacheCipher(secret);
   }
+}
+
+List<String> _findStaleMessageIds(
+  List<String> messageIds,
+  List<int> remoteUids,
+) {
+  final remoteUidSet = remoteUids.toSet();
+  final staleIds = <String>[];
+  for (final messageId in messageIds) {
+    final raw = messageId.contains(':') ? messageId.split(':').last : messageId;
+    final uid = int.tryParse(raw);
+    if (uid != null && uid > 0 && !remoteUidSet.contains(uid)) {
+      staleIds.add(messageId);
+    }
+  }
+  return staleIds;
+}
+
+class _CachedFolderListing {
+  const _CachedFolderListing({required this.folders, required this.expiresAt});
+
+  final List<MailFolder> folders;
+  final DateTime expiresAt;
+
+  bool get isExpired => !DateTime.now().isBefore(expiresAt);
 }
 
 class _PreviewFetchResult {
