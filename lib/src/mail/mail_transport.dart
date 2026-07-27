@@ -10,6 +10,7 @@ const _messagePreviewFetchBytes = 8 * 1024;
 const _rfc822BackgroundParseThreshold = 48 * 1024;
 const _uidSearchBackgroundParseThreshold = 48 * 1024;
 const _uidPageBackgroundSelectionThreshold = 4096;
+const _incrementalPreviewPageMultiplier = 4;
 
 class MailboxCredential {
   const MailboxCredential({
@@ -211,7 +212,16 @@ abstract class MailTransport {
   });
 }
 
-class SocketMailTransport implements MailTransport {
+abstract class IncrementalMailTransport {
+  Future<MailPreviewPage> fetchNewFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required int afterUid,
+    int limit = 30,
+  });
+}
+
+class SocketMailTransport implements MailTransport, IncrementalMailTransport {
   const SocketMailTransport();
 
   @override
@@ -378,17 +388,57 @@ class SocketMailTransport implements MailTransport {
     required MailFolder folder,
     int limit = 30,
     int? beforeUid,
+  }) {
+    return _fetchFolderMessagePreviews(
+      credential: credential,
+      folder: folder,
+      limit: limit,
+      beforeUid: beforeUid,
+    );
+  }
+
+  @override
+  Future<MailPreviewPage> fetchNewFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required int afterUid,
+    int limit = 30,
+  }) {
+    return _fetchFolderMessagePreviews(
+      credential: credential,
+      folder: folder,
+      limit: limit,
+      afterUid: afterUid,
+    );
+  }
+
+  Future<MailPreviewPage> _fetchFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required int limit,
+    int? beforeUid,
+    int? afterUid,
   }) async {
     final imap = await _ImapConnection.connect(credential);
     try {
       await imap.login();
       await imap.selectMailbox(folder.path);
-      final uids = await imap.uidSearchAll();
-      final selectedUids = await _selectUidPageInBackground(
-        uids,
-        limit: limit,
-        beforeUid: beforeUid,
-      );
+      final uids =
+          afterUid == null
+              ? await imap.uidSearchAll()
+              : await imap.uidSearchAfter(afterUid);
+      final selectedUids =
+          afterUid == null
+              ? await _selectUidPageInBackground(
+                uids,
+                limit: limit,
+                beforeUid: beforeUid,
+              )
+              : await _selectNewUidPageInBackground(
+                uids,
+                afterUid: afterUid,
+                limit: limit * _incrementalPreviewPageMultiplier,
+              );
       final messages = <MailMessage>[];
       var complete = true;
       Map<int, _FetchedImapMessage> fetchedByUid;
@@ -439,8 +489,12 @@ class SocketMailTransport implements MailTransport {
       return MailPreviewPage(
         messages: messages,
         selectedUids: selectedUids,
-        remoteUids: uids,
-        hasMore: _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid),
+        remoteUids: afterUid == null ? uids : null,
+        hasMore:
+            afterUid == null
+                ? _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid)
+                : uids.where((uid) => uid > afterUid).length >
+                    selectedUids.length,
         complete: complete,
       );
     } finally {
@@ -1261,6 +1315,19 @@ class _ImapConnection {
 
   Future<List<int>> uidSearchAll() async {
     final lines = await _commandLines('UID SEARCH ALL');
+    return _uidsFromSearchLines(lines);
+  }
+
+  Future<List<int>> uidSearchAfter(int uid) async {
+    final firstUid = uid < 1 ? 1 : uid + 1;
+    final lines = await _commandLines('UID SEARCH UID $firstUid:*');
+    return [
+      for (final result in await _uidsFromSearchLines(lines))
+        if (result > uid) result,
+    ];
+  }
+
+  Future<List<int>> _uidsFromSearchLines(List<String> lines) async {
     for (final line in lines) {
       if (line.startsWith('* SEARCH')) {
         final values = line.substring('* SEARCH'.length).trim();
@@ -1846,6 +1913,22 @@ Future<List<int>> _selectUidPageInBackground(
   return Isolate.run(
     () => _selectUidPage(uids, limit: limit, beforeUid: beforeUid),
   );
+}
+
+Future<List<int>> _selectNewUidPageInBackground(
+  List<int> uids, {
+  required int afterUid,
+  required int limit,
+}) {
+  List<int> select() {
+    final ordered = uids.where((uid) => uid > afterUid).toList()..sort();
+    return ordered.take(limit).toList(growable: false);
+  }
+
+  if (uids.length < _uidPageBackgroundSelectionThreshold) {
+    return Future.value(select());
+  }
+  return Isolate.run(select);
 }
 
 List<int> _selectUidPage(List<int> uids, {required int limit, int? beforeUid}) {

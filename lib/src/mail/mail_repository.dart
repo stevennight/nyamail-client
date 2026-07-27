@@ -106,6 +106,14 @@ abstract class MailRepository {
   Future<void> clearLocalCache();
 }
 
+abstract class FullRefreshMailRepository {
+  Future<MailMessagePage> fullRefreshViewPage({
+    required MailboxView view,
+    String? query,
+    int limit = 30,
+  });
+}
+
 class DemoMailRepository implements MailRepository {
   const DemoMailRepository();
 
@@ -382,7 +390,8 @@ class DemoMailRepository implements MailRepository {
   Future<void> clearLocalCache() async {}
 }
 
-class CachedTransportMailRepository implements MailRepository {
+class CachedTransportMailRepository
+    implements MailRepository, FullRefreshMailRepository {
   CachedTransportMailRepository({
     required MailMessageCache cache,
     required MailTransport transport,
@@ -409,8 +418,12 @@ class CachedTransportMailRepository implements MailRepository {
   final Future<Directory> Function() _supportDirectoryProvider;
   final _folderListings = <String, _CachedFolderListing>{};
   final _folderLoads = <String, Future<List<MailFolder>>>{};
+  final _viewPageLoads = <String, Future<MailMessagePage>>{};
+  final _folderRefreshStates = <String, _FolderRefreshState>{};
   static final Set<String> _backgroundIndexing = <String>{};
-  static const Duration _previewFetchTimeout = Duration(seconds: 45);
+  static const Duration _previewFetchTimeout = Duration(seconds: 30);
+  static const _maxConcurrentMailboxFetches = 4;
+  static const _fullFolderRefreshInterval = Duration(minutes: 10);
   static const _backgroundReconcileUidThreshold = 4096;
   static const _folderListingCacheDuration = Duration(minutes: 10);
   static const _fallbackFolderListingCacheDuration = Duration(minutes: 1);
@@ -437,11 +450,12 @@ class CachedTransportMailRepository implements MailRepository {
     if (_credentials.isEmpty) {
       return const DemoMailRepository().folders(accountId: accountId);
     }
-    final folders = <MailFolder>[];
-    for (final credential in _scopedCredentials(accountId)) {
-      folders.addAll(await _foldersForCredential(credential));
-    }
-    return folders;
+    final listings = await _mapConcurrently(
+      _scopedCredentials(accountId),
+      _foldersForCredential,
+      maxConcurrent: _maxConcurrentMailboxFetches,
+    );
+    return [for (final folders in listings) ...folders];
   }
 
   @override
@@ -473,7 +487,7 @@ class CachedTransportMailRepository implements MailRepository {
     required MailboxView view,
     String? query,
     int limit = 30,
-  }) async {
+  }) {
     if (_credentials.isEmpty) {
       return const DemoMailRepository().viewPage(
         view: view,
@@ -481,22 +495,86 @@ class CachedTransportMailRepository implements MailRepository {
         limit: limit,
       );
     }
-    var hasFullRemotePage = false;
-    var attemptedFetches = 0;
-    final failures = <Object>[];
-    for (final folder in await _foldersForView(view)) {
-      final credential = _credentialForAccount(folder.accountId);
-      if (credential == null) continue;
-      attemptedFetches++;
-      final fetched = await _fetchPreviewPageForFolder(
-        credential: credential,
-        folder: folder,
+    return _sharedViewPage(
+      view: view,
+      query: query,
+      limit: limit,
+      forceFullRefresh: false,
+    );
+  }
+
+  @override
+  Future<MailMessagePage> fullRefreshViewPage({
+    required MailboxView view,
+    String? query,
+    int limit = 30,
+  }) {
+    if (_credentials.isEmpty) {
+      return const DemoMailRepository().viewPage(
+        view: view,
+        query: query,
         limit: limit,
       );
+    }
+    return _sharedViewPage(
+      view: view,
+      query: query,
+      limit: limit,
+      forceFullRefresh: true,
+    );
+  }
+
+  Future<MailMessagePage> _sharedViewPage({
+    required MailboxView view,
+    required String? query,
+    required int limit,
+    required bool forceFullRefresh,
+  }) {
+    final key =
+        '${forceFullRefresh ? 'full' : 'auto'}\u0000'
+        '${view.key}\u0000${query?.trim() ?? ''}\u0000$limit';
+    final current = _viewPageLoads[key];
+    if (current != null) return current;
+
+    late final Future<MailMessagePage> load;
+    load = _loadViewPage(
+      view: view,
+      query: query,
+      limit: limit,
+      forceFullRefresh: forceFullRefresh,
+    ).whenComplete(() {
+      if (identical(_viewPageLoads[key], load)) {
+        _viewPageLoads.remove(key);
+      }
+    });
+    _viewPageLoads[key] = load;
+    return load;
+  }
+
+  Future<MailMessagePage> _loadViewPage({
+    required MailboxView view,
+    String? query,
+    required int limit,
+    required bool forceFullRefresh,
+  }) async {
+    var hasFullRemotePage = false;
+    final failures = <Object>[];
+    final targets = _folderFetchTargets(await _foldersForView(view));
+    final fetchedPages = await _mapConcurrently(
+      targets,
+      (target) => _fetchPreviewPageForFolder(
+        credential: target.credential,
+        folder: target.folder,
+        limit: limit,
+        forceFullRefresh: forceFullRefresh,
+      ),
+      maxConcurrent: _maxConcurrentMailboxFetches,
+    );
+    for (final fetched in fetchedPages) {
       if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
-    _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
+    _throwIfAllPreviewFetchesFailed(targets.length, failures);
     final cached = await _scopedCachedMessagesForView(
       view: view,
       query: query,
@@ -532,23 +610,22 @@ class CachedTransportMailRepository implements MailRepository {
     );
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
-      var attemptedFetches = 0;
       final failures = <Object>[];
-      for (final folder in await _foldersForView(view)) {
-        final credential = _credentialForAccount(folder.accountId);
-        if (credential == null) continue;
-        attemptedFetches++;
-        final beforeUid = await _oldestCachedUidForFolder(folder);
-        final fetched = await _fetchPreviewPageForFolder(
-          credential: credential,
-          folder: folder,
+      final targets = _folderFetchTargets(await _foldersForView(view));
+      final fetchedPages = await _mapConcurrently(targets, (target) async {
+        final beforeUid = await _oldestCachedUidForFolder(target.folder);
+        return _fetchPreviewPageForFolder(
+          credential: target.credential,
+          folder: target.folder,
           limit: limit,
           beforeUid: beforeUid,
         );
+      }, maxConcurrent: _maxConcurrentMailboxFetches);
+      for (final fetched in fetchedPages) {
         if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
-      _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
+      _throwIfAllPreviewFetchesFailed(targets.length, failures);
       cached = await _scopedCachedMessagesForView(
         view: view,
         query: query,
@@ -605,19 +682,22 @@ class CachedTransportMailRepository implements MailRepository {
       );
     }
     var hasFullRemotePage = false;
-    var attemptedFetches = 0;
     final failures = <Object>[];
-    for (final credential in _scopedCredentials(accountId)) {
-      attemptedFetches++;
-      final fetched = await _fetchPreviewPage(
+    final credentials = _scopedCredentials(accountId);
+    final fetchedPages = await _mapConcurrently(
+      credentials,
+      (credential) => _fetchPreviewPage(
         credential: credential,
         mailbox: mailbox,
         limit: limit,
-      );
+      ),
+      maxConcurrent: _maxConcurrentMailboxFetches,
+    );
+    for (final fetched in fetchedPages) {
       if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
-    _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
+    _throwIfAllPreviewFetchesFailed(credentials.length, failures);
     final cached = await _scopedCachedMessages(
       mailbox: mailbox,
       accountId: accountId,
@@ -661,24 +741,27 @@ class CachedTransportMailRepository implements MailRepository {
     );
     var hasFullRemotePage = false;
     if (cached.length < targetLimit) {
-      var attemptedFetches = 0;
       final failures = <Object>[];
-      for (final credential in _scopedCredentials(accountId)) {
-        attemptedFetches++;
+      final credentials = _scopedCredentials(accountId);
+      final fetchedPages = await _mapConcurrently(credentials, (
+        credential,
+      ) async {
         final beforeUid = await _oldestCachedUid(
           accountId: credential.accountId,
           mailbox: mailbox,
         );
-        final fetched = await _fetchPreviewPage(
+        return _fetchPreviewPage(
           credential: credential,
           mailbox: mailbox,
           limit: limit,
           beforeUid: beforeUid,
         );
+      }, maxConcurrent: _maxConcurrentMailboxFetches);
+      for (final fetched in fetchedPages) {
         if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
-      _throwIfAllPreviewFetchesFailed(attemptedFetches, failures);
+      _throwIfAllPreviewFetchesFailed(credentials.length, failures);
       cached = await _scopedCachedMessages(
         mailbox: mailbox,
         accountId: accountId,
@@ -1017,6 +1100,7 @@ class CachedTransportMailRepository implements MailRepository {
 
   @override
   Future<void> clearLocalCache() async {
+    _folderRefreshStates.clear();
     await _cache.clear();
     final namespace = _safeOptionalPathSegment(_cacheNamespace);
     if (namespace == null) {
@@ -1095,17 +1179,52 @@ class CachedTransportMailRepository implements MailRepository {
     required int limit,
     int? beforeUid,
     bool reconcile = true,
+    bool forceFullRefresh = false,
   }) async {
     try {
-      final fetched = await _transport
-          .fetchFolderMessagePreviews(
-            credential: credential,
-            folder: folder,
-            limit: limit,
-            beforeUid: beforeUid,
-          )
+      final refreshState = _folderRefreshStates[folder.key];
+      final now = DateTime.now();
+      final incrementalTransport =
+          _transport is IncrementalMailTransport
+              ? _transport as IncrementalMailTransport
+              : null;
+      final useIncrementalRefresh =
+          !forceFullRefresh &&
+          beforeUid == null &&
+          reconcile &&
+          incrementalTransport != null &&
+          refreshState != null &&
+          now.difference(refreshState.lastFullRefreshAt) <
+              _fullFolderRefreshInterval;
+      final fetched = await (useIncrementalRefresh
+              ? incrementalTransport.fetchNewFolderMessagePreviews(
+                credential: credential,
+                folder: folder,
+                afterUid: refreshState.cursor,
+                limit: limit,
+              )
+              : _transport.fetchFolderMessagePreviews(
+                credential: credential,
+                folder: folder,
+                limit: limit,
+                beforeUid: beforeUid,
+              ))
           .timeout(_previewFetchTimeout);
       await _cache.saveMessages(fetched.messages);
+      if (fetched.complete && beforeUid == null) {
+        final remoteUids = fetched.remoteUids;
+        if (!useIncrementalRefresh || remoteUids != null) {
+          _folderRefreshStates[folder.key] = _FolderRefreshState(
+            cursor: _highestUid(remoteUids ?? fetched.selectedUids),
+            lastFullRefreshAt: now,
+          );
+        } else {
+          refreshState.cursor = _highestUid(
+            fetched.selectedUids,
+            fallback: refreshState.cursor,
+          );
+        }
+      }
       if (reconcile && fetched.complete && fetched.remoteUids != null) {
         final remoteUids = fetched.remoteUids!;
         if (remoteUids.length >= _backgroundReconcileUidThreshold) {
@@ -1344,11 +1463,14 @@ class CachedTransportMailRepository implements MailRepository {
     final folder = view.folder;
     if (folder != null) return [folder];
     final smart = view.smartFolder!;
-    final folders = <MailFolder>[];
-    for (final credential in _credentials) {
-      final accountFolders = await _foldersForCredential(credential);
-      folders.addAll(
-        accountFolders.where((folder) {
+    final listings = await _mapConcurrently(
+      _credentials,
+      _foldersForCredential,
+      maxConcurrent: _maxConcurrentMailboxFetches,
+    );
+    return [
+      for (final accountFolders in listings)
+        ...accountFolders.where((folder) {
           if (!folder.selectable) return false;
           if (smart == MailSmartFolder.allIncoming ||
               smart == MailSmartFolder.unread) {
@@ -1356,9 +1478,15 @@ class CachedTransportMailRepository implements MailRepository {
           }
           return folder.kind == smart.mailbox;
         }),
-      );
-    }
-    return folders;
+    ];
+  }
+
+  List<_FolderFetchTarget> _folderFetchTargets(Iterable<MailFolder> folders) {
+    return [
+      for (final folder in folders)
+        if (_credentialForAccount(folder.accountId) case final credential?)
+          _FolderFetchTarget(credential: credential, folder: folder),
+    ];
   }
 
   Future<List<MailFolder>> _foldersForCredential(MailboxCredential credential) {
@@ -1564,6 +1692,51 @@ List<String> _findStaleMessageIds(
     }
   }
   return staleIds;
+}
+
+Future<List<R>> _mapConcurrently<T, R>(
+  Iterable<T> source,
+  Future<R> Function(T item) action, {
+  required int maxConcurrent,
+}) async {
+  final items = source.toList(growable: false);
+  if (items.isEmpty) return <R>[];
+  final results = List<Object?>.filled(items.length, null);
+  var nextIndex = 0;
+
+  Future<void> worker() async {
+    while (nextIndex < items.length) {
+      final index = nextIndex++;
+      results[index] = await action(items[index]);
+    }
+  }
+
+  final workerCount =
+      maxConcurrent < items.length ? maxConcurrent : items.length;
+  await Future.wait([for (var i = 0; i < workerCount; i++) worker()]);
+  return [for (final result in results) result as R];
+}
+
+class _FolderFetchTarget {
+  const _FolderFetchTarget({required this.credential, required this.folder});
+
+  final MailboxCredential credential;
+  final MailFolder folder;
+}
+
+class _FolderRefreshState {
+  _FolderRefreshState({required this.cursor, required this.lastFullRefreshAt});
+
+  int cursor;
+  final DateTime lastFullRefreshAt;
+}
+
+int _highestUid(Iterable<int> uids, {int fallback = 0}) {
+  var highest = fallback;
+  for (final uid in uids) {
+    if (uid > highest) highest = uid;
+  }
+  return highest;
 }
 
 class _CachedFolderListing {

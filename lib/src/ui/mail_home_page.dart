@@ -57,11 +57,11 @@ import 'mail_html_view.dart';
 
 const _maxOutgoingAttachmentBytes = 25 * 1024 * 1024;
 const _googleAndroidOAuthClient = GoogleAndroidOAuthClient();
-const _mailRefreshTimeout = Duration(seconds: 90);
+const _mailRefreshTimeout = Duration(seconds: 45);
 const _mailLoadMoreTimeout = Duration(seconds: 60);
 const _oauthRefreshTimeout = Duration(seconds: 20);
 const _folderDiscoveryTimeout = Duration(seconds: 45);
-const _automaticMailRefreshInterval = Duration(minutes: 2);
+const _automaticMailRefreshInterval = Duration(minutes: 1);
 
 const _mailHomeShortcuts = <ShortcutActivator, Intent>{
   SingleActivator(LogicalKeyboardKey.keyN, control: true): _ComposeMailIntent(),
@@ -567,10 +567,11 @@ class _MailHomePageState extends State<MailHomePage>
       await _refreshMessagesInBackground(
         requestId: requestId,
         completeStartupNotificationBaseline: completesNotificationBaseline,
+        showRefreshIndicator: false,
       );
       if (!mounted) return;
       if (_systemSettings.newMailNotifications &&
-          (!completesNotificationBaseline ||
+          (!_viewCanPrimeNewMailNotificationBaseline() ||
               _newMailNotificationBaseline.startupPending)) {
         await _pollNewMailForNotifications();
       }
@@ -607,18 +608,27 @@ class _MailHomePageState extends State<MailHomePage>
     required MailboxView view,
     String? query,
     required int limit,
+    bool forceFullRefresh = false,
   }) async {
+    Future<MailMessagePage> load() {
+      final repository = _mailRepository;
+      if (forceFullRefresh && repository is FullRefreshMailRepository) {
+        return (repository as FullRefreshMailRepository).fullRefreshViewPage(
+          view: view,
+          query: query,
+          limit: limit,
+        );
+      }
+      return repository.viewPage(view: view, query: query, limit: limit);
+    }
+
     await _refreshOAuthVaultIfNeeded();
     try {
-      return await _mailRepository
-          .viewPage(view: view, query: query, limit: limit)
-          .timeout(_mailRefreshTimeout);
+      return await load().timeout(_mailRefreshTimeout);
     } catch (error) {
       if (!_looksLikeMailAuthFailure(error)) rethrow;
       await _refreshOAuthVaultIfNeeded(force: true);
-      return _mailRepository
-          .viewPage(view: view, query: query, limit: limit)
-          .timeout(_mailRefreshTimeout);
+      return load().timeout(_mailRefreshTimeout);
     }
   }
 
@@ -1335,6 +1345,7 @@ class _MailHomePageState extends State<MailHomePage>
         showErrors: true,
         preserveSelection: !resetLimit,
         showRefreshIndicator: false,
+        forceFullRefresh: true,
       );
     } finally {
       _endMailRefresh(requestId);
@@ -1387,6 +1398,7 @@ class _MailHomePageState extends State<MailHomePage>
     bool suppressNewMailNotifications = false,
     bool completeStartupNotificationBaseline = false,
     bool showRefreshIndicator = true,
+    bool forceFullRefresh = false,
   }) async {
     if (showRefreshIndicator) {
       _beginMailRefresh(requestId);
@@ -1396,6 +1408,7 @@ class _MailHomePageState extends State<MailHomePage>
         view: _view,
         query: _search.text,
         limit: _messagePageSize,
+        forceFullRefresh: forceFullRefresh,
       );
       if (!_isCurrentMessageLoad(requestId)) return;
       if (suppressNewMailNotifications) {

@@ -386,6 +386,47 @@ void main() {
     }
   });
 
+  test('SocketMailTransport incrementally fetches only newer UIDs', () async {
+    final server = await _FakeImapServer.start(
+      searchUids: [501, 502, 503, 504],
+    );
+    try {
+      final page = await const SocketMailTransport()
+          .fetchNewFolderMessagePreviews(
+            credential: MailboxCredential(
+              accountId: 'acc',
+              address: 'me@example.com',
+              displayName: 'Me',
+              imapHost: InternetAddress.loopbackIPv4.address,
+              imapPort: server.port,
+              smtpHost: 'smtp.example.com',
+              smtpPort: 465,
+              username: 'me@example.com',
+              secret: 'secret',
+              useTls: false,
+            ),
+            folder: const MailFolder(
+              accountId: 'acc',
+              path: 'INBOX',
+              displayName: 'Inbox',
+              kind: MailboxKind.inbox,
+            ),
+            afterUid: 502,
+            limit: 1,
+          );
+
+      expect(server.fetchedUids, [503, 504]);
+      expect(page.messages.map((message) => message.id), [
+        'acc:inbox:503',
+        'acc:inbox:504',
+      ]);
+      expect(page.remoteUids, isNull);
+      expect(server.sawIncrementalUidSearch, isTrue);
+    } finally {
+      await server.close();
+    }
+  });
+
   test('SocketMailTransport parses a large preview batch', () async {
     final uids = [507, 506, 505, 504, 503, 502, 501];
     final body = List<String>.filled(8 * 1024, 'x').join();
@@ -976,6 +1017,10 @@ class _FakeImapServer {
     return _commands.any((command) => command.contains(' UID SEARCH ALL'));
   }
 
+  bool get sawIncrementalUidSearch {
+    return _commands.any((command) => command.contains(' UID SEARCH UID '));
+  }
+
   bool get sawUidFetch {
     return _commands.any((command) => command.contains(' UID FETCH 501 '));
   }
@@ -1096,6 +1141,18 @@ class _FakeImapServer {
         socket.write('$tag OK SELECT completed\r\n');
       } else if (command.contains(' UID SEARCH ALL')) {
         socket.write('* SEARCH ${searchUids.join(' ')}\r\n');
+        socket.write('$tag OK SEARCH completed\r\n');
+      } else if (command.contains(' UID SEARCH UID ')) {
+        final firstUid =
+            int.tryParse(
+              RegExp(
+                    r' UID SEARCH UID (\d+):\*',
+                  ).firstMatch(command)?.group(1) ??
+                  '',
+            ) ??
+            1;
+        final matching = searchUids.where((uid) => uid >= firstUid);
+        socket.write('* SEARCH ${matching.join(' ')}\r\n');
         socket.write('$tag OK SEARCH completed\r\n');
       } else if (command.contains(' UID MOVE ')) {
         final sourceUid =

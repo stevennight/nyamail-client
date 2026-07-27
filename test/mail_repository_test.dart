@@ -724,6 +724,156 @@ void main() {
     expect(transport.folderListRequestCount, 1);
   });
 
+  test('smart view refreshes independent accounts concurrently', () async {
+    final transport =
+        _RecordingTransport()
+          ..previewFetchDelay = const Duration(milliseconds: 40);
+    final repository = CachedTransportMailRepository(
+      cache: _MemoryMailCache(),
+      transport: transport,
+      credentials: const [
+        MailboxCredential(
+          accountId: 'work',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: 'imap.example.com',
+          imapPort: 993,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+        ),
+        MailboxCredential(
+          accountId: 'personal',
+          address: 'me@personal.example',
+          displayName: 'Personal',
+          imapHost: 'imap.example.com',
+          imapPort: 993,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@personal.example',
+          secret: 'secret',
+        ),
+      ],
+    );
+
+    await repository.viewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+
+    expect(transport.previewFetchRequestCount, 2);
+    expect(transport.maxActivePreviewFetches, 2);
+  });
+
+  test(
+    'identical simultaneous smart view refreshes share one request',
+    () async {
+      final transport =
+          _RecordingTransport()
+            ..previewFetchDelay = const Duration(milliseconds: 40);
+      final repository = CachedTransportMailRepository(
+        cache: _MemoryMailCache(),
+        transport: transport,
+        credentials: const [
+          MailboxCredential(
+            accountId: 'work',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: 'imap.example.com',
+            imapPort: 993,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+          ),
+        ],
+      );
+
+      await Future.wait([
+        repository.viewPage(
+          view: const MailboxView.smart(MailSmartFolder.allIncoming),
+        ),
+        repository.viewPage(
+          view: const MailboxView.smart(MailSmartFolder.allIncoming),
+        ),
+      ]);
+
+      expect(transport.previewFetchRequestCount, 1);
+    },
+  );
+
+  test(
+    'recent smart view refresh fetches only UIDs after its cursor',
+    () async {
+      const inbox = MailFolder(
+        accountId: 'work',
+        path: 'INBOX',
+        displayName: 'Inbox',
+        kind: MailboxKind.inbox,
+      );
+      final transport =
+          _RecordingTransport()
+            ..foldersByCredential['work'] = [inbox]
+            ..messagesByFolder[inbox.key] = [
+              MailMessage(
+                id: 'work:inbox:10',
+                accountId: 'work',
+                from: 'Alice <alice@example.com>',
+                subject: 'Existing',
+                preview: 'Existing',
+                body: 'Existing',
+                receivedAt: DateTime.utc(2026, 7, 1),
+              ),
+            ];
+      final repository = CachedTransportMailRepository(
+        cache: _MemoryMailCache(),
+        transport: transport,
+        credentials: const [
+          MailboxCredential(
+            accountId: 'work',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: 'imap.example.com',
+            imapPort: 993,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+          ),
+        ],
+      );
+
+      await repository.viewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+      );
+      transport.messagesByFolder[inbox.key]!.add(
+        MailMessage(
+          id: 'work:inbox:11',
+          accountId: 'work',
+          from: 'Bob <bob@example.com>',
+          subject: 'New',
+          preview: 'New',
+          body: 'New',
+          receivedAt: DateTime.utc(2026, 7, 2),
+        ),
+      );
+
+      final refreshed = await repository.viewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+      );
+      await repository.fullRefreshViewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+      );
+
+      expect(transport.incrementalPreviewFetchRequestCount, 1);
+      expect(transport.previewFetchRequestCount, 3);
+      expect(refreshed.messages.map((message) => message.subject), [
+        'New',
+        'Existing',
+      ]);
+    },
+  );
+
   test('account folder view fetches only the selected real folder', () async {
     final projects = MailFolder(
       accountId: 'work',
@@ -1949,7 +2099,7 @@ class _MemoryMailCache implements MailMessageCache {
   }
 }
 
-class _RecordingTransport implements MailTransport {
+class _RecordingTransport implements MailTransport, IncrementalMailTransport {
   MailboxCredential? sentCredential;
   OutgoingMessage? sentMessage;
   String? seenMessageId;
@@ -1975,7 +2125,27 @@ class _RecordingTransport implements MailTransport {
   final fetchedCredentialIds = <String>[];
   final fetchedBeforeUids = <int?>[];
   int folderListRequestCount = 0;
+  int previewFetchRequestCount = 0;
+  int incrementalPreviewFetchRequestCount = 0;
+  int activePreviewFetches = 0;
+  int maxActivePreviewFetches = 0;
+  Duration previewFetchDelay = Duration.zero;
   bool incompletePreviewFetch = false;
+
+  Future<void> _beginPreviewFetch() async {
+    previewFetchRequestCount++;
+    activePreviewFetches++;
+    if (activePreviewFetches > maxActivePreviewFetches) {
+      maxActivePreviewFetches = activePreviewFetches;
+    }
+    if (previewFetchDelay > Duration.zero) {
+      await Future<void>.delayed(previewFetchDelay);
+    }
+  }
+
+  void _endPreviewFetch() {
+    activePreviewFetches--;
+  }
 
   @override
   Future<void> validateCredential({
@@ -2027,6 +2197,7 @@ class _RecordingTransport implements MailTransport {
     int limit = 30,
     int? beforeUid,
   }) async {
+    await _beginPreviewFetch();
     fetchedCredentialIds.add(credential.accountId);
     fetchedMailbox = mailbox;
     fetchedLimit = limit;
@@ -2050,7 +2221,7 @@ class _RecordingTransport implements MailTransport {
       for (final message in _messagesForMailbox(credential, mailbox))
         if (_uidFor(message) case final uid?) uid,
     ];
-    return MailPreviewPage(
+    final page = MailPreviewPage(
       messages: messages,
       selectedUids: [
         for (final message in messages)
@@ -2060,6 +2231,8 @@ class _RecordingTransport implements MailTransport {
       hasMore: _hasMoreMessages(remoteUids, limit: limit, beforeUid: beforeUid),
       complete: !incompletePreviewFetch,
     );
+    _endPreviewFetch();
+    return page;
   }
 
   @override
@@ -2069,6 +2242,7 @@ class _RecordingTransport implements MailTransport {
     int limit = 30,
     int? beforeUid,
   }) async {
+    await _beginPreviewFetch();
     fetchedCredentialIds.add(credential.accountId);
     fetchedMailbox = folder.kind;
     fetchedLimit = limit;
@@ -2095,7 +2269,7 @@ class _RecordingTransport implements MailTransport {
       for (final message in _messagesForFolder(credential, folder))
         if (_uidFor(message) case final uid?) uid,
     ];
-    return MailPreviewPage(
+    final page = MailPreviewPage(
       messages: messages,
       selectedUids: [
         for (final message in messages)
@@ -2105,6 +2279,41 @@ class _RecordingTransport implements MailTransport {
       hasMore: _hasMoreMessages(remoteUids, limit: limit, beforeUid: beforeUid),
       complete: !incompletePreviewFetch,
     );
+    _endPreviewFetch();
+    return page;
+  }
+
+  @override
+  Future<MailPreviewPage> fetchNewFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required int afterUid,
+    int limit = 30,
+  }) async {
+    await _beginPreviewFetch();
+    incrementalPreviewFetchRequestCount++;
+    final messages = [
+      for (final message in _messagesForFolder(credential, folder))
+        if (_uidFor(message) case final uid? when uid > afterUid)
+          message.copyWith(
+            mailbox: folder.kind,
+            folderPath: folder.path,
+            folderDisplayName: folder.displayName,
+            body: '',
+            hasAttachments: false,
+            attachments: const [],
+            bodyLoaded: false,
+          ),
+    ]..sort((a, b) => _uidFor(a)!.compareTo(_uidFor(b)!));
+    final selected = messages.take(limit * 4).toList(growable: false);
+    final page = MailPreviewPage(
+      messages: selected,
+      selectedUids: [for (final message in selected) _uidFor(message)!],
+      hasMore: messages.length > selected.length,
+      complete: !incompletePreviewFetch,
+    );
+    _endPreviewFetch();
+    return page;
   }
 
   @override
