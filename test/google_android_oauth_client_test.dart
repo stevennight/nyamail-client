@@ -17,11 +17,7 @@ void main() {
       messenger.setMockMethodCallHandler(channel, (call) async {
         calls.add(call);
         return <String, Object?>{
-          'accessToken': 'access-token',
-          'tokenType': 'Bearer',
-          'refreshToken': 'refresh-token',
-          'expiresIn': 3600,
-          'grantedScopes': ['https://mail.google.com/'],
+          'serverAuthCode': 'server-auth-code',
           'accountEmail': 'me@gmail.com',
         };
       });
@@ -33,7 +29,27 @@ void main() {
         isSupportedOverride: true,
       ).authorize(
         provider: oauthProviderConfig('gmail'),
-        clientId: 'android-client-id.apps.googleusercontent.com',
+        androidClientId: 'android-client-id.apps.googleusercontent.com',
+        serverClientId: 'web-client-id.apps.googleusercontent.com',
+        serverClientSecret: 'web-client-secret',
+        exchangeServerAuthorizationCode: ({
+          required provider,
+          required clientId,
+          clientSecret,
+          required code,
+        }) async {
+          expect(provider.provider, 'gmail');
+          expect(clientId, 'web-client-id.apps.googleusercontent.com');
+          expect(clientSecret, 'web-client-secret');
+          expect(code, 'server-auth-code');
+          return const OAuthTokenSet(
+            accessToken: 'access-token',
+            tokenType: 'Bearer',
+            refreshToken: 'refresh-token',
+            expiresIn: 3600,
+            scope: 'https://mail.google.com/',
+          );
+        },
         loginHint: 'me@gmail.com',
         forceAccountPicker: true,
         onProgress: progress.add,
@@ -42,9 +58,11 @@ void main() {
       expect(calls, hasLength(1));
       expect(calls.single.method, 'authorizeGmail');
       expect(calls.single.arguments, {
-        'clientId': 'android-client-id.apps.googleusercontent.com',
+        'androidClientId': 'android-client-id.apps.googleusercontent.com',
+        'serverClientId': 'web-client-id.apps.googleusercontent.com',
         'loginHint': 'me@gmail.com',
         'forceAccountPicker': true,
+        'forceRefreshToken': true,
         'scopes': ['https://mail.google.com/'],
       });
       expect(progress, [
@@ -79,7 +97,19 @@ void main() {
         isSupportedOverride: true,
       ).authorize(
         provider: oauthProviderConfig('gmail'),
-        clientId: 'android-client-id.apps.googleusercontent.com',
+        androidClientId: 'android-client-id.apps.googleusercontent.com',
+        serverClientId: 'web-client-id.apps.googleusercontent.com',
+        serverClientSecret: 'web-client-secret',
+        exchangeServerAuthorizationCode:
+            ({
+              required provider,
+              required clientId,
+              clientSecret,
+              required code,
+            }) async =>
+                throw StateError(
+                  'exchange should not run for a mismatched account',
+                ),
         loginHint: 'me@gmail.com',
       ),
       throwsA(isA<OAuthLoopbackException>()),
@@ -88,10 +118,64 @@ void main() {
 
   test('android google client rejects unsupported providers', () async {
     await expectLater(
-      const GoogleAndroidOAuthClient(
-        isSupportedOverride: true,
-      ).authorize(provider: oauthProviderConfig('outlook')),
+      const GoogleAndroidOAuthClient(isSupportedOverride: true).authorize(
+        provider: oauthProviderConfig('outlook'),
+        androidClientId: 'android-client-id.apps.googleusercontent.com',
+        serverClientId: 'web-client-id.apps.googleusercontent.com',
+        serverClientSecret: 'web-client-secret',
+        exchangeServerAuthorizationCode:
+            ({
+              required provider,
+              required clientId,
+              clientSecret,
+              required code,
+            }) async => throw StateError('exchange should not run'),
+      ),
       throwsA(isA<OAuthLoopbackException>()),
     );
   });
+
+  test(
+    'android google client rejects a missing server authorization code',
+    () async {
+      const channel = MethodChannel('test_google_authorization_missing_code');
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      var exchangeCalled = false;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        return <String, Object?>{'accountEmail': 'me@gmail.com'};
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+      await expectLater(
+        const GoogleAndroidOAuthClient(
+          channel: channel,
+          isSupportedOverride: true,
+        ).authorize(
+          provider: oauthProviderConfig('gmail'),
+          androidClientId: 'android-client-id.apps.googleusercontent.com',
+          serverClientId: 'web-client-id.apps.googleusercontent.com',
+          serverClientSecret: 'web-client-secret',
+          exchangeServerAuthorizationCode: ({
+            required provider,
+            required clientId,
+            clientSecret,
+            required code,
+          }) async {
+            exchangeCalled = true;
+            throw StateError('exchange should not run');
+          },
+          loginHint: 'me@gmail.com',
+        ),
+        throwsA(
+          isA<OAuthLoopbackException>().having(
+            (error) => error.message,
+            'message',
+            contains('server authorization code'),
+          ),
+        ),
+      );
+      expect(exchangeCalled, isFalse);
+    },
+  );
 }

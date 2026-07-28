@@ -11,10 +11,40 @@ import 'mail_models.dart';
 import 'mail_transport.dart';
 
 class MailMessagePage {
-  const MailMessagePage({required this.messages, required this.hasMore});
+  const MailMessagePage({
+    required this.messages,
+    required this.hasMore,
+    this.syncedAccountIds = const <String>{},
+    this.accountFailures = const <MailAccountSyncFailure>[],
+  });
 
   final List<MailMessage> messages;
   final bool hasMore;
+  final Set<String> syncedAccountIds;
+  final List<MailAccountSyncFailure> accountFailures;
+}
+
+class MailAccountSyncFailure {
+  const MailAccountSyncFailure({
+    required this.accountId,
+    required this.message,
+    required this.authenticationRequired,
+  });
+
+  final String accountId;
+  final String message;
+  final bool authenticationRequired;
+}
+
+bool looksLikeMailAuthenticationFailure(Object error) {
+  final text = error.toString().toLowerCase();
+  return text.contains('auth') ||
+      text.contains('xoauth') ||
+      text.contains('invalid credentials') ||
+      text.contains('invalid_grant') ||
+      text.contains('login failed') ||
+      text.contains('credentials') ||
+      text.contains('token');
 }
 
 abstract class MailRepository {
@@ -558,7 +588,6 @@ class CachedTransportMailRepository
     required bool forceFullRefresh,
   }) async {
     var hasFullRemotePage = false;
-    final failures = <Object>[];
     final targets = _folderFetchTargets(await _foldersForView(view));
     final fetchedPages = await _mapConcurrently(
       targets,
@@ -571,10 +600,12 @@ class CachedTransportMailRepository
       maxConcurrent: _maxConcurrentMailboxFetches,
     );
     for (final fetched in fetchedPages) {
-      if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
-    _throwIfAllPreviewFetchesFailed(targets.length, failures);
+    final syncSummary = _accountSyncSummary(
+      accountIds: [for (final target in targets) target.credential.accountId],
+      results: fetchedPages,
+    );
     final cached = await _scopedCachedMessagesForView(
       view: view,
       query: query,
@@ -584,6 +615,8 @@ class CachedTransportMailRepository
     return MailMessagePage(
       messages: cached.take(limit).toList(),
       hasMore: cached.length > limit || hasFullRemotePage,
+      syncedAccountIds: syncSummary.syncedAccountIds,
+      accountFailures: syncSummary.failures,
     );
   }
 
@@ -609,8 +642,8 @@ class CachedTransportMailRepository
       maxResults: targetLimit + 1,
     );
     var hasFullRemotePage = false;
+    var syncSummary = const _AccountSyncSummary();
     if (cached.length < targetLimit) {
-      final failures = <Object>[];
       final targets = _folderFetchTargets(await _foldersForView(view));
       final fetchedPages = await _mapConcurrently(targets, (target) async {
         final beforeUid = await _oldestCachedUidForFolder(target.folder);
@@ -622,10 +655,12 @@ class CachedTransportMailRepository
         );
       }, maxConcurrent: _maxConcurrentMailboxFetches);
       for (final fetched in fetchedPages) {
-        if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
-      _throwIfAllPreviewFetchesFailed(targets.length, failures);
+      syncSummary = _accountSyncSummary(
+        accountIds: [for (final target in targets) target.credential.accountId],
+        results: fetchedPages,
+      );
       cached = await _scopedCachedMessagesForView(
         view: view,
         query: query,
@@ -636,6 +671,8 @@ class CachedTransportMailRepository
     return MailMessagePage(
       messages: cached.take(targetLimit).toList(),
       hasMore: cached.length > targetLimit || hasFullRemotePage,
+      syncedAccountIds: syncSummary.syncedAccountIds,
+      accountFailures: syncSummary.failures,
     );
   }
 
@@ -682,7 +719,6 @@ class CachedTransportMailRepository
       );
     }
     var hasFullRemotePage = false;
-    final failures = <Object>[];
     final credentials = _scopedCredentials(accountId);
     final fetchedPages = await _mapConcurrently(
       credentials,
@@ -694,10 +730,12 @@ class CachedTransportMailRepository
       maxConcurrent: _maxConcurrentMailboxFetches,
     );
     for (final fetched in fetchedPages) {
-      if (fetched.failed) failures.add(fetched.error!);
       hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
     }
-    _throwIfAllPreviewFetchesFailed(credentials.length, failures);
+    final syncSummary = _accountSyncSummary(
+      accountIds: [for (final credential in credentials) credential.accountId],
+      results: fetchedPages,
+    );
     final cached = await _scopedCachedMessages(
       mailbox: mailbox,
       accountId: accountId,
@@ -712,6 +750,8 @@ class CachedTransportMailRepository
     return MailMessagePage(
       messages: cached.take(limit).toList(),
       hasMore: cached.length > limit || hasFullRemotePage,
+      syncedAccountIds: syncSummary.syncedAccountIds,
+      accountFailures: syncSummary.failures,
     );
   }
 
@@ -740,8 +780,8 @@ class CachedTransportMailRepository
       maxResults: targetLimit + 1,
     );
     var hasFullRemotePage = false;
+    var syncSummary = const _AccountSyncSummary();
     if (cached.length < targetLimit) {
-      final failures = <Object>[];
       final credentials = _scopedCredentials(accountId);
       final fetchedPages = await _mapConcurrently(credentials, (
         credential,
@@ -758,10 +798,14 @@ class CachedTransportMailRepository
         );
       }, maxConcurrent: _maxConcurrentMailboxFetches);
       for (final fetched in fetchedPages) {
-        if (fetched.failed) failures.add(fetched.error!);
         hasFullRemotePage = hasFullRemotePage || fetched.hasMore;
       }
-      _throwIfAllPreviewFetchesFailed(credentials.length, failures);
+      syncSummary = _accountSyncSummary(
+        accountIds: [
+          for (final credential in credentials) credential.accountId,
+        ],
+        results: fetchedPages,
+      );
       cached = await _scopedCachedMessages(
         mailbox: mailbox,
         accountId: accountId,
@@ -777,6 +821,8 @@ class CachedTransportMailRepository
     return MailMessagePage(
       messages: cached.take(targetLimit).toList(),
       hasMore: cached.length > targetLimit || hasFullRemotePage,
+      syncedAccountIds: syncSummary.syncedAccountIds,
+      accountFailures: syncSummary.failures,
     );
   }
 
@@ -1336,12 +1382,31 @@ class CachedTransportMailRepository
     return Isolate.run(() => _findStaleMessageIds(messageIds, remoteUids));
   }
 
-  void _throwIfAllPreviewFetchesFailed(
-    int attemptedFetches,
-    List<Object> failures,
-  ) {
-    if (attemptedFetches == 0 || failures.length < attemptedFetches) return;
-    throw failures.first;
+  _AccountSyncSummary _accountSyncSummary({
+    required List<String> accountIds,
+    required List<_PreviewFetchResult> results,
+  }) {
+    assert(accountIds.length == results.length);
+    final syncedAccountIds = accountIds.toSet();
+    final failuresByAccount = <String, MailAccountSyncFailure>{};
+    for (var index = 0; index < results.length; index++) {
+      final error = results[index].error;
+      if (error == null) continue;
+      final accountId = accountIds[index];
+      syncedAccountIds.remove(accountId);
+      failuresByAccount.putIfAbsent(
+        accountId,
+        () => MailAccountSyncFailure(
+          accountId: accountId,
+          message: error.toString(),
+          authenticationRequired: looksLikeMailAuthenticationFailure(error),
+        ),
+      );
+    }
+    return _AccountSyncSummary(
+      syncedAccountIds: syncedAccountIds,
+      failures: failuresByAccount.values.toList(growable: false),
+    );
   }
 
   Future<List<MailMessage>> _scopedCachedMessages({
@@ -1760,8 +1825,16 @@ class _PreviewFetchResult {
   final bool hasMore;
   final bool complete;
   final Object? error;
+}
 
-  bool get failed => error != null;
+class _AccountSyncSummary {
+  const _AccountSyncSummary({
+    this.syncedAccountIds = const <String>{},
+    this.failures = const <MailAccountSyncFailure>[],
+  });
+
+  final Set<String> syncedAccountIds;
+  final List<MailAccountSyncFailure> failures;
 }
 
 const _encryptedAttachmentExtension = '.nyacache';

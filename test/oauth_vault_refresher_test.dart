@@ -99,6 +99,58 @@ void main() {
     expect(refreshCalled, isFalse);
   });
 
+  test('refreshes only requested oauth item ids', () async {
+    final now = DateTime.utc(2026, 7, 1, 12);
+    final refreshedTokens = <String>[];
+    final document = VaultDocument(
+      version: 1,
+      items: [
+        _oauthItem(
+          id: 'gmail',
+          address: 'me@gmail.com',
+          secret: 'old-gmail-token',
+          refreshToken: 'gmail-refresh-token',
+          tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
+        ),
+        _oauthItem(
+          id: 'outlook',
+          address: 'me@outlook.com',
+          provider: 'outlook',
+          secret: 'old-outlook-token',
+          refreshToken: 'outlook-refresh-token',
+          tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
+        ),
+      ],
+    );
+
+    final result = await OAuthVaultRefresher(
+      clock: () => now,
+      refreshTokens: ({
+        required OAuthProviderConfig provider,
+        required String clientId,
+        String? clientSecret,
+        required String refreshToken,
+      }) async {
+        refreshedTokens.add(refreshToken);
+        return OAuthTokenSet(
+          accessToken: 'new-${provider.provider}-token',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+        );
+      },
+    ).refreshExpiring(
+      document: document,
+      clientIdForProvider: (_) => 'client-id',
+      force: true,
+      itemIds: const {'outlook'},
+    );
+
+    expect(refreshedTokens, ['outlook-refresh-token']);
+    expect(result.refreshedItemIds, {'outlook'});
+    expect(result.document.items[0].secret, 'old-gmail-token');
+    expect(result.document.items[1].secret, 'new-outlook-token');
+  });
+
   test('refreshes oauth items with missing expiry metadata', () async {
     final now = DateTime.utc(2026, 7, 1, 12);
     final document = VaultDocument(
@@ -139,57 +191,60 @@ void main() {
     );
   });
 
-  test('reauthorizes expiring oauth items when refresh token is unavailable', () async {
-    final now = DateTime.utc(2026, 7, 1, 12);
-    final document = VaultDocument(
-      version: 1,
-      items: [
-        _oauthItem(
-          secret: 'old-access-token',
-          refreshToken: '',
-          tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
-        ),
-      ],
-    );
+  test(
+    'reauthorizes expiring oauth items when refresh token is unavailable',
+    () async {
+      final now = DateTime.utc(2026, 7, 1, 12);
+      final document = VaultDocument(
+        version: 1,
+        items: [
+          _oauthItem(
+            secret: 'old-access-token',
+            refreshToken: '',
+            tokenExpiresAt: now.subtract(const Duration(minutes: 1)),
+          ),
+        ],
+      );
 
-    final result = await OAuthVaultRefresher(
-      clock: () => now,
-      refreshTokens: ({
-        required OAuthProviderConfig provider,
-        required String clientId,
-        String? clientSecret,
-        required String refreshToken,
-      }) async {
-        throw StateError('refresh token path should not be used');
-      },
-      reauthorizeAccessToken: ({
-        required OAuthProviderConfig provider,
-        required String clientId,
-        String? clientSecret,
-        required String loginHint,
-      }) async {
-        expect(provider.provider, 'gmail');
-        expect(clientId, 'client-id');
-        expect(loginHint, 'me@gmail.com');
-        return const OAuthTokenSet(
-          accessToken: 'new-android-access-token',
-          tokenType: 'Bearer',
-          expiresIn: 3300,
-        );
-      },
-    ).refreshExpiring(
-      document: document,
-      clientIdForProvider: (_) => 'client-id',
-    );
+      final result = await OAuthVaultRefresher(
+        clock: () => now,
+        refreshTokens: ({
+          required OAuthProviderConfig provider,
+          required String clientId,
+          String? clientSecret,
+          required String refreshToken,
+        }) async {
+          throw StateError('refresh token path should not be used');
+        },
+        reauthorizeAccessToken: ({
+          required OAuthProviderConfig provider,
+          required String clientId,
+          String? clientSecret,
+          required String loginHint,
+        }) async {
+          expect(provider.provider, 'gmail');
+          expect(clientId, 'client-id');
+          expect(loginHint, 'me@gmail.com');
+          return const OAuthTokenSet(
+            accessToken: 'new-android-access-token',
+            tokenType: 'Bearer',
+            expiresIn: 3300,
+          );
+        },
+      ).refreshExpiring(
+        document: document,
+        clientIdForProvider: (_) => 'client-id',
+      );
 
-    expect(result.changed, isTrue);
-    expect(result.document.items.single.secret, 'new-android-access-token');
-    expect(result.document.items.single.refreshToken, isEmpty);
-    expect(
-      result.document.items.single.tokenExpiresAt,
-      now.add(const Duration(seconds: 3300)),
-    );
-  });
+      expect(result.changed, isTrue);
+      expect(result.document.items.single.secret, 'new-android-access-token');
+      expect(result.document.items.single.refreshToken, isEmpty);
+      expect(
+        result.document.items.single.tokenExpiresAt,
+        now.add(const Duration(seconds: 3300)),
+      );
+    },
+  );
 
   test('uses item oauth client for synced refresh tokens', () async {
     final now = DateTime.utc(2026, 7, 1, 12);
@@ -266,17 +321,20 @@ void main() {
 }
 
 VaultMailboxItem _oauthItem({
+  String id = 'vault_oauth',
+  String address = 'me@gmail.com',
+  String provider = 'gmail',
   required String secret,
   required String refreshToken,
   required DateTime? tokenExpiresAt,
 }) {
   return VaultMailboxItem(
-    id: 'vault_oauth',
+    id: id,
     kind: VaultItemKind.oauth,
-    address: 'me@gmail.com',
+    address: address,
     displayName: 'Me',
-    provider: 'gmail',
-    username: 'me@gmail.com',
+    provider: provider,
+    username: address,
     secret: secret,
     refreshToken: refreshToken,
     tokenExpiresAt: tokenExpiresAt,

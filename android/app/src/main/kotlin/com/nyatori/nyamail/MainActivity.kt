@@ -28,6 +28,8 @@ class MainActivity : FlutterFragmentActivity() {
     private data class PendingGoogleAuthorization(
         val result: MethodChannel.Result,
         val scopes: List<Scope>,
+        val serverClientId: String,
+        val forceRefreshToken: Boolean,
     )
 
     private var oauthCallbackChannel: MethodChannel? = null
@@ -70,7 +72,19 @@ class MainActivity : FlutterFragmentActivity() {
                     val rawScopes = call.argument<List<String>>("scopes") ?: emptyList()
                     val loginHint = call.argument<String>("loginHint") ?: ""
                     val forceAccountPicker = call.argument<Boolean>("forceAccountPicker") ?: false
-                    authorizeGmail(rawScopes, loginHint, forceAccountPicker, result)
+                    val androidClientId = call.argument<String>("androidClientId") ?: ""
+                    val serverClientId = call.argument<String>("serverClientId") ?: ""
+                    val forceRefreshToken =
+                        call.argument<Boolean>("forceRefreshToken") ?: true
+                    authorizeGmail(
+                        rawScopes,
+                        loginHint,
+                        forceAccountPicker,
+                        androidClientId,
+                        serverClientId,
+                        forceRefreshToken,
+                        result
+                    )
                 }
                 else -> result.notImplemented()
             }
@@ -194,6 +208,9 @@ class MainActivity : FlutterFragmentActivity() {
         rawScopes: List<String>,
         loginHint: String,
         forceAccountPicker: Boolean,
+        androidClientId: String,
+        serverClientId: String,
+        forceRefreshToken: Boolean,
         result: MethodChannel.Result
     ) {
         if (pendingGoogleAuthorization != null) {
@@ -213,7 +230,28 @@ class MainActivity : FlutterFragmentActivity() {
             return
         }
 
-        pendingGoogleAuthorization = PendingGoogleAuthorization(result, scopes)
+        if (androidClientId.isBlank()) {
+            result.error(
+                "missing_android_client_id",
+                "Google Android client ID is required.",
+                null
+            )
+            return
+        }
+        if (serverClientId.isBlank()) {
+            result.error(
+                "missing_server_client_id",
+                "Google Web client ID is required for offline access.",
+                null
+            )
+            return
+        }
+        pendingGoogleAuthorization = PendingGoogleAuthorization(
+            result,
+            scopes,
+            serverClientId.trim(),
+            forceRefreshToken
+        )
         if (forceAccountPicker) {
             startGoogleAccountPicker(loginHint.trim())
             return
@@ -251,6 +289,10 @@ class MainActivity : FlutterFragmentActivity() {
         val pending = pendingGoogleAuthorization ?: return
         val builder = AuthorizationRequest.builder()
             .setRequestedScopes(pending.scopes)
+            .requestOfflineAccess(
+                pending.serverClientId,
+                pending.forceRefreshToken
+            )
         if (account != null) {
             builder.setAccount(account)
         }

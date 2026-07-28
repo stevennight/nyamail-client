@@ -122,6 +122,7 @@ Future<OAuthTokenSet> _authorizeOAuthForCurrentPlatform({
   required OAuthLoopbackClient oauthClient,
   required OAuthProviderConfig provider,
   required String clientId,
+  String? androidClientId,
   String? clientSecret,
   String? loginHint,
   Uri? mobileRedirectUri,
@@ -131,7 +132,11 @@ Future<OAuthTokenSet> _authorizeOAuthForCurrentPlatform({
   if (_usesGoogleAndroidOAuth(provider.provider)) {
     return _googleAndroidOAuthClient.authorize(
       provider: provider,
-      clientId: clientId,
+      androidClientId: androidClientId ?? '',
+      serverClientId: clientId,
+      serverClientSecret: clientSecret ?? '',
+      exchangeServerAuthorizationCode:
+          oauthClient.exchangeServerAuthorizationCode,
       loginHint: loginHint,
       forceAccountPicker: forceAccountPicker,
       onProgress: onProgress,
@@ -236,7 +241,9 @@ class _MailHomePageState extends State<MailHomePage>
   bool _loading = true;
   bool _vaultUnlocking = false;
   bool _loadingMore = false;
-  Future<void>? _oauthRefreshFuture;
+  Future<OAuthVaultRefreshResult?>? _oauthRefreshFuture;
+  final Map<String, MailAccountSyncFailure> _accountSyncFailures =
+      <String, MailAccountSyncFailure>{};
   bool _claimingVaultShare = false;
   String? _banner;
   bool _refreshingMail = false;
@@ -624,9 +631,10 @@ class _MailHomePageState extends State<MailHomePage>
 
     await _refreshOAuthVaultIfNeeded();
     try {
-      return await load().timeout(_mailRefreshTimeout);
+      final page = await load().timeout(_mailRefreshTimeout);
+      return _retryPageAfterTargetedOAuthRefresh(page, load);
     } catch (error) {
-      if (!_looksLikeMailAuthFailure(error)) rethrow;
+      if (!looksLikeMailAuthenticationFailure(error)) rethrow;
       await _refreshOAuthVaultIfNeeded(force: true);
       return load().timeout(_mailRefreshTimeout);
     }
@@ -640,16 +648,21 @@ class _MailHomePageState extends State<MailHomePage>
   }) async {
     await _refreshOAuthVaultIfNeeded();
     try {
-      return await _mailRepository
-          .loadOlderViewMessages(
-            view: view,
-            query: query,
-            visibleCount: visibleCount,
-            limit: limit,
-          )
-          .timeout(_mailLoadMoreTimeout);
+      Future<MailMessagePage> load() {
+        return _mailRepository
+            .loadOlderViewMessages(
+              view: view,
+              query: query,
+              visibleCount: visibleCount,
+              limit: limit,
+            )
+            .timeout(_mailLoadMoreTimeout);
+      }
+
+      final page = await load();
+      return _retryPageAfterTargetedOAuthRefresh(page, load);
     } catch (error) {
-      if (!_looksLikeMailAuthFailure(error)) rethrow;
+      if (!looksLikeMailAuthenticationFailure(error)) rethrow;
       await _refreshOAuthVaultIfNeeded(force: true);
       return _mailRepository
           .loadOlderViewMessages(
@@ -662,13 +675,24 @@ class _MailHomePageState extends State<MailHomePage>
     }
   }
 
-  bool _looksLikeMailAuthFailure(Object error) {
-    final text = error.toString().toLowerCase();
-    return text.contains('auth') ||
-        text.contains('xoauth') ||
-        text.contains('invalid credentials') ||
-        text.contains('invalid_grant') ||
-        text.contains('token');
+  Future<MailMessagePage> _retryPageAfterTargetedOAuthRefresh(
+    MailMessagePage page,
+    Future<MailMessagePage> Function() load,
+  ) async {
+    final accountIds = {
+      for (final failure in page.accountFailures)
+        if (failure.authenticationRequired) failure.accountId,
+    };
+    if (accountIds.isEmpty) return page;
+    final refresh = await _refreshOAuthVaultIfNeeded(
+      force: true,
+      accountIds: accountIds,
+    );
+    if (refresh == null ||
+        refresh.refreshedItemIds.intersection(accountIds).isEmpty) {
+      return page;
+    }
+    return load();
   }
 
   void _primeNewMailNotificationBaseline(
@@ -1426,6 +1450,7 @@ class _MailHomePageState extends State<MailHomePage>
       }
       final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
+        _mergeAccountSyncStatus(page);
         _messages = messages;
         _selected = _messageFor(
           messages,
@@ -1462,6 +1487,15 @@ class _MailHomePageState extends State<MailHomePage>
     });
   }
 
+  void _mergeAccountSyncStatus(MailMessagePage page) {
+    for (final accountId in page.syncedAccountIds) {
+      _accountSyncFailures.remove(accountId);
+    }
+    for (final failure in page.accountFailures) {
+      _accountSyncFailures[failure.accountId] = failure;
+    }
+  }
+
   void _endMailRefresh(int requestId) {
     if (!mounted || _refreshingMailRequestId != requestId) return;
     setState(() {
@@ -1496,6 +1530,7 @@ class _MailHomePageState extends State<MailHomePage>
       if (!_isCurrentMessageLoad(requestId)) return;
       final messages = _visibleMessagesForDisplay(page.messages);
       setState(() {
+        _mergeAccountSyncStatus(page);
         _messages = messages;
         _selected = _messageFor(
           messages,
@@ -1553,6 +1588,7 @@ class _MailHomePageState extends State<MailHomePage>
                         (drawerContext) => _Sidebar(
                           accounts: _accounts,
                           folders: _folders,
+                          accountFailures: _accountSyncFailures,
                           view: _view,
                           onViewChanged: (nextView) {
                             Navigator.of(drawerContext).pop();
@@ -1563,6 +1599,7 @@ class _MailHomePageState extends State<MailHomePage>
                                   unawaited(_showMailboxSettings(account)),
                           onAddMailbox: _showAddMailbox,
                           onDeleteAccount: _deleteMailbox,
+                          onResolveAccountFailure: _resolveAccountSyncFailure,
                         ),
                   ),
                 ),
@@ -1637,6 +1674,7 @@ class _MailHomePageState extends State<MailHomePage>
                         _Sidebar(
                           accounts: _accounts,
                           folders: _folders,
+                          accountFailures: _accountSyncFailures,
                           view: _view,
                           onViewChanged: _changeView,
                           onAccountSettings:
@@ -1644,6 +1682,7 @@ class _MailHomePageState extends State<MailHomePage>
                                   unawaited(_showMailboxSettings(account)),
                           onAddMailbox: _showAddMailbox,
                           onDeleteAccount: _deleteMailbox,
+                          onResolveAccountFailure: _resolveAccountSyncFailure,
                         ),
                         const VerticalDivider(width: 1),
                       ],
@@ -2315,6 +2354,24 @@ class _MailHomePageState extends State<MailHomePage>
     }
   }
 
+  Future<void> _resolveAccountSyncFailure(MailAccount account) async {
+    final failure = _accountSyncFailures[account.id];
+    if (failure == null) return;
+    if (!failure.authenticationRequired) {
+      await _loadMessages();
+      return;
+    }
+    final item =
+        _vaultDocument?.items
+            .where((candidate) => candidate.id == account.id)
+            .firstOrNull;
+    if (item == null || item.kind != VaultItemKind.oauth) {
+      await _showMailboxSettings(account);
+      return;
+    }
+    await _reauthorizeMailboxItem(item);
+  }
+
   Future<void> _editMailboxItem(VaultMailboxItem item) async {
     final updated = await showDialog<VaultMailboxItem>(
       context: context,
@@ -2348,6 +2405,7 @@ class _MailHomePageState extends State<MailHomePage>
         oauthClient: widget.oauthClient,
         provider: provider,
         clientId: clientId,
+        androidClientId: _oauthAndroidClientIdForProvider(item.provider),
         clientSecret: clientSecret,
         loginHint: item.address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(item.provider),
@@ -2413,13 +2471,13 @@ class _MailHomePageState extends State<MailHomePage>
     await _applyVaultDocument(updatedDocument);
     final synced = await _syncVaultRecordsWithServer(silent: true);
     if (!mounted) return;
-    setState(
-      () =>
-          _banner =
-              synced || _session == null
-                  ? successBanner
-                  : '$successBanner Sync will retry later.',
-    );
+    setState(() {
+      _accountSyncFailures.remove(item.id);
+      _banner =
+          synced || _session == null
+              ? successBanner
+              : '$successBanner Sync will retry later.';
+    });
   }
 
   Uri? _oauthMobileRedirectUriForProvider(String provider) {
@@ -3506,7 +3564,11 @@ class _MailHomePageState extends State<MailHomePage>
             : MailMessagePage(messages: _messages, hasMore: _hasMoreMessages);
     final messages = _visibleMessagesForDisplay(page.messages);
     if (!mounted) return;
+    final nextAccountIds = accounts.map((account) => account.id).toSet();
     setState(() {
+      _accountSyncFailures.removeWhere(
+        (accountId, _) => !nextAccountIds.contains(accountId),
+      );
       _accounts = accounts;
       _folders = folders;
       _view = activeView;
@@ -3522,7 +3584,6 @@ class _MailHomePageState extends State<MailHomePage>
         _hasMoreMessages = page.hasMore;
       }
     });
-    final nextAccountIds = accounts.map((account) => account.id).toSet();
     final accountsChanged = !setEquals(previousAccountIds, nextAccountIds);
     if (accountsChanged) {
       _resetNewMailNotificationBaseline();
@@ -3583,15 +3644,19 @@ class _MailHomePageState extends State<MailHomePage>
     return null;
   }
 
-  Future<void> _refreshOAuthVaultIfNeeded({bool force = false}) {
-    if (force) {
+  Future<OAuthVaultRefreshResult?> _refreshOAuthVaultIfNeeded({
+    bool force = false,
+    Set<String>? accountIds,
+  }) {
+    if (force || accountIds != null) {
       return _refreshOAuthVaultIfNeededUnshared(
-        force: true,
+        force: force,
+        accountIds: accountIds,
       ).timeout(_oauthRefreshTimeout);
     }
     final current = _oauthRefreshFuture;
     if (current != null) return current;
-    late final Future<void> refresh;
+    late final Future<OAuthVaultRefreshResult?> refresh;
     refresh = _refreshOAuthVaultIfNeededUnshared()
         .timeout(_oauthRefreshTimeout)
         .whenComplete(() {
@@ -3603,7 +3668,10 @@ class _MailHomePageState extends State<MailHomePage>
     return refresh;
   }
 
-  Future<void> _refreshOAuthVaultIfNeededUnshared({bool force = false}) async {
+  Future<OAuthVaultRefreshResult?> _refreshOAuthVaultIfNeededUnshared({
+    bool force = false,
+    Set<String>? accountIds,
+  }) async {
     final profile = _profile;
     final session = _session;
     final document = _vaultDocument;
@@ -3619,11 +3687,11 @@ class _MailHomePageState extends State<MailHomePage>
 
     if (document == null) {
       _debugVault('oauth refresh: skipped, vault document is not loaded');
-      return;
+      return null;
     }
     if (profile == null && session == null) {
       _debugVault('oauth refresh: skipped, no local or sync account context');
-      return;
+      return null;
     }
     try {
       final result = await OAuthVaultRefresher(
@@ -3643,6 +3711,9 @@ class _MailHomePageState extends State<MailHomePage>
             oauthClient: widget.oauthClient,
             provider: provider,
             clientId: clientId,
+            androidClientId: _oauthAndroidClientIdForProvider(
+              provider.provider,
+            ),
             clientSecret: clientSecret,
             loginHint: loginHint,
             mobileRedirectUri: _oauthMobileRedirectUriForProvider(
@@ -3655,14 +3726,33 @@ class _MailHomePageState extends State<MailHomePage>
         clientIdForProvider: _oauthClientIdForProvider,
         clientSecretForProvider: _oauthClientSecretForProvider,
         force: force,
+        itemIds: accountIds,
       );
-      if (!isCurrentVaultContext()) return;
+      if (!isCurrentVaultContext()) return result;
+      setState(() {
+        for (final accountId in result.refreshedItemIds) {
+          _accountSyncFailures.remove(accountId);
+        }
+        for (final failure in result.failures) {
+          _accountSyncFailures[failure.itemId] = MailAccountSyncFailure(
+            accountId: failure.itemId,
+            message: failure.message,
+            authenticationRequired: looksLikeMailAuthenticationFailure(
+              failure.message,
+            ),
+          );
+        }
+        if (result.failures.isNotEmpty) {
+          final first = result.failures.first;
+          _banner = 'OAuth token refresh failed for ${first.address}.';
+        }
+      });
       if (result.changed) {
         _debugVault(
           'oauth refresh: refreshed ${result.refreshedCount} token(s)',
         );
         final localProfile = profile ?? await _ensureLocalProfile();
-        if (!isCurrentVaultContext()) return;
+        if (!isCurrentVaultContext()) return result;
         if (localProfile != null) {
           await _saveLocalVaultDocument(
             profile: localProfile,
@@ -3671,7 +3761,7 @@ class _MailHomePageState extends State<MailHomePage>
         } else {
           _debugVault('oauth refresh: refreshed token kept in memory only');
         }
-        if (!isCurrentVaultContext()) return;
+        if (!isCurrentVaultContext()) return result;
         await _applyVaultDocument(
           result.document,
           loadMessages: false,
@@ -3679,33 +3769,29 @@ class _MailHomePageState extends State<MailHomePage>
         );
         await _syncVaultRecordsWithServer(silent: true);
       }
-      if (result.failures.isNotEmpty && isCurrentVaultContext()) {
-        final first = result.failures.first;
-        setState(
-          () => _banner = 'OAuth token refresh failed for ${first.address}.',
-        );
-      }
+      return result;
     } catch (error) {
       if (isCurrentVaultContext()) {
         setState(() => _banner = 'OAuth token refresh failed: $error');
       }
+      return null;
     }
   }
 
   String _oauthClientIdForProvider(String provider) {
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
-    if (io.Platform.isAndroid) {
+    final normalizedProvider = normalizeOAuthProviderKey(provider);
+    if (io.Platform.isAndroid && normalizedProvider != 'gmail') {
       final vaultAndroidClientId = vaultConfig?.androidClientId.trim() ?? '';
       if (vaultAndroidClientId.isNotEmpty) return vaultAndroidClientId;
-      return switch (provider) {
-        'gmail' => widget.gmailAndroidOAuthClientId.trim(),
+      return switch (normalizedProvider) {
         'outlook' => widget.outlookAndroidOAuthClientId.trim(),
         _ => '',
       };
     }
     final vaultClientId = vaultConfig?.clientId.trim() ?? '';
     if (vaultClientId.isNotEmpty) return vaultClientId;
-    return switch (provider) {
+    return switch (normalizedProvider) {
       'gmail' => widget.gmailOAuthClientId.trim(),
       'outlook' => widget.outlookOAuthClientId.trim(),
       _ => '',
@@ -3713,14 +3799,13 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   String _oauthClientSecretForProvider(String provider) {
-    if (_usesGoogleAndroidOAuth(provider)) return '';
     final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
-    if (io.Platform.isAndroid) {
+    final normalizedProvider = normalizeOAuthProviderKey(provider);
+    if (io.Platform.isAndroid && normalizedProvider != 'gmail') {
       if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
         return vaultConfig!.androidClientSecret.trim();
       }
-      return switch (provider) {
-        'gmail' => widget.gmailAndroidOAuthClientSecret.trim(),
+      return switch (normalizedProvider) {
         'outlook' => widget.outlookAndroidOAuthClientSecret.trim(),
         _ => '',
       };
@@ -3728,11 +3813,19 @@ class _MailHomePageState extends State<MailHomePage>
     if (vaultConfig?.clientId.trim().isNotEmpty == true) {
       return vaultConfig!.clientSecret.trim();
     }
-    return switch (provider) {
+    return switch (normalizedProvider) {
       'gmail' => widget.gmailOAuthClientSecret.trim(),
       'outlook' => widget.outlookOAuthClientSecret.trim(),
       _ => '',
     };
+  }
+
+  String _oauthAndroidClientIdForProvider(String provider) {
+    if (!_usesGoogleAndroidOAuth(provider)) return '';
+    final vaultConfig = _vaultDocument?.oauthProviderFor(provider);
+    final clientId = vaultConfig?.androidClientId.trim() ?? '';
+    if (clientId.isNotEmpty) return clientId;
+    return widget.gmailAndroidOAuthClientId.trim();
   }
 
   Future<void> _sendReply(
@@ -5966,20 +6059,24 @@ class _Sidebar extends StatefulWidget {
   const _Sidebar({
     required this.accounts,
     required this.folders,
+    required this.accountFailures,
     required this.view,
     required this.onViewChanged,
     required this.onAccountSettings,
     required this.onAddMailbox,
     required this.onDeleteAccount,
+    required this.onResolveAccountFailure,
   });
 
   final List<MailAccount> accounts;
   final List<MailFolder> folders;
+  final Map<String, MailAccountSyncFailure> accountFailures;
   final MailboxView view;
   final ValueChanged<MailboxView> onViewChanged;
   final ValueChanged<MailAccount> onAccountSettings;
   final VoidCallback onAddMailbox;
   final ValueChanged<MailAccount> onDeleteAccount;
+  final ValueChanged<MailAccount> onResolveAccountFailure;
 
   @override
   State<_Sidebar> createState() => _SidebarState();
@@ -6094,6 +6191,12 @@ class _SidebarState extends State<_Sidebar> {
     String filter,
   ) {
     final filtering = filter.isNotEmpty;
+    final failure = widget.accountFailures[account.id];
+    final failureLabel =
+        failure?.authenticationRequired == true
+            ? 'Authorization required'
+            : 'Sync failed';
+    final colorScheme = Theme.of(context).colorScheme;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onSecondaryTapDown:
@@ -6124,16 +6227,45 @@ class _SidebarState extends State<_Sidebar> {
             filtering ||
             widget.view.folder?.accountId == account.id ||
             widget.accounts.length == 1,
-        leading: const Icon(Icons.alternate_email),
-        title: Text(
-          account.displayName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+        leading: Icon(
+          failure == null
+              ? Icons.alternate_email
+              : failure.authenticationRequired
+              ? Icons.key_off_outlined
+              : Icons.sync_problem_outlined,
+          color: failure == null ? null : colorScheme.error,
+        ),
+        title: Row(
+          children: [
+            Expanded(
+              child: Text(
+                account.displayName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (failure != null)
+              IconButton(
+                tooltip:
+                    failure.authenticationRequired
+                        ? 'Reauthorize ${account.address}'
+                        : 'Retry ${account.address}',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => widget.onResolveAccountFailure(account),
+                icon: Icon(
+                  failure.authenticationRequired ? Icons.key : Icons.refresh,
+                  size: 18,
+                ),
+              ),
+          ],
         ),
         subtitle: Text(
-          account.address,
-          maxLines: 1,
+          failure == null
+              ? account.address
+              : '$failureLabel\n${account.address}',
+          maxLines: failure == null ? 1 : 2,
           overflow: TextOverflow.ellipsis,
+          style: failure == null ? null : TextStyle(color: colorScheme.error),
         ),
         children: [
           for (final folder in visibleFolders)
@@ -11484,9 +11616,9 @@ class _OAuthProviderSettingsDialogState
           ],
         ),
         const SizedBox(height: 10),
-        if (!showAndroidFields) ...[
+        if (!showAndroidFields || usesNativeGoogleAndroid) ...[
           Text(
-            'Desktop',
+            usesNativeGoogleAndroid ? 'Web server' : 'Desktop',
             style: textTheme.labelLarge?.copyWith(color: colorScheme.primary),
           ),
           const SizedBox(height: 8),
@@ -11496,8 +11628,12 @@ class _OAuthProviderSettingsDialogState
             autocorrect: false,
             enableSuggestions: false,
             decoration: InputDecoration(
-              labelText: 'Client ID',
-              hintText: _clientIdHint(provider),
+              labelText:
+                  usesNativeGoogleAndroid ? 'Web client ID' : 'Client ID',
+              hintText:
+                  usesNativeGoogleAndroid
+                      ? 'Google OAuth Web client ID'
+                      : _clientIdHint(provider),
               prefixIcon: const Icon(Icons.badge_outlined),
             ),
           ),
@@ -11508,7 +11644,10 @@ class _OAuthProviderSettingsDialogState
             autocorrect: false,
             enableSuggestions: false,
             decoration: InputDecoration(
-              labelText: 'Client secret',
+              labelText:
+                  usesNativeGoogleAndroid
+                      ? 'Web client secret'
+                      : 'Client secret',
               prefixIcon: const Icon(Icons.key_outlined),
               suffixIcon: IconButton(
                 tooltip: showSecret ? 'Hide secret' : 'Show secret',
@@ -11525,7 +11664,8 @@ class _OAuthProviderSettingsDialogState
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              'Build fallback: ${_fallbackStatus(buildClientId, buildClientSecret)}',
+              '${usesNativeGoogleAndroid ? 'Web' : 'Build'} fallback: '
+              '${_fallbackStatus(buildClientId, buildClientSecret)}',
               style: textTheme.bodySmall?.copyWith(
                 color: colorScheme.onSurfaceVariant,
               ),
@@ -11555,7 +11695,8 @@ class _OAuthProviderSettingsDialogState
             Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                'Google Android OAuth uses package name and SHA-1. It does not use an Android client secret or custom redirect URI.',
+                'The Android client uses package name and SHA-1. The Web client '
+                'from the same Google Cloud project provides offline refresh tokens.',
                 style: textTheme.bodySmall?.copyWith(
                   color: colorScheme.onSurfaceVariant,
                 ),
@@ -12965,6 +13106,7 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
         oauthClient: widget.oauthClient,
         provider: oauthProvider,
         clientId: clientId,
+        androidClientId: _oauthAndroidClientIdForProvider(_provider),
         clientSecret: clientSecret,
         loginHint: address,
         mobileRedirectUri: _oauthMobileRedirectUriForProvider(_provider),
@@ -13099,18 +13241,18 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
 
   String _oauthClientIdForProvider(String provider) {
     final vaultConfig = widget.document.oauthProviderFor(provider);
-    if (io.Platform.isAndroid) {
+    final normalizedProvider = normalizeOAuthProviderKey(provider);
+    if (io.Platform.isAndroid && normalizedProvider != 'gmail') {
       final androidClientId = vaultConfig?.androidClientId.trim() ?? '';
       if (androidClientId.isNotEmpty) return androidClientId;
-      return switch (provider) {
-        'gmail' => widget.gmailAndroidOAuthClientId.trim(),
+      return switch (normalizedProvider) {
         'outlook' => widget.outlookAndroidOAuthClientId.trim(),
         _ => '',
       };
     }
     final vaultClientId = vaultConfig?.clientId.trim() ?? '';
     if (vaultClientId.isNotEmpty) return vaultClientId;
-    return switch (provider) {
+    return switch (normalizedProvider) {
       'gmail' => widget.gmailOAuthClientId.trim(),
       'outlook' => widget.outlookOAuthClientId.trim(),
       _ => '',
@@ -13118,14 +13260,13 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
   }
 
   String _oauthClientSecretForProvider(String provider) {
-    if (_usesGoogleAndroidOAuth(provider)) return '';
     final vaultConfig = widget.document.oauthProviderFor(provider);
-    if (io.Platform.isAndroid) {
+    final normalizedProvider = normalizeOAuthProviderKey(provider);
+    if (io.Platform.isAndroid && normalizedProvider != 'gmail') {
       if (vaultConfig?.androidClientId.trim().isNotEmpty == true) {
         return vaultConfig!.androidClientSecret.trim();
       }
-      return switch (provider) {
-        'gmail' => widget.gmailAndroidOAuthClientSecret.trim(),
+      return switch (normalizedProvider) {
         'outlook' => widget.outlookAndroidOAuthClientSecret.trim(),
         _ => '',
       };
@@ -13133,11 +13274,19 @@ class _AddMailboxDialogState extends State<_AddMailboxDialog> {
     if (vaultConfig?.clientId.trim().isNotEmpty == true) {
       return vaultConfig!.clientSecret.trim();
     }
-    return switch (provider) {
+    return switch (normalizedProvider) {
       'gmail' => widget.gmailOAuthClientSecret.trim(),
       'outlook' => widget.outlookOAuthClientSecret.trim(),
       _ => '',
     };
+  }
+
+  String _oauthAndroidClientIdForProvider(String provider) {
+    if (!_usesGoogleAndroidOAuth(provider)) return '';
+    final vaultConfig = widget.document.oauthProviderFor(provider);
+    final clientId = vaultConfig?.androidClientId.trim() ?? '';
+    if (clientId.isNotEmpty) return clientId;
+    return widget.gmailAndroidOAuthClientId.trim();
   }
 
   Uri? _oauthMobileRedirectUriForProvider(String provider) {

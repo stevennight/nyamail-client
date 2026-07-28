@@ -5,6 +5,14 @@ import 'package:flutter/services.dart';
 import 'oauth_loopback_client.dart';
 import 'oauth_provider.dart';
 
+typedef GoogleServerAuthorizationCodeExchange =
+    Future<OAuthTokenSet> Function({
+      required OAuthProviderConfig provider,
+      required String clientId,
+      String? clientSecret,
+      required String code,
+    });
+
 class GoogleAndroidOAuthClient {
   const GoogleAndroidOAuthClient({
     MethodChannel channel = const MethodChannel(
@@ -21,9 +29,14 @@ class GoogleAndroidOAuthClient {
 
   Future<OAuthTokenSet> authorize({
     required OAuthProviderConfig provider,
-    String clientId = '',
+    required String androidClientId,
+    required String serverClientId,
+    required String serverClientSecret,
+    required GoogleServerAuthorizationCodeExchange
+    exchangeServerAuthorizationCode,
     String? loginHint,
     bool forceAccountPicker = false,
+    bool forceRefreshToken = true,
     OAuthAuthorizationProgressCallback? onProgress,
   }) async {
     if (!isSupported) {
@@ -36,16 +49,31 @@ class GoogleAndroidOAuthClient {
         'Google Android authorization does not support ${provider.provider}.',
       );
     }
+    if (androidClientId.trim().isEmpty) {
+      throw const OAuthLoopbackException(
+        'Google Android client ID is not configured.',
+      );
+    }
+    if (serverClientId.trim().isEmpty) {
+      throw const OAuthLoopbackException(
+        'Google Web client ID is not configured for Android offline access.',
+      );
+    }
+    if (serverClientSecret.trim().isEmpty) {
+      throw const OAuthLoopbackException(
+        'Google Web client secret is not configured for Android offline access.',
+      );
+    }
     onProgress?.call(OAuthAuthorizationProgress.waitingForAuthorization);
-    final raw = await _channel.invokeMapMethod<String, Object?>(
-      'authorizeGmail',
-      {
-        'clientId': clientId,
-        'loginHint': loginHint ?? '',
-        'forceAccountPicker': forceAccountPicker,
-        'scopes': provider.scopes,
-      },
-    );
+    final raw = await _channel
+        .invokeMapMethod<String, Object?>('authorizeGmail', {
+          'androidClientId': androidClientId.trim(),
+          'serverClientId': serverClientId.trim(),
+          'loginHint': loginHint ?? '',
+          'forceAccountPicker': forceAccountPicker,
+          'forceRefreshToken': forceRefreshToken,
+          'scopes': provider.scopes,
+        });
     onProgress?.call(OAuthAuthorizationProgress.exchangingToken);
     final result = raw ?? const <String, Object?>{};
     final expectedEmail = loginHint?.trim() ?? '';
@@ -58,28 +86,26 @@ class GoogleAndroidOAuthClient {
         '$expectedEmail. Choose the same Google account as the mailbox address.',
       );
     }
-    final accessToken = (result['accessToken'] as String? ?? '').trim();
-    if (accessToken.isEmpty) {
+    final serverAuthCode = (result['serverAuthCode'] as String? ?? '').trim();
+    if (serverAuthCode.isEmpty) {
       throw const OAuthLoopbackException(
-        'Google Android authorization did not return an access token.',
+        'Google Android authorization did not return a server authorization '
+        'code. Verify that the Web client belongs to the same Google Cloud '
+        'project as the Android client.',
       );
     }
-    final expiresIn = int.tryParse('${result['expiresIn'] ?? ''}') ?? 3300;
-    final grantedScopes = _scopeValue(result['grantedScopes']).trim();
-    return OAuthTokenSet(
-      accessToken: accessToken,
-      tokenType: (result['tokenType'] as String? ?? 'Bearer').trim(),
-      refreshToken: (result['refreshToken'] as String?)?.trim(),
-      expiresIn: expiresIn,
-      scope: grantedScopes.isEmpty ? provider.scopes.join(' ') : grantedScopes,
+    final tokenSet = await exchangeServerAuthorizationCode(
+      provider: provider,
+      clientId: serverClientId.trim(),
+      clientSecret: serverClientSecret.trim(),
+      code: serverAuthCode,
     );
-  }
-
-  String _scopeValue(Object? value) {
-    if (value is String) return value;
-    if (value is Iterable) {
-      return value.map((item) => item.toString()).join(' ');
+    if (tokenSet.refreshToken?.trim().isEmpty ?? true) {
+      throw const OAuthLoopbackException(
+        'Google token exchange did not return a refresh token. Revoke the '
+        'existing grant and authorize again.',
+      );
     }
-    return '';
+    return tokenSet;
   }
 }

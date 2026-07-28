@@ -203,6 +203,37 @@ void main() {
     },
   );
 
+  test(
+    'server authorization code exchange uses web client without browser fields',
+    () async {
+      final server = await _FakeOAuthServer.start();
+      try {
+        final provider = OAuthProviderConfig(
+          provider: 'test',
+          authorizationEndpoint: server.authorizationEndpoint,
+          tokenEndpoint: server.tokenEndpoint,
+          scopes: const ['mail.read'],
+        );
+        final tokenSet = await OAuthLoopbackClient()
+            .exchangeServerAuthorizationCode(
+              provider: provider,
+              clientId: 'web-client-id',
+              clientSecret: 'web-client-secret',
+              code: 'server-auth-code',
+            );
+
+        expect(tokenSet.refreshToken, 'refresh-token');
+        expect(server.tokenBody['client_id'], 'web-client-id');
+        expect(server.tokenBody['client_secret'], 'web-client-secret');
+        expect(server.tokenBody['grant_type'], 'authorization_code');
+        expect(server.tokenBody['code'], 'server-auth-code');
+        expect(server.tokenBody.containsKey('redirect_uri'), isFalse);
+        expect(server.tokenBody.containsKey('code_verifier'), isFalse);
+      } finally {
+        await server.close();
+      }
+    },
+  );
   test('loopback client rejects state mismatch', () async {
     final server = await _FakeOAuthServer.start();
     try {

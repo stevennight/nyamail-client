@@ -1638,6 +1638,159 @@ void main() {
     expect(inbox.single.subject, 'Recover me');
   });
 
+  test(
+    'viewPage keeps healthy providers updating when one account auth fails',
+    () async {
+      final transport =
+          _RecordingTransport()
+            ..previewErrorsByCredential['gmail'] = const MailTransportException(
+              'IMAP command failed: AUTHENTICATIONFAILED invalid token',
+            )
+            ..messagesByCredential['outlook'] = [
+              MailMessage(
+                id: 'outlook:inbox:42',
+                accountId: 'outlook',
+                from: 'Sender <sender@example.com>',
+                subject: 'Healthy provider mail',
+                preview: 'Delivered while Gmail is disconnected',
+                body: 'Delivered while Gmail is disconnected',
+                receivedAt: DateTime.utc(2026, 7, 27, 8),
+              ),
+            ];
+      final repository = CachedTransportMailRepository(
+        cache: _MemoryMailCache(),
+        transport: transport,
+        credentials: const [
+          MailboxCredential(
+            accountId: 'gmail',
+            address: 'me@gmail.com',
+            displayName: 'Gmail',
+            imapHost: 'imap.gmail.com',
+            imapPort: 993,
+            smtpHost: 'smtp.gmail.com',
+            smtpPort: 465,
+            username: 'me@gmail.com',
+            secret: 'expired-token',
+            authType: MailboxAuthType.oauth2,
+          ),
+          MailboxCredential(
+            accountId: 'outlook',
+            address: 'me@outlook.com',
+            displayName: 'Outlook',
+            imapHost: 'outlook.office365.com',
+            imapPort: 993,
+            smtpHost: 'smtp-mail.outlook.com',
+            smtpPort: 587,
+            username: 'me@outlook.com',
+            secret: 'current-token',
+            authType: MailboxAuthType.oauth2,
+          ),
+        ],
+      );
+
+      final page = await repository.viewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+      );
+
+      expect(
+        page.messages.map((message) => message.subject),
+        contains('Healthy provider mail'),
+      );
+      expect(page.syncedAccountIds, {'outlook'});
+      expect(page.accountFailures, hasLength(1));
+      expect(page.accountFailures.single.accountId, 'gmail');
+      expect(page.accountFailures.single.authenticationRequired, isTrue);
+    },
+  );
+
+  test(
+    'viewPage returns cached mail and per-account failures when all fail',
+    () async {
+      final transport =
+          _RecordingTransport()
+            ..previewErrorsByCredential.addAll({
+              'gmail': const MailTransportException(
+                'IMAP command failed: AUTHENTICATIONFAILED invalid token',
+              ),
+              'outlook': const SocketException('Network unreachable'),
+            });
+      final cache = _MemoryMailCache();
+      await cache.saveMessages([
+        MailMessage(
+          id: 'gmail:inbox:1',
+          accountId: 'gmail',
+          from: 'Cached Gmail',
+          subject: 'Cached Gmail mail',
+          preview: 'Available offline',
+          body: 'Available offline',
+          receivedAt: DateTime.utc(2026, 7, 26),
+        ),
+        MailMessage(
+          id: 'outlook:inbox:1',
+          accountId: 'outlook',
+          from: 'Cached Outlook',
+          subject: 'Cached Outlook mail',
+          preview: 'Available offline',
+          body: 'Available offline',
+          receivedAt: DateTime.utc(2026, 7, 25),
+        ),
+      ]);
+      final repository = CachedTransportMailRepository(
+        cache: cache,
+        transport: transport,
+        credentials: const [
+          MailboxCredential(
+            accountId: 'gmail',
+            address: 'me@gmail.com',
+            displayName: 'Gmail',
+            imapHost: 'imap.gmail.com',
+            imapPort: 993,
+            smtpHost: 'smtp.gmail.com',
+            smtpPort: 465,
+            username: 'me@gmail.com',
+            secret: 'expired-token',
+            authType: MailboxAuthType.oauth2,
+          ),
+          MailboxCredential(
+            accountId: 'outlook',
+            address: 'me@outlook.com',
+            displayName: 'Outlook',
+            imapHost: 'outlook.office365.com',
+            imapPort: 993,
+            smtpHost: 'smtp-mail.outlook.com',
+            smtpPort: 587,
+            username: 'me@outlook.com',
+            secret: 'current-token',
+            authType: MailboxAuthType.oauth2,
+          ),
+        ],
+      );
+
+      final page = await repository.viewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+      );
+
+      expect(page.messages, hasLength(2));
+      expect(page.syncedAccountIds, isEmpty);
+      expect(page.accountFailures.map((failure) => failure.accountId).toSet(), {
+        'gmail',
+        'outlook',
+      });
+      expect(
+        page.accountFailures
+            .singleWhere((failure) => failure.accountId == 'gmail')
+            .authenticationRequired,
+        isTrue,
+      );
+      expect(
+        page.accountFailures
+            .singleWhere((failure) => failure.accountId == 'outlook')
+            .authenticationRequired,
+        isFalse,
+      );
+    },
+  );
+
   test('downloadAttachment stores sanitized attachment bytes', () async {
     final transport =
         _RecordingTransport()
@@ -2121,6 +2274,7 @@ class _RecordingTransport implements MailTransport, IncrementalMailTransport {
   final messagesByCredential = <String, List<MailMessage>>{};
   final foldersByCredential = <String, List<MailFolder>>{};
   final messagesByFolder = <String, List<MailMessage>>{};
+  final previewErrorsByCredential = <String, Object>{};
   final bodyById = <String, MailMessage>{};
   final fetchedCredentialIds = <String>[];
   final fetchedBeforeUids = <int?>[];
@@ -2145,6 +2299,13 @@ class _RecordingTransport implements MailTransport, IncrementalMailTransport {
 
   void _endPreviewFetch() {
     activePreviewFetches--;
+  }
+
+  void _throwPreviewErrorIfNeeded(MailboxCredential credential) {
+    final error = previewErrorsByCredential[credential.accountId];
+    if (error == null) return;
+    _endPreviewFetch();
+    throw error;
   }
 
   @override
@@ -2198,6 +2359,7 @@ class _RecordingTransport implements MailTransport, IncrementalMailTransport {
     int? beforeUid,
   }) async {
     await _beginPreviewFetch();
+    _throwPreviewErrorIfNeeded(credential);
     fetchedCredentialIds.add(credential.accountId);
     fetchedMailbox = mailbox;
     fetchedLimit = limit;
@@ -2243,6 +2405,7 @@ class _RecordingTransport implements MailTransport, IncrementalMailTransport {
     int? beforeUid,
   }) async {
     await _beginPreviewFetch();
+    _throwPreviewErrorIfNeeded(credential);
     fetchedCredentialIds.add(credential.accountId);
     fetchedMailbox = folder.kind;
     fetchedLimit = limit;
@@ -2291,6 +2454,7 @@ class _RecordingTransport implements MailTransport, IncrementalMailTransport {
     int limit = 30,
   }) async {
     await _beginPreviewFetch();
+    _throwPreviewErrorIfNeeded(credential);
     incrementalPreviewFetchRequestCount++;
     final messages = [
       for (final message in _messagesForFolder(credential, folder))

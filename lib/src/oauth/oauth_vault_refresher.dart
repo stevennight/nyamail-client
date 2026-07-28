@@ -40,16 +40,19 @@ class OAuthVaultRefresher {
     String Function(String provider) clientSecretForProvider =
         _emptyOAuthClientSecret,
     bool force = false,
+    Set<String>? itemIds,
   }) async {
     final now = _clock().toUtc();
     final threshold = now.add(_refreshBefore);
     final nextItems = <VaultMailboxItem>[];
     final failures = <OAuthVaultRefreshFailure>[];
+    final refreshedItemIds = <String>{};
     var refreshedCount = 0;
 
     for (final item in document.items) {
       var next = item;
-      if (_shouldRefresh(item, threshold, force: force)) {
+      if ((itemIds == null || itemIds.contains(item.id)) &&
+          _shouldRefresh(item, threshold, force: force)) {
         final clientId =
             item.oauthClientId.trim().isNotEmpty
                 ? item.oauthClientId.trim()
@@ -97,6 +100,7 @@ class OAuthVaultRefresher {
               tokenScope: tokenSet.scope ?? item.tokenScope,
             );
             refreshedCount++;
+            refreshedItemIds.add(item.id);
           } catch (error) {
             failures.add(
               OAuthVaultRefreshFailure(
@@ -115,6 +119,7 @@ class OAuthVaultRefresher {
       document:
           refreshedCount == 0 ? document : document.copyWith(items: nextItems),
       refreshedCount: refreshedCount,
+      refreshedItemIds: refreshedItemIds,
       failures: failures,
     );
   }
@@ -144,11 +149,13 @@ class OAuthVaultRefreshResult {
   const OAuthVaultRefreshResult({
     required this.document,
     required this.refreshedCount,
+    this.refreshedItemIds = const <String>{},
     this.failures = const [],
   });
 
   final VaultDocument document;
   final int refreshedCount;
+  final Set<String> refreshedItemIds;
   final List<OAuthVaultRefreshFailure> failures;
 
   bool get changed => refreshedCount > 0;

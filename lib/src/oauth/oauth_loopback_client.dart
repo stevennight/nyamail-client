@@ -301,6 +301,27 @@ class OAuthLoopbackClient {
     return OAuthTokenSet.fromJson(_decodeJson(response));
   }
 
+  Future<OAuthTokenSet> exchangeServerAuthorizationCode({
+    required OAuthProviderConfig provider,
+    required String clientId,
+    String? clientSecret,
+    required String code,
+  }) async {
+    final response = await _httpClient
+        .post(
+          provider.tokenEndpoint,
+          headers: const {'content-type': 'application/x-www-form-urlencoded'},
+          body: _tokenRequestBody({
+            'client_id': clientId,
+            'client_secret': clientSecret,
+            'grant_type': 'authorization_code',
+            'code': code,
+          }),
+        )
+        .timeout(_oauthTokenRequestTimeout);
+    return OAuthTokenSet.fromJson(_decodeJson(response));
+  }
+
   Map<String, String> _tokenRequestBody(Map<String, String?> values) {
     return {
       for (final entry in values.entries)
