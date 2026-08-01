@@ -2048,6 +2048,7 @@ class _MailHomePageState extends State<MailHomePage>
 
   Future<void> _showSettings() async {
     var keepOpen = true;
+    _SettingsFeedback? feedback;
     while (keepOpen) {
       if (!mounted) return;
       final smallScreen = MediaQuery.sizeOf(context).width < 720;
@@ -2063,6 +2064,7 @@ class _MailHomePageState extends State<MailHomePage>
                         accountCount: _accounts.length,
                         claimingVaultShare: _claimingVaultShare,
                         hasPendingPairingQr: _pendingPairingPackage != null,
+                        feedback: feedback,
                       ),
                 ),
               )
@@ -2075,9 +2077,16 @@ class _MailHomePageState extends State<MailHomePage>
                       accountCount: _accounts.length,
                       claimingVaultShare: _claimingVaultShare,
                       hasPendingPairingQr: _pendingPairingPackage != null,
+                      feedback: feedback,
                     ),
               );
       if (!mounted || action == null) return;
+      feedback = null;
+      if (action == _SettingsAction.addMailbox) {
+        feedback = await _showAddMailbox(showResultNotice: false);
+        keepOpen = true;
+        continue;
+      }
       keepOpen = await _handleSettingsAction(action);
     }
   }
@@ -3395,10 +3404,12 @@ class _MailHomePageState extends State<MailHomePage>
     }
   }
 
-  Future<void> _showAddMailbox() async {
+  Future<_SettingsFeedback?> _showAddMailbox({
+    bool showResultNotice = true,
+  }) async {
     final profile = await _ensureLocalProfile();
-    if (profile == null) return;
-    if (!mounted) return;
+    if (profile == null) return null;
+    if (!mounted) return null;
     final added = await showDialog<_AddMailboxResult>(
       context: context,
       builder:
@@ -3420,21 +3431,37 @@ class _MailHomePageState extends State<MailHomePage>
                 widget.outlookAndroidOAuthRedirectUri,
           ),
     );
-    if (added == null) return;
-    await _saveLocalVaultDocument(profile: profile, document: added.document);
-    await _applyVaultDocument(added.document);
-    final synced = await _syncVaultRecordsWithServer(silent: true);
-    if (!mounted) return;
-    setState(() {
-      _banner =
+    if (added == null) return null;
+    try {
+      await _saveLocalVaultDocument(profile: profile, document: added.document);
+      await _applyVaultDocument(added.document);
+      final synced = await _syncVaultRecordsWithServer(silent: true);
+      if (!mounted) return null;
+      final feedback =
           synced || _session == null
-              ? null
-              : '${added.mailbox.address} was added locally. Sync will retry later.';
-    });
-    if (synced || _session == null) {
-      _showTransientNotice(
-        '${added.mailbox.address} was added to the local encrypted vault.',
+              ? _SettingsFeedback(
+                message:
+                    '${added.mailbox.address} was added to the local encrypted vault.',
+              )
+              : _SettingsFeedback(
+                message:
+                    '${added.mailbox.address} was added locally. Sync will retry later.',
+                warning: true,
+              );
+      if (showResultNotice) {
+        _showTransientNotice(feedback.message);
+      }
+      return feedback;
+    } catch (error) {
+      if (!mounted) return null;
+      final feedback = _SettingsFeedback(
+        message: 'Could not add ${added.mailbox.address}: $error',
+        error: true,
       );
+      if (showResultNotice) {
+        _showTransientNotice(feedback.message, error: true);
+      }
+      return feedback;
     }
   }
 
@@ -5572,6 +5599,18 @@ enum _SettingsAction {
   showPairingQr,
 }
 
+class _SettingsFeedback {
+  const _SettingsFeedback({
+    required this.message,
+    this.warning = false,
+    this.error = false,
+  });
+
+  final String message;
+  final bool warning;
+  final bool error;
+}
+
 class _SettingsDialog extends StatelessWidget {
   const _SettingsDialog({
     required this.session,
@@ -5579,6 +5618,7 @@ class _SettingsDialog extends StatelessWidget {
     required this.accountCount,
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
+    this.feedback,
   });
 
   final LocalSession? session;
@@ -5586,6 +5626,7 @@ class _SettingsDialog extends StatelessWidget {
   final int accountCount;
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
+  final _SettingsFeedback? feedback;
 
   @override
   Widget build(BuildContext context) {
@@ -5600,6 +5641,7 @@ class _SettingsDialog extends StatelessWidget {
           accountCount: accountCount,
           claimingVaultShare: claimingVaultShare,
           hasPendingPairingQr: hasPendingPairingQr,
+          feedback: feedback,
           compact: false,
         ),
       ),
@@ -5620,6 +5662,7 @@ class _SettingsPage extends StatelessWidget {
     required this.accountCount,
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
+    this.feedback,
   });
 
   final LocalSession? session;
@@ -5627,6 +5670,7 @@ class _SettingsPage extends StatelessWidget {
   final int accountCount;
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
+  final _SettingsFeedback? feedback;
 
   @override
   Widget build(BuildContext context) {
@@ -5642,6 +5686,7 @@ class _SettingsPage extends StatelessWidget {
               accountCount: accountCount,
               claimingVaultShare: claimingVaultShare,
               hasPendingPairingQr: hasPendingPairingQr,
+              feedback: feedback,
               compact: true,
             ),
           ],
@@ -5659,6 +5704,7 @@ class _SettingsContent extends StatelessWidget {
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
     required this.compact,
+    this.feedback,
   });
 
   final LocalSession? session;
@@ -5667,6 +5713,7 @@ class _SettingsContent extends StatelessWidget {
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
   final bool compact;
+  final _SettingsFeedback? feedback;
 
   @override
   Widget build(BuildContext context) {
@@ -5675,6 +5722,10 @@ class _SettingsContent extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (feedback case final feedback?) ...[
+          _SettingsFeedbackBanner(feedback: feedback),
+          SizedBox(height: spacing),
+        ],
         _SettingsSection(
           title: 'Sync',
           children: [
@@ -5806,6 +5857,46 @@ class _SettingsContent extends StatelessWidget {
           ],
         ),
       ],
+    );
+  }
+}
+
+class _SettingsFeedbackBanner extends StatelessWidget {
+  const _SettingsFeedbackBanner({required this.feedback});
+
+  final _SettingsFeedback feedback;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final color =
+        feedback.error
+            ? colorScheme.error
+            : feedback.warning
+            ? colorScheme.tertiary
+            : colorScheme.primary;
+    return Material(
+      color: color.withValues(alpha: 0.1),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              feedback.error
+                  ? Icons.error_outline
+                  : feedback.warning
+                  ? Icons.sync_problem_outlined
+                  : Icons.check_circle_outline,
+              color: color,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(child: Text(feedback.message)),
+          ],
+        ),
+      ),
     );
   }
 }
