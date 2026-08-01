@@ -62,12 +62,50 @@ Outputs:
 
 ```text
 build/releases/nyamail-windows-x64-<version>.zip
+build/releases/nyamail-windows-x64-<version>.zip.sha256
 build/releases/nyamail-android-<version>.apk
+build/releases/nyamail-android-<version>.apk.sha256
 ```
 
-The version comes from `pubspec.yaml`, for example `0.1.0+1`. The Windows zip
+The version comes from `pubspec.yaml`, currently `1.0.0+1`. The Windows zip
 contains the Flutter `Release` directory contents and excludes stale zip files
 from previous builds. Use `-SkipWindows`, `-SkipAndroid`, or `-NoPub` when you
-only need part of the build.
+only need part of the build. Release builds use the `stable` update channel by
+default.
+
+Android release builds require a production signing key. Local builds load
+`android/key.properties`; CI loads the same four values through environment
+variables. A release build fails instead of falling back to the debug key when
+signing is incomplete.
+
+## GitHub Actions
+
+`.github/workflows/ci.yml` runs analysis and tests for pull requests. Pushes to
+`main`, tags matching `v*`, and manual runs also build signed Windows and
+Android release artifacts with `scripts/build-release.ps1` and upload their
+SHA256 files.
+
+Configure this repository variable in GitHub Actions:
+
+```text
+NYAMAIL_API_BASE_URL
+```
+
+Configure these repository secrets:
+
+```text
+NYAMAIL_ANDROID_KEYSTORE_BASE64
+NYAMAIL_ANDROID_STORE_PASSWORD
+NYAMAIL_ANDROID_KEY_ALIAS
+NYAMAIL_ANDROID_KEY_PASSWORD
+NYAMAIL_RELEASE_PUBLIC_KEY
+```
+
+`NYAMAIL_ANDROID_KEYSTORE_BASE64` is the Base64 encoding of the existing
+`android/keystores/nyamail-release.jks` file. Keep that keystore and its
+passwords backed up outside the repository; replacing it prevents signed app
+updates from being installed over previous releases. OAuth provider client
+settings remain user-configured inside the app and are not compiled into CI
+artifacts.
 
 Provider/OAuth smoke tools live under `tool/`.

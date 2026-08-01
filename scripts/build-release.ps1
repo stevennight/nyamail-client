@@ -3,7 +3,7 @@ param(
   [switch]$SkipAndroid,
   [switch]$NoPub,
   [string]$ApiBaseUrl = "http://localhost:8080",
-  [string]$ReleaseChannel = "dev",
+  [string]$ReleaseChannel = "stable",
   [string]$ReleasePublicKey = "",
   [string]$GmailOAuthClientId = "",
   [string]$GmailOAuthClientSecret = "",
@@ -77,10 +77,14 @@ function New-ArtifactSummary {
 
   $item = Get-Item -LiteralPath $Path
   $hash = Get-FileHash -LiteralPath $Path -Algorithm SHA256
+  $hashPath = "$Path.sha256"
+  "$($hash.Hash.ToLowerInvariant())  $($item.Name)" |
+    Set-Content -LiteralPath $hashPath -Encoding ASCII -NoNewline
   return [pscustomobject]@{
     Path = $item.FullName
     SizeMB = [math]::Round($item.Length / 1MB, 2)
     SHA256 = $hash.Hash
+    HashFile = $hashPath
   }
 }
 

@@ -41,6 +41,23 @@ val hasReleaseSigning = listOf(
     releaseKeyPassword,
 ).all { it != null }
 
+gradle.taskGraph.whenReady {
+    val buildsRelease = allTasks.any { task ->
+        task.name.contains("release", ignoreCase = true)
+    }
+    if (buildsRelease && !hasReleaseSigning) {
+        throw GradleException(
+            "Android release signing is not configured. Provide android/key.properties " +
+                "or the four NYAMAIL_ANDROID_* signing environment variables."
+        )
+    }
+    if (buildsRelease && !rootProject.file(releaseStoreFilePath!!).isFile) {
+        throw GradleException(
+            "Android release keystore was not found at the configured storeFile path."
+        )
+    }
+}
+
 android {
     namespace = "com.nyatori.nyamail"
     compileSdk = flutter.compileSdkVersion
@@ -76,11 +93,8 @@ android {
 
     buildTypes {
         release {
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                logger.warn("Android release signing key is not configured; using the debug key for this build.")
-                signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
             }
             isMinifyEnabled = false
             isShrinkResources = false

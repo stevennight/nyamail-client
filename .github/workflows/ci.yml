@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.4"
+
+jobs:
+  quality:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Test
+        run: flutter test --no-pub
+
+  windows-release:
+    name: Windows release
+    if: github.event_name != 'pull_request'
+    needs: quality
+    runs-on: windows-latest
+    env:
+      NYAMAIL_API_BASE_URL: ${{ vars.NYAMAIL_API_BASE_URL }}
+      NYAMAIL_RELEASE_PUBLIC_KEY: ${{ secrets.NYAMAIL_RELEASE_PUBLIC_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Validate production configuration
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:NYAMAIL_API_BASE_URL)) {
+            $missing += "NYAMAIL_API_BASE_URL repository variable"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:NYAMAIL_RELEASE_PUBLIC_KEY)) {
+            $missing += "NYAMAIL_RELEASE_PUBLIC_KEY repository secret"
+          }
+          if ($missing.Count -gt 0) {
+            throw "Missing production configuration: $($missing -join ', ')"
+          }
+
+      - name: Build Windows artifact
+        shell: pwsh
+        run: |
+          .\scripts\build-release.ps1 `
+            -SkipAndroid `
+            -ApiBaseUrl $env:NYAMAIL_API_BASE_URL `
+            -ReleaseChannel stable `
+            -ReleasePublicKey $env:NYAMAIL_RELEASE_PUBLIC_KEY
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyamail-windows-${{ github.run_number }}
+          path: |
+            build/releases/nyamail-windows-x64-*.zip
+            build/releases/nyamail-windows-x64-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  android-release:
+    name: Android release
+    if: github.event_name != 'pull_request'
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      NYAMAIL_API_BASE_URL: ${{ vars.NYAMAIL_API_BASE_URL }}
+      NYAMAIL_RELEASE_PUBLIC_KEY: ${{ secrets.NYAMAIL_RELEASE_PUBLIC_KEY }}
+      NYAMAIL_ANDROID_KEYSTORE_BASE64: ${{ secrets.NYAMAIL_ANDROID_KEYSTORE_BASE64 }}
+      NYAMAIL_ANDROID_STORE_PASSWORD: ${{ secrets.NYAMAIL_ANDROID_STORE_PASSWORD }}
+      NYAMAIL_ANDROID_KEY_ALIAS: ${{ secrets.NYAMAIL_ANDROID_KEY_ALIAS }}
+      NYAMAIL_ANDROID_KEY_PASSWORD: ${{ secrets.NYAMAIL_ANDROID_KEY_PASSWORD }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Restore Android signing key
+        shell: pwsh
+        run: |
+          $required = @{
+            NYAMAIL_API_BASE_URL = $env:NYAMAIL_API_BASE_URL
+            NYAMAIL_RELEASE_PUBLIC_KEY = $env:NYAMAIL_RELEASE_PUBLIC_KEY
+            NYAMAIL_ANDROID_KEYSTORE_BASE64 = $env:NYAMAIL_ANDROID_KEYSTORE_BASE64
+            NYAMAIL_ANDROID_STORE_PASSWORD = $env:NYAMAIL_ANDROID_STORE_PASSWORD
+            NYAMAIL_ANDROID_KEY_ALIAS = $env:NYAMAIL_ANDROID_KEY_ALIAS
+            NYAMAIL_ANDROID_KEY_PASSWORD = $env:NYAMAIL_ANDROID_KEY_PASSWORD
+          }
+          $missing = @($required.Keys | Where-Object {
+            [string]::IsNullOrWhiteSpace($required[$_])
+          })
+          if ($missing.Count -gt 0) {
+            throw "Missing production configuration: $($missing -join ', ')"
+          }
+
+          $keystorePath = Join-Path $env:RUNNER_TEMP "nyamail-release.jks"
+          try {
+            $keystoreBytes = [Convert]::FromBase64String(
+              $env:NYAMAIL_ANDROID_KEYSTORE_BASE64
+            )
+          } catch {
+            throw "NYAMAIL_ANDROID_KEYSTORE_BASE64 is not valid Base64."
+          }
+          [IO.File]::WriteAllBytes($keystorePath, $keystoreBytes)
+          "NYAMAIL_ANDROID_STORE_FILE=$keystorePath" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Android artifact
+        shell: pwsh
+        run: |
+          ./scripts/build-release.ps1 `
+            -SkipWindows `
+            -ApiBaseUrl $env:NYAMAIL_API_BASE_URL `
+            -ReleaseChannel stable `
+            -ReleasePublicKey $env:NYAMAIL_RELEASE_PUBLIC_KEY
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyamail-android-${{ github.run_number }}
+          path: |
+            build/releases/nyamail-android-*.apk
+            build/releases/nyamail-android-*.apk.sha256
+          if-no-files-found: error
+          retention-days: 14
