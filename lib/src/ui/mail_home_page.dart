@@ -241,12 +241,16 @@ class _MailHomePageState extends State<MailHomePage>
   int _keyboardNavigationDirection = 1;
   bool _loading = true;
   bool _vaultUnlocking = false;
+  bool _vaultUnlockCancelled = false;
   bool _loadingMore = false;
   Future<OAuthVaultRefreshResult?>? _oauthRefreshFuture;
   final Map<String, MailAccountSyncFailure> _accountSyncFailures =
       <String, MailAccountSyncFailure>{};
   bool _claimingVaultShare = false;
-  String? _banner;
+  String? _bannerValue;
+  _NoticeKind _bannerKind = _NoticeKind.info;
+  bool _captureSettingsNotices = false;
+  _SettingsFeedback? _capturedSettingsFeedback;
   bool _refreshingMail = false;
   int? _refreshingMailRequestId;
   bool _mailUndoSnackBarVisible = false;
@@ -275,6 +279,30 @@ class _MailHomePageState extends State<MailHomePage>
   final _newMailNotificationBaseline = MailNotificationBaseline();
   late final LocalVaultAuthenticator _vaultAuthenticator =
       LocalVaultAuthenticator();
+
+  String? get _banner => _bannerValue;
+
+  set _banner(String? message) {
+    _bannerValue = message;
+    _bannerKind = _NoticeKind.info;
+  }
+
+  void _setPersistentNotice(
+    String? message, {
+    _NoticeKind kind = _NoticeKind.info,
+  }) {
+    if (_captureSettingsNotices) {
+      if (message != null && kind != _NoticeKind.progress) {
+        _capturedSettingsFeedback = _SettingsFeedback(
+          message: message,
+          kind: kind,
+        );
+      }
+      return;
+    }
+    _bannerValue = message;
+    _bannerKind = kind;
+  }
 
   @override
   void initState() {
@@ -321,11 +349,20 @@ class _MailHomePageState extends State<MailHomePage>
 
   void _showTransientNotice(
     String message, {
-    bool error = false,
+    _NoticeKind kind = _NoticeKind.info,
     Duration duration = const Duration(seconds: 4),
   }) {
     if (!mounted) return;
+    if (_captureSettingsNotices) {
+      _capturedSettingsFeedback = _SettingsFeedback(
+        message: message,
+        kind: kind,
+      );
+      return;
+    }
     final colorScheme = Theme.of(context).colorScheme;
+    final isError = kind == _NoticeKind.error;
+    final isWarning = kind == _NoticeKind.warning;
     final messenger = ScaffoldMessenger.of(context);
     if (!_mailUndoSnackBarVisible) {
       messenger.hideCurrentSnackBar();
@@ -334,19 +371,40 @@ class _MailHomePageState extends State<MailHomePage>
       SnackBar(
         behavior: SnackBarBehavior.floating,
         duration: duration,
-        backgroundColor: error ? colorScheme.error : null,
+        backgroundColor:
+            isError
+                ? colorScheme.error
+                : isWarning
+                ? colorScheme.tertiaryContainer
+                : null,
         content: Row(
           children: [
             Icon(
-              error ? Icons.error_outline : Icons.check_circle_outline,
-              color: error ? colorScheme.onError : colorScheme.inversePrimary,
+              switch (kind) {
+                _NoticeKind.success => Icons.check_circle_outline,
+                _NoticeKind.warning => Icons.warning_amber_outlined,
+                _NoticeKind.error => Icons.error_outline,
+                _NoticeKind.progress => Icons.sync,
+                _NoticeKind.info => Icons.info_outline,
+              },
+              color:
+                  isError
+                      ? colorScheme.onError
+                      : isWarning
+                      ? colorScheme.onTertiaryContainer
+                      : colorScheme.inversePrimary,
               size: 20,
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Text(
                 message,
-                style: error ? TextStyle(color: colorScheme.onError) : null,
+                style:
+                    isError
+                        ? TextStyle(color: colorScheme.onError)
+                        : isWarning
+                        ? TextStyle(color: colorScheme.onTertiaryContainer)
+                        : null,
               ),
             ),
           ],
@@ -363,7 +421,12 @@ class _MailHomePageState extends State<MailHomePage>
       await _applySystemBehaviorSettings(settings);
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = 'Could not load system settings: $error');
+      setState(
+        () => _setPersistentNotice(
+          'Could not load system settings: $error',
+          kind: _NoticeKind.error,
+        ),
+      );
     }
   }
 
@@ -404,7 +467,10 @@ class _MailHomePageState extends State<MailHomePage>
       setState(() {
         _loading = false;
         _vaultUnlocking = false;
-        _banner = 'Could not start NyaMail: $error';
+        _setPersistentNotice(
+          'Could not start NyaMail: $error',
+          kind: _NoticeKind.error,
+        );
       });
     }
   }
@@ -422,7 +488,10 @@ class _MailHomePageState extends State<MailHomePage>
         _pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
         _loading = false;
         _vaultUnlocking = false;
-        _banner = 'Create a local encrypted vault before using NyaMail.';
+        _setPersistentNotice(
+          'Create a local encrypted vault before using NyaMail.',
+          kind: _NoticeKind.warning,
+        );
       });
       return;
     }
@@ -438,7 +507,12 @@ class _MailHomePageState extends State<MailHomePage>
         _pinnedMessageIds = interactionSettings.pinnedMessageIds.toSet();
         _loading = false;
         _vaultUnlocking = false;
-        _banner ??= 'Unlock the local vault before using NyaMail.';
+        if (_banner == null) {
+          _setPersistentNotice(
+            'Unlock the local vault before using NyaMail.',
+            kind: _NoticeKind.warning,
+          );
+        }
       });
       return;
     }
@@ -495,9 +569,7 @@ class _MailHomePageState extends State<MailHomePage>
       _hasMoreMessages = page.hasMore;
       _loading = false;
       _vaultUnlocking = false;
-      if (banner != null) {
-        _banner = banner;
-      }
+      _banner = banner;
     });
     _debugVault('finish bootstrap: unlocked frame ready');
     _resetNewMailNotificationBaseline();
@@ -768,20 +840,28 @@ class _MailHomePageState extends State<MailHomePage>
       _debugVault(
         'local unlock: start (${promptIfNeeded ? 'prompt' : 'silent'})',
       );
+      if (promptIfNeeded) {
+        _vaultUnlockCancelled = false;
+      }
       final vaultSecret = await _unlockVaultSecretForProfile(
         profile,
         promptIfNeeded: promptIfNeeded,
       );
       if (vaultSecret == null || vaultSecret.trim().isEmpty) {
+        if (_vaultUnlockCancelled) {
+          _vaultUnlockCancelled = false;
+          return false;
+        }
         if (promptIfNeeded && mounted) {
           final currentBanner = _banner;
           if (currentBanner == null ||
               currentBanner == 'Preparing local vault...' ||
               currentBanner == 'Unlocking local vault...') {
             setState(
-              () =>
-                  _banner =
-                      'Local vault exists, but this device cannot unlock it.',
+              () => _setPersistentNotice(
+                'Local vault exists, but this device cannot unlock it.',
+                kind: _NoticeKind.error,
+              ),
             );
           }
         }
@@ -816,21 +896,29 @@ class _MailHomePageState extends State<MailHomePage>
       return true;
     } on VaultCryptoException catch (error) {
       if (mounted) {
-        setState(() => _banner = error.message);
+        setState(
+          () => _setPersistentNotice(error.message, kind: _NoticeKind.error),
+        );
       }
       return false;
     } on FormatException catch (error) {
       if (mounted) {
         setState(
-          () =>
-              _banner =
-                  'Local vault data is not readable. Clear local data or reconnect sync. (${error.message})',
+          () => _setPersistentNotice(
+            'Local vault data is not readable. Clear local data or reconnect sync. (${error.message})',
+            kind: _NoticeKind.error,
+          ),
         );
       }
       return false;
     } catch (error) {
       if (mounted) {
-        setState(() => _banner = 'Could not unlock local vault: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Could not unlock local vault: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
       return false;
     }
@@ -868,14 +956,18 @@ class _MailHomePageState extends State<MailHomePage>
       if (!mounted) return;
       if (_hasUnlockedLocalVault) {
         setState(
-          () =>
-              _banner =
-                  'Sync account connected. Server vault sync will retry later.',
+          () => _setPersistentNotice(
+            'Sync account connected. Server vault sync will retry later.',
+            kind: _NoticeKind.warning,
+          ),
         );
         return;
       }
       setState(
-        () => _banner = 'Signed in, but server vault could not be opened.',
+        () => _setPersistentNotice(
+          'Signed in, but server vault could not be opened.',
+          kind: _NoticeKind.error,
+        ),
       );
     }
   }
@@ -930,7 +1022,10 @@ class _MailHomePageState extends State<MailHomePage>
             quickUnlockMethod: quickUnlockMethod,
           ),
     );
-    if (input == null) return null;
+    if (input == null) {
+      _vaultUnlockCancelled = true;
+      return null;
+    }
     if (input.useQuickUnlock) {
       return _tryQuickUnlockVaultSecret(
         profile: profile,
@@ -964,8 +1059,9 @@ class _MailHomePageState extends State<MailHomePage>
       reason: reason,
     );
     if (!authenticated) {
+      _vaultUnlockCancelled = true;
       if (mounted) {
-        setState(() => _banner = 'System quick unlock was cancelled.');
+        _showTransientNotice('System quick unlock was cancelled.');
       }
       return null;
     }
@@ -982,9 +1078,10 @@ class _MailHomePageState extends State<MailHomePage>
       } catch (error) {
         if (mounted) {
           setState(
-            () =>
-                _banner =
-                    'System quick unlock failed. Use the vault password. ($error)',
+            () => _setPersistentNotice(
+              'System quick unlock failed. Use the vault password. ($error)',
+              kind: _NoticeKind.error,
+            ),
           );
         }
         return null;
@@ -1163,12 +1260,12 @@ class _MailHomePageState extends State<MailHomePage>
       discoverFolders: false,
     );
     if (mounted) {
-      setState(
-        () =>
-            _banner =
-                quickUnlockEnabled
-                    ? 'Local encrypted vault is ready. Quick unlock is enabled.'
-                    : 'Local encrypted vault is ready.',
+      setState(() => _banner = null);
+      _showTransientNotice(
+        quickUnlockEnabled
+            ? 'Local encrypted vault is ready. Quick unlock is enabled.'
+            : 'Local encrypted vault is ready.',
+        kind: _NoticeKind.success,
       );
     }
     return profile;
@@ -1241,7 +1338,10 @@ class _MailHomePageState extends State<MailHomePage>
       if (!await widget.releaseService.verifyManifestSignature(artifact)) {
         if (!mounted) return;
         setState(
-          () => _banner = 'Update manifest signature could not be verified.',
+          () => _setPersistentNotice(
+            'Update manifest signature could not be verified.',
+            kind: _NoticeKind.error,
+          ),
         );
         return;
       }
@@ -1256,15 +1356,28 @@ class _MailHomePageState extends State<MailHomePage>
         setState(() => _banner = 'Update $label is available.');
         return;
       }
-      setState(() => _banner = 'Downloading update $label...');
+      setState(
+        () => _setPersistentNotice(
+          'Downloading update $label...',
+          kind: _NoticeKind.progress,
+        ),
+      );
       final file = await widget.releaseService.downloadAndVerify(artifact);
       await widget.releaseService.openDownloadedFile(file);
       if (!mounted) return;
       setState(() => _banner = null);
-      _showTransientNotice('Update downloaded, verified, and opened.');
+      _showTransientNotice(
+        'Update downloaded, verified, and opened.',
+        kind: _NoticeKind.success,
+      );
     } catch (_) {
       if (!silent && mounted) {
-        setState(() => _banner = 'Could not complete the update.');
+        setState(
+          () => _setPersistentNotice(
+            'Could not complete the update.',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
     }
   }
@@ -1415,7 +1528,10 @@ class _MailHomePageState extends State<MailHomePage>
       if (!_isCurrentMessageLoad(requestId)) return;
       setState(() {
         _loadingMore = false;
-        _banner = 'Could not load cached mail: $error';
+        _setPersistentNotice(
+          'Could not load cached mail: $error',
+          kind: _NoticeKind.error,
+        );
       });
     }
   }
@@ -1475,7 +1591,10 @@ class _MailHomePageState extends State<MailHomePage>
       if (!showErrors || !_isCurrentMessageLoad(requestId)) return;
       setState(() {
         _loadingMore = false;
-        _banner = 'Could not refresh mail: $error';
+        _setPersistentNotice(
+          'Could not refresh mail: $error',
+          kind: _NoticeKind.error,
+        );
       });
     } finally {
       if (showRefreshIndicator) {
@@ -1553,7 +1672,10 @@ class _MailHomePageState extends State<MailHomePage>
       if (!_isCurrentMessageLoad(requestId)) return;
       setState(() {
         _loadingMore = false;
-        _banner = 'Could not load more mail: $error';
+        _setPersistentNotice(
+          'Could not load more mail: $error',
+          kind: _NoticeKind.error,
+        );
       });
     }
   }
@@ -1629,6 +1751,7 @@ class _MailHomePageState extends State<MailHomePage>
             if (_banner != null)
               _InlineNoticeBanner(
                 message: _banner!,
+                kind: _bannerKind,
                 actionIcon:
                     _pendingPairingPackage == null ? null : Icons.qr_code_2,
                 actionTooltip: 'Show pairing QR',
@@ -1895,14 +2018,22 @@ class _MailHomePageState extends State<MailHomePage>
     if (mounted) {
       setState(() {
         _vaultUnlocking = true;
-        _banner = 'Preparing local vault...';
+        _setPersistentNotice(
+          'Preparing local vault...',
+          kind: _NoticeKind.progress,
+        );
       });
     }
     try {
       final profile = _profile ?? await widget.secureStore.readLocalProfile();
       if (profile == null) {
         if (mounted) {
-          setState(() => _banner = 'Creating local vault...');
+          setState(
+            () => _setPersistentNotice(
+              'Creating local vault...',
+              kind: _NoticeKind.progress,
+            ),
+          );
         }
         final created = await _createLocalVault();
         if (!mounted) return;
@@ -1919,7 +2050,12 @@ class _MailHomePageState extends State<MailHomePage>
       }
       _profile = profile;
       if (mounted) {
-        setState(() => _banner = 'Unlocking local vault...');
+        setState(
+          () => _setPersistentNotice(
+            'Unlocking local vault...',
+            kind: _NoticeKind.progress,
+          ),
+        );
       }
       final unlocked = await _tryUnlockLocalVault(
         profile,
@@ -1934,13 +2070,21 @@ class _MailHomePageState extends State<MailHomePage>
         renderSettings: _renderSettings,
         interactionSettings: _interactionSettings,
         profile: profile,
-        banner: 'Local vault unlocked.',
       );
+      if (mounted) {
+        _showTransientNotice(
+          'Local vault unlocked.',
+          kind: _NoticeKind.success,
+        );
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _vaultUnlocking = false;
-        _banner = 'Could not unlock the local vault: $error';
+        _setPersistentNotice(
+          'Could not unlock the local vault: $error',
+          kind: _NoticeKind.error,
+        );
       });
     }
   }
@@ -2087,7 +2231,15 @@ class _MailHomePageState extends State<MailHomePage>
         keepOpen = true;
         continue;
       }
-      keepOpen = await _handleSettingsAction(action);
+      _capturedSettingsFeedback = null;
+      _captureSettingsNotices = true;
+      try {
+        keepOpen = await _handleSettingsAction(action);
+        feedback = _capturedSettingsFeedback;
+      } finally {
+        _captureSettingsNotices = false;
+        _capturedSettingsFeedback = null;
+      }
     }
   }
 
@@ -2208,7 +2360,9 @@ class _MailHomePageState extends State<MailHomePage>
       await widget.onApiBaseUrlChanged(nextApiBaseUrl);
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = error.toString());
+      setState(
+        () => _setPersistentNotice(error.toString(), kind: _NoticeKind.error),
+      );
     }
   }
 
@@ -2249,7 +2403,10 @@ class _MailHomePageState extends State<MailHomePage>
           includeLegacySecret: false,
         );
         if (vaultSecret == null || vaultSecret.trim().isEmpty) {
-          setState(() => _banner = 'Unlock the local vault first.');
+          _showTransientNotice(
+            'Unlock the local vault first.',
+            kind: _NoticeKind.warning,
+          );
           return;
         }
         final enabled = await _enableQuickUnlockForSecret(
@@ -2257,17 +2414,19 @@ class _MailHomePageState extends State<MailHomePage>
           vaultSecret: vaultSecret,
         );
         if (!mounted) return;
-        setState(
-          () =>
-              _banner =
-                  enabled
-                      ? 'System quick unlock is enabled for this device.'
-                      : 'System quick unlock could not be enabled.',
+        _showTransientNotice(
+          enabled
+              ? 'System quick unlock is enabled for this device.'
+              : 'System quick unlock could not be enabled.',
+          kind: enabled ? _NoticeKind.success : _NoticeKind.error,
         );
       case _LocalVaultSettingsAction.disableQuickUnlock:
         await widget.secureStore.clearQuickUnlockMaterial();
         if (!mounted) return;
-        setState(() => _banner = 'System quick unlock is disabled.');
+        _showTransientNotice(
+          'System quick unlock is disabled.',
+          kind: _NoticeKind.success,
+        );
     }
   }
 
@@ -2309,17 +2468,26 @@ class _MailHomePageState extends State<MailHomePage>
       );
       final synced = await _syncVaultRecordsWithServer(silent: true);
       if (!mounted) return;
-      setState(
-        () =>
-            _banner =
-                synced || _session == null
-                    ? 'OAuth provider settings saved to the local encrypted vault.'
-                    : 'OAuth provider settings saved locally. Sync will retry later.',
-      );
+      if (synced || _session == null) {
+        _showTransientNotice(
+          'OAuth provider settings saved to the local encrypted vault.',
+          kind: _NoticeKind.success,
+        );
+      } else {
+        setState(
+          () => _setPersistentNotice(
+            'OAuth provider settings saved locally. Sync will retry later.',
+            kind: _NoticeKind.warning,
+          ),
+        );
+      }
     } catch (error) {
       if (!mounted) return;
       setState(
-        () => _banner = 'Could not save OAuth provider settings: $error',
+        () => _setPersistentNotice(
+          'Could not save OAuth provider settings: $error',
+          kind: _NoticeKind.error,
+        ),
       );
     }
   }
@@ -2327,7 +2495,12 @@ class _MailHomePageState extends State<MailHomePage>
   Future<void> _showMailboxSettings([MailAccount? account]) async {
     final document = _vaultDocument;
     if (document == null) {
-      setState(() => _banner = 'Mailbox account data is not loaded yet.');
+      setState(
+        () => _setPersistentNotice(
+          'Mailbox account data is not loaded yet.',
+          kind: _NoticeKind.warning,
+        ),
+      );
       return;
     }
     final items =
@@ -2335,7 +2508,12 @@ class _MailHomePageState extends State<MailHomePage>
             ? document.items
             : document.items.where((item) => item.id == account.id).toList();
     if (items.isEmpty) {
-      setState(() => _banner = 'Mailbox account data is not available.');
+      setState(
+        () => _setPersistentNotice(
+          'Mailbox account data is not available.',
+          kind: _NoticeKind.warning,
+        ),
+      );
       return;
     }
     final action = await showDialog<_MailboxSettingsAction>(
@@ -2408,11 +2586,13 @@ class _MailHomePageState extends State<MailHomePage>
         );
       }
       setState(
-        () =>
-            _banner = _oauthProgressMessage(
-              OAuthAuthorizationProgress.waitingForAuthorization,
-              provider.provider,
-            ),
+        () => _setPersistentNotice(
+          _oauthProgressMessage(
+            OAuthAuthorizationProgress.waitingForAuthorization,
+            provider.provider,
+          ),
+          kind: _NoticeKind.progress,
+        ),
       );
       final clientSecret = _oauthClientSecretForProvider(item.provider);
       final tokenSet = await _authorizeOAuthForCurrentPlatform(
@@ -2427,7 +2607,10 @@ class _MailHomePageState extends State<MailHomePage>
         onProgress: (progress) {
           if (!mounted) return;
           setState(
-            () => _banner = _oauthProgressMessage(progress, provider.provider),
+            () => _setPersistentNotice(
+              _oauthProgressMessage(progress, provider.provider),
+              kind: _NoticeKind.progress,
+            ),
           );
         },
       );
@@ -2469,7 +2652,12 @@ class _MailHomePageState extends State<MailHomePage>
       );
     } catch (error) {
       if (!mounted) return;
-      setState(() => _banner = 'Could not reauthorize mailbox: $error');
+      setState(
+        () => _setPersistentNotice(
+          'Could not reauthorize mailbox: $error',
+          kind: _NoticeKind.error,
+        ),
+      );
     }
   }
 
@@ -2485,13 +2673,17 @@ class _MailHomePageState extends State<MailHomePage>
     await _applyVaultDocument(updatedDocument);
     final synced = await _syncVaultRecordsWithServer(silent: true);
     if (!mounted) return;
-    setState(() {
-      _accountSyncFailures.remove(item.id);
-      _banner =
-          synced || _session == null
-              ? successBanner
-              : '$successBanner Sync will retry later.';
-    });
+    setState(() => _accountSyncFailures.remove(item.id));
+    if (synced || _session == null) {
+      _showTransientNotice(successBanner, kind: _NoticeKind.success);
+    } else {
+      setState(
+        () => _setPersistentNotice(
+          '$successBanner Sync will retry later.',
+          kind: _NoticeKind.warning,
+        ),
+      );
+    }
   }
 
   Uri? _oauthMobileRedirectUriForProvider(String provider) {
@@ -2547,7 +2739,10 @@ class _MailHomePageState extends State<MailHomePage>
     if (mounted) {
       setState(() {
         _loadingMore = false;
-        _banner = 'Clearing local data...';
+        _setPersistentNotice(
+          'Clearing local data...',
+          kind: _NoticeKind.progress,
+        );
       });
     }
 
@@ -2600,7 +2795,10 @@ class _MailHomePageState extends State<MailHomePage>
       _selectedMessageIds = const <String>{};
       _banner = null;
     });
-    _showTransientNotice('Local data cleared on this device.');
+    _showTransientNotice(
+      'Local data cleared on this device.',
+      kind: _NoticeKind.success,
+    );
     _ensureSelectedMessageBody();
   }
 
@@ -2645,7 +2843,10 @@ class _MailHomePageState extends State<MailHomePage>
         _selectedMessageIds = const <String>{};
         _hasMoreMessages = true;
         _loadingMore = false;
-        _banner = 'Clearing mail cache...';
+        _setPersistentNotice(
+          'Clearing mail cache...',
+          kind: _NoticeKind.progress,
+        );
       });
     }
 
@@ -2653,7 +2854,12 @@ class _MailHomePageState extends State<MailHomePage>
       await _mailRepository.clearLocalCache();
       if (!_isCurrentMessageLoad(requestId)) return true;
       if (mounted) {
-        setState(() => _banner = 'Mail cache cleared. Rebuilding index...');
+        setState(
+          () => _setPersistentNotice(
+            'Mail cache cleared. Rebuilding index...',
+            kind: _NoticeKind.progress,
+          ),
+        );
       }
       final page = await _loadRemoteViewPage(
         view: _view,
@@ -2671,13 +2877,19 @@ class _MailHomePageState extends State<MailHomePage>
         _loadingMore = false;
         _banner = null;
       });
-      _showTransientNotice('Mail cache cleared. Rebuilding from mail servers.');
+      _showTransientNotice(
+        'Mail cache cleared. Rebuilding from mail servers.',
+        kind: _NoticeKind.success,
+      );
       return true;
     } catch (error) {
       if (_isCurrentMessageLoad(requestId)) {
         setState(() {
           _loadingMore = false;
-          _banner = 'Could not clear mail cache: $error';
+          _setPersistentNotice(
+            'Could not clear mail cache: $error',
+            kind: _NoticeKind.error,
+          );
         });
       }
       return true;
@@ -2769,15 +2981,25 @@ class _MailHomePageState extends State<MailHomePage>
               ? _draftCacheForSession(_session!)
               : _draftCacheForProfile(_profile!);
       _pendingPairingPackage = pairingPackage;
-      _banner =
-          result.requiresApproval
-              ? 'This device needs approval. Pair $pairingCode. Pairing package copied.'
-              : result.recoveryCodes.isEmpty
-              ? null
-              : 'Recovery codes created. Store them before closing this build.';
+      if (result.requiresApproval) {
+        _setPersistentNotice(
+          'This device needs approval. Pair $pairingCode. Pairing package copied.',
+          kind: _NoticeKind.warning,
+        );
+      } else if (result.recoveryCodes.isNotEmpty) {
+        _setPersistentNotice(
+          'Recovery codes created. Store them before closing this build.',
+          kind: _NoticeKind.warning,
+        );
+      } else {
+        _banner = null;
+      }
     });
     if (!result.requiresApproval && result.recoveryCodes.isEmpty && mounted) {
-      _showTransientNotice('Sync connected as ${result.email}.');
+      _showTransientNotice(
+        'Sync connected as ${result.email}.',
+        kind: _NoticeKind.success,
+      );
     }
     if (result.recoveryCodes.isNotEmpty) {
       await _showRecoveryCodes(result.recoveryCodes);
@@ -2790,7 +3012,10 @@ class _MailHomePageState extends State<MailHomePage>
               : await _syncVaultRecordsWithServer(silent: true);
       if (mounted && !result.requiresApproval && !recordSynced) {
         setState(
-          () => _banner = 'Sync connected, but record sync will retry later.',
+          () => _setPersistentNotice(
+            'Sync connected, but record sync will retry later.',
+            kind: _NoticeKind.warning,
+          ),
         );
       }
       await _loadMessages();
@@ -2899,14 +3124,19 @@ class _MailHomePageState extends State<MailHomePage>
     if (mounted) {
       setState(() {
         _loadingMore = false;
-        _banner = 'Leaving sync...';
+        _setPersistentNotice('Leaving sync...', kind: _NoticeKind.progress);
       });
     }
     try {
       await widget.api.leaveSyncDevice(token: session.accessToken);
     } catch (error) {
       if (mounted) {
-        setState(() => _banner = 'Could not leave sync: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Could not leave sync: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
       return;
     }
@@ -2937,6 +3167,7 @@ class _MailHomePageState extends State<MailHomePage>
     });
     _showTransientNotice(
       'This device left sync. Local vault remains available.',
+      kind: _NoticeKind.success,
     );
     _ensureSelectedMessageBody();
   }
@@ -2948,7 +3179,7 @@ class _MailHomePageState extends State<MailHomePage>
     if (mounted) {
       setState(() {
         _loadingMore = false;
-        _banner = 'Signing out...';
+        _setPersistentNotice('Signing out...', kind: _NoticeKind.progress);
       });
     }
     await widget.secureStore.clearSession();
@@ -2976,6 +3207,7 @@ class _MailHomePageState extends State<MailHomePage>
     });
     _showTransientNotice(
       'Sync server disconnected. Local vault remains available.',
+      kind: _NoticeKind.success,
     );
     _ensureSelectedMessageBody();
   }
@@ -3034,9 +3266,10 @@ class _MailHomePageState extends State<MailHomePage>
       } catch (_) {
         if (mounted) {
           setState(
-            () =>
-                _banner =
-                    'Signed in, but this device could not consume its vault share.',
+            () => _setPersistentNotice(
+              'Signed in, but this device could not consume its vault share.',
+              kind: _NoticeKind.error,
+            ),
           );
         }
         return;
@@ -3068,12 +3301,18 @@ class _MailHomePageState extends State<MailHomePage>
       if (!mounted) return;
       if (_hasUnlockedLocalVault) {
         setState(
-          () => _banner = 'Signed in. Server vault sync will retry later.',
+          () => _setPersistentNotice(
+            'Signed in. Server vault sync will retry later.',
+            kind: _NoticeKind.warning,
+          ),
         );
         return;
       }
       setState(
-        () => _banner = 'Signed in, but server vault could not be opened.',
+        () => _setPersistentNotice(
+          'Signed in, but server vault could not be opened.',
+          kind: _NoticeKind.error,
+        ),
       );
     }
   }
@@ -3083,7 +3322,10 @@ class _MailHomePageState extends State<MailHomePage>
     if (session == null || _claimingVaultShare) return;
     setState(() {
       _claimingVaultShare = true;
-      _banner = 'Checking for shared vault access...';
+      _setPersistentNotice(
+        'Checking for shared vault access...',
+        kind: _NoticeKind.progress,
+      );
     });
     try {
       final unlocked = await _consumeVaultShare(session);
@@ -3095,18 +3337,36 @@ class _MailHomePageState extends State<MailHomePage>
               )
               : false;
       if (!mounted) return;
-      setState(() {
-        if (unlocked) _pendingPairingPackage = null;
-        _banner =
-            unlocked
-                ? synced
-                    ? 'Vault access received. Mailboxes are ready on this device.'
-                    : 'Vault access received. Vault sync will retry later.'
-                : 'No vault share is available for this device yet.';
-      });
+      if (unlocked) {
+        setState(() => _pendingPairingPackage = null);
+        if (synced) {
+          setState(() => _banner = null);
+          _showTransientNotice(
+            'Vault access received. Mailboxes are ready on this device.',
+            kind: _NoticeKind.success,
+          );
+        } else {
+          setState(
+            () => _setPersistentNotice(
+              'Vault access received. Vault sync will retry later.',
+              kind: _NoticeKind.warning,
+            ),
+          );
+        }
+      } else {
+        setState(() => _banner = null);
+        _showTransientNotice(
+          'No vault share is available for this device yet.',
+        );
+      }
     } catch (error) {
       if (mounted) {
-        setState(() => _banner = 'Could not receive vault share: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Could not receive vault share: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
     } finally {
       if (mounted) {
@@ -3393,12 +3653,18 @@ class _MailHomePageState extends State<MailHomePage>
             result.conflicts == 0 ? '' : ', conflicts ${result.conflicts}';
         _showTransientNotice(
           'Vault sync complete. Pushed ${result.pushed}, pulled ${result.pulled}$conflictText.',
+          kind: _NoticeKind.success,
         );
       }
       return true;
     } catch (error) {
       if (mounted && !silent) {
-        setState(() => _banner = 'Vault sync could not complete: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Vault sync could not complete: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
       return false;
     }
@@ -3446,20 +3712,20 @@ class _MailHomePageState extends State<MailHomePage>
               : _SettingsFeedback(
                 message:
                     '${added.mailbox.address} was added locally. Sync will retry later.',
-                warning: true,
+                kind: _NoticeKind.warning,
               );
       if (showResultNotice) {
-        _showTransientNotice(feedback.message);
+        _showTransientNotice(feedback.message, kind: feedback.kind);
       }
       return feedback;
     } catch (error) {
       if (!mounted) return null;
       final feedback = _SettingsFeedback(
         message: 'Could not add ${added.mailbox.address}: $error',
-        error: true,
+        kind: _NoticeKind.error,
       );
       if (showResultNotice) {
-        _showTransientNotice(feedback.message, error: true);
+        _showTransientNotice(feedback.message, kind: _NoticeKind.error);
       }
       return feedback;
     }
@@ -3470,24 +3736,32 @@ class _MailHomePageState extends State<MailHomePage>
     final session = _session;
     final document = _vaultDocument;
     if (account.id == 'all') {
-      setState(() => _banner = 'Select a mailbox account before removing it.');
+      _showTransientNotice(
+        'Select a mailbox account before removing it.',
+        kind: _NoticeKind.warning,
+      );
       return;
     }
     if (document == null) {
-      setState(() => _banner = 'Mailbox account data is not loaded yet.');
+      _showTransientNotice(
+        'Mailbox account data is not loaded yet.',
+        kind: _NoticeKind.warning,
+      );
       return;
     }
     if (profile == null && session == null) {
-      setState(
-        () => _banner = 'Unlock the local vault before removing a mailbox.',
+      _showTransientNotice(
+        'Unlock the local vault before removing a mailbox.',
+        kind: _NoticeKind.warning,
       );
       return;
     }
     final localProfile = profile ?? await _ensureLocalProfile();
     if (localProfile == null) {
       if (mounted) {
-        setState(
-          () => _banner = 'Unlock the local vault before removing a mailbox.',
+        _showTransientNotice(
+          'Unlock the local vault before removing a mailbox.',
+          kind: _NoticeKind.warning,
         );
       }
       return;
@@ -3524,20 +3798,30 @@ class _MailHomePageState extends State<MailHomePage>
       await _applyVaultDocument(updatedDocument);
       final synced = await _syncVaultRecordsWithServer(silent: true);
       if (!mounted) return;
-      setState(() {
-        _banner =
-            synced || session == null
-                ? null
-                : '${account.address} was removed locally. Sync will retry later.';
-      });
+      if (synced || session == null) {
+        setState(() => _banner = null);
+      } else {
+        setState(
+          () => _setPersistentNotice(
+            '${account.address} was removed locally. Sync will retry later.',
+            kind: _NoticeKind.warning,
+          ),
+        );
+      }
       if (synced || session == null) {
         _showTransientNotice(
           '${account.address} was removed from the local encrypted vault.',
+          kind: _NoticeKind.success,
         );
       }
     } catch (error) {
       if (mounted) {
-        setState(() => _banner = 'Could not remove mailbox: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Could not remove mailbox: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
     }
   }
@@ -3776,7 +4060,10 @@ class _MailHomePageState extends State<MailHomePage>
         }
         if (result.failures.isNotEmpty) {
           final first = result.failures.first;
-          _banner = 'OAuth token refresh failed for ${first.address}.';
+          _setPersistentNotice(
+            'OAuth token refresh failed for ${first.address}.',
+            kind: _NoticeKind.error,
+          );
         }
       });
       if (result.changed) {
@@ -3804,7 +4091,12 @@ class _MailHomePageState extends State<MailHomePage>
       return result;
     } catch (error) {
       if (isCurrentVaultContext()) {
-        setState(() => _banner = 'OAuth token refresh failed: $error');
+        setState(
+          () => _setPersistentNotice(
+            'OAuth token refresh failed: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
       return null;
     }
@@ -3874,7 +4166,7 @@ class _MailHomePageState extends State<MailHomePage>
       attachments: attachments,
     );
     if (!mounted) return;
-    _showTransientNotice('Reply sent.');
+    _showTransientNotice('Reply sent.', kind: _NoticeKind.success);
   }
 
   Future<void> _sendReplyAll(
@@ -3891,7 +4183,7 @@ class _MailHomePageState extends State<MailHomePage>
       attachments: attachments,
     );
     if (!mounted) return;
-    _showTransientNotice('Reply all sent.');
+    _showTransientNotice('Reply all sent.', kind: _NoticeKind.success);
   }
 
   Future<void> _showCompose() async {
@@ -3931,7 +4223,7 @@ class _MailHomePageState extends State<MailHomePage>
     if (sent == true) {
       await _draftCache?.deleteComposeDraft();
       if (!mounted) return;
-      _showTransientNotice('Message sent.');
+      _showTransientNotice('Message sent.', kind: _NoticeKind.success);
     }
   }
 
@@ -3953,7 +4245,7 @@ class _MailHomePageState extends State<MailHomePage>
           ),
     );
     if (sent == true && mounted) {
-      _showTransientNotice('Message forwarded.');
+      _showTransientNotice('Message forwarded.', kind: _NoticeKind.success);
     }
   }
 
@@ -3964,7 +4256,10 @@ class _MailHomePageState extends State<MailHomePage>
     if (!mounted) return;
     if (vaultSecret == null || vaultSecret.trim().isEmpty) {
       if (mounted) {
-        setState(() => _banner = 'Unlock the local vault before sharing it.');
+        _showTransientNotice(
+          'Unlock the local vault before sharing it.',
+          kind: _NoticeKind.warning,
+        );
       }
       return;
     }
@@ -4063,7 +4358,12 @@ class _MailHomePageState extends State<MailHomePage>
       return updated;
     } catch (error) {
       if (mounted) {
-        setState(() => _banner = 'Could not load message body: $error');
+        setState(
+          () => _setPersistentNotice(
+            'Could not load message body: $error',
+            kind: _NoticeKind.error,
+          ),
+        );
       }
       return null;
     }
@@ -4147,9 +4447,10 @@ class _MailHomePageState extends State<MailHomePage>
     } catch (error) {
       if (!mounted) return;
       setState(
-        () =>
-            _banner =
-                'Marked read locally. Could not sync read state to the mailbox: $error',
+        () => _setPersistentNotice(
+          'Marked read locally. Could not sync read state to the mailbox: $error',
+          kind: _NoticeKind.warning,
+        ),
       );
     }
   }
@@ -4203,7 +4504,10 @@ class _MailHomePageState extends State<MailHomePage>
       throw StateError('Could not open ${file.path}');
     }
     if (!mounted) return;
-    _showTransientNotice('Attachment downloaded: ${file.path}');
+    _showTransientNotice(
+      'Attachment downloaded: ${file.path}',
+      kind: _NoticeKind.success,
+    );
   }
 
   bool get _supportsMobileSwipe {
@@ -4375,7 +4679,10 @@ class _MailHomePageState extends State<MailHomePage>
       } catch (error) {
         if (!mounted) return;
         _restoreMailUndoSnapshot(snapshot, notice: null);
-        _showTransientNotice('Could not sync mail action: $error', error: true);
+        _showTransientNotice(
+          'Could not sync mail action: $error',
+          kind: _NoticeKind.error,
+        );
       }
     });
 
@@ -4493,7 +4800,7 @@ class _MailHomePageState extends State<MailHomePage>
     action.timer?.cancel();
     action.closePrompt?.call();
     _restorePendingMessages(action.messages, displayOrder: action.displayOrder);
-    _showTransientNotice('Mail action undone.');
+    _showTransientNotice('Mail action undone.', kind: _NoticeKind.success);
   }
 
   Future<void> _commitPendingMailAction(int actionId) async {
@@ -4523,7 +4830,10 @@ class _MailHomePageState extends State<MailHomePage>
             .toList(growable: false),
         displayOrder: action.displayOrder,
       );
-      _showTransientNotice('Could not sync mail action: $cause', error: true);
+      _showTransientNotice(
+        'Could not sync mail action: $cause',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -4650,7 +4960,10 @@ class _MailHomePageState extends State<MailHomePage>
       } else {
         await _reloadMessages();
       }
-      _showTransientNotice('Could not sync mail action: $error', error: true);
+      _showTransientNotice(
+        'Could not sync mail action: $error',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -4910,7 +5223,10 @@ class _MailHomePageState extends State<MailHomePage>
       }
     } catch (error) {
       if (!mounted) return;
-      _showTransientNotice('Mail action failed: $error', error: true);
+      _showTransientNotice(
+        'Mail action failed: $error',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -4938,7 +5254,10 @@ class _MailHomePageState extends State<MailHomePage>
       setState(() => _selectedMessageIds = const <String>{});
     } catch (error) {
       if (!mounted) return;
-      _showTransientNotice('Batch mail action failed: $error', error: true);
+      _showTransientNotice(
+        'Batch mail action failed: $error',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -4951,7 +5270,10 @@ class _MailHomePageState extends State<MailHomePage>
       setState(() => _selectedMessageIds = const <String>{});
     } catch (error) {
       if (!mounted) return;
-      _showTransientNotice('Batch mail action failed: $error', error: true);
+      _showTransientNotice(
+        'Batch mail action failed: $error',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -5506,9 +5828,12 @@ class _RefreshButtonIcon extends StatelessWidget {
   }
 }
 
+enum _NoticeKind { info, success, warning, error, progress }
+
 class _InlineNoticeBanner extends StatelessWidget {
   const _InlineNoticeBanner({
     required this.message,
+    required this.kind,
     required this.onDismiss,
     this.actionIcon,
     this.actionTooltip,
@@ -5516,6 +5841,7 @@ class _InlineNoticeBanner extends StatelessWidget {
   });
 
   final String message;
+  final _NoticeKind kind;
   final VoidCallback onDismiss;
   final IconData? actionIcon;
   final String? actionTooltip;
@@ -5524,11 +5850,20 @@ class _InlineNoticeBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    final error = _looksLikeError(message);
-    final backgroundColor =
-        error ? colorScheme.errorContainer : colorScheme.secondaryContainer;
-    final foregroundColor =
-        error ? colorScheme.onErrorContainer : colorScheme.onSecondaryContainer;
+    final backgroundColor = switch (kind) {
+      _NoticeKind.error => colorScheme.errorContainer,
+      _NoticeKind.warning => colorScheme.tertiaryContainer,
+      _NoticeKind.success => colorScheme.primaryContainer,
+      _NoticeKind.info ||
+      _NoticeKind.progress => colorScheme.secondaryContainer,
+    };
+    final foregroundColor = switch (kind) {
+      _NoticeKind.error => colorScheme.onErrorContainer,
+      _NoticeKind.warning => colorScheme.onTertiaryContainer,
+      _NoticeKind.success => colorScheme.onPrimaryContainer,
+      _NoticeKind.info ||
+      _NoticeKind.progress => colorScheme.onSecondaryContainer,
+    };
     return Material(
       color: backgroundColor,
       child: Padding(
@@ -5536,7 +5871,13 @@ class _InlineNoticeBanner extends StatelessWidget {
         child: Row(
           children: [
             Icon(
-              error ? Icons.error_outline : Icons.info_outline,
+              switch (kind) {
+                _NoticeKind.error => Icons.error_outline,
+                _NoticeKind.warning => Icons.warning_amber_outlined,
+                _NoticeKind.success => Icons.check_circle_outline,
+                _NoticeKind.progress => Icons.sync,
+                _NoticeKind.info => Icons.info_outline,
+              },
               color: foregroundColor,
               size: 20,
             ),
@@ -5569,16 +5910,6 @@ class _InlineNoticeBanner extends StatelessWidget {
       ),
     );
   }
-
-  bool _looksLikeError(String value) {
-    final normalized = value.trim().toLowerCase();
-    return normalized.startsWith('could not') ||
-        normalized.startsWith('cannot') ||
-        normalized.startsWith('failed') ||
-        normalized.contains(' failed') ||
-        normalized.contains('error') ||
-        normalized.contains('could not ');
-  }
 }
 
 enum _SettingsAction {
@@ -5602,13 +5933,11 @@ enum _SettingsAction {
 class _SettingsFeedback {
   const _SettingsFeedback({
     required this.message,
-    this.warning = false,
-    this.error = false,
+    this.kind = _NoticeKind.success,
   });
 
   final String message;
-  final bool warning;
-  final bool error;
+  final _NoticeKind kind;
 }
 
 class _SettingsDialog extends StatelessWidget {
@@ -5869,12 +6198,12 @@ class _SettingsFeedbackBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    final color =
-        feedback.error
-            ? colorScheme.error
-            : feedback.warning
-            ? colorScheme.tertiary
-            : colorScheme.primary;
+    final color = switch (feedback.kind) {
+      _NoticeKind.error => colorScheme.error,
+      _NoticeKind.warning => colorScheme.tertiary,
+      _NoticeKind.success => colorScheme.primary,
+      _NoticeKind.info || _NoticeKind.progress => colorScheme.secondary,
+    };
     return Material(
       color: color.withValues(alpha: 0.1),
       borderRadius: BorderRadius.circular(6),
@@ -5884,11 +6213,13 @@ class _SettingsFeedbackBanner extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Icon(
-              feedback.error
-                  ? Icons.error_outline
-                  : feedback.warning
-                  ? Icons.sync_problem_outlined
-                  : Icons.check_circle_outline,
+              switch (feedback.kind) {
+                _NoticeKind.error => Icons.error_outline,
+                _NoticeKind.warning => Icons.sync_problem_outlined,
+                _NoticeKind.success => Icons.check_circle_outline,
+                _NoticeKind.progress => Icons.sync,
+                _NoticeKind.info => Icons.info_outline,
+              },
               color: color,
               size: 20,
             ),
