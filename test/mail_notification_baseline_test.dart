@@ -42,12 +42,72 @@ void main() {
 
     expect(fresh.map((message) => message.id), ['new-after-refresh']);
   });
+
+  test(
+    'older messages discovered later extend the baseline without notifying',
+    () {
+      final baseline = MailNotificationBaseline();
+      final newestKnown = _message('known', DateTime.utc(2026, 7, 7, 10));
+
+      baseline.freshMessages([newestKnown], completeStartupBaseline: true);
+      final fresh = baseline.freshMessages([
+        newestKnown,
+        _message('old-page', DateTime.utc(2024, 1, 1)),
+      ]);
+
+      expect(fresh, isEmpty);
+    },
+  );
+
+  test('only messages newer than the account watermark notify', () {
+    final baseline = MailNotificationBaseline();
+    final known = _message('known', DateTime.utc(2026, 7, 7, 10));
+
+    baseline.freshMessages([known], completeStartupBaseline: true);
+    final fresh = baseline.freshMessages([
+      _message('old-page', DateTime.utc(2024, 1, 1)),
+      _message('new-mail', DateTime.utc(2026, 7, 7, 10, 1)),
+    ]);
+
+    expect(fresh.map((message) => message.id), ['new-mail']);
+  });
+
+  test('first observation of another account is primed without notifying', () {
+    final baseline = MailNotificationBaseline();
+    baseline.freshMessages([
+      _message('known', DateTime.utc(2026, 7, 7, 10)),
+    ], completeStartupBaseline: true);
+
+    final firstAccountBatch = baseline.freshMessages([
+      _message(
+        'recovered-account-old-mail',
+        DateTime.utc(2020, 1, 1),
+        accountId: 'recovered',
+      ),
+    ]);
+    final nextAccountBatch = baseline.freshMessages([
+      _message(
+        'recovered-account-new-mail',
+        DateTime.utc(2026, 7, 7, 11),
+        accountId: 'recovered',
+      ),
+    ]);
+
+    expect(firstAccountBatch, isEmpty);
+    expect(nextAccountBatch.map((message) => message.id), [
+      'recovered-account-new-mail',
+    ]);
+  });
 }
 
-MailMessage _message(String id, DateTime receivedAt) {
+MailMessage _message(
+  String id,
+  DateTime receivedAt, {
+  String accountId = 'acc',
+}) {
   return MailMessage(
     id: id,
-    accountId: 'acc',
+    accountId: accountId,
     from: 'Alice <alice@example.com>',
     subject: id,
     preview: id,
