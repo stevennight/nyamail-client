@@ -312,7 +312,7 @@ class _MailHomePageState extends State<MailHomePage>
       case AppLifecycleState.resumed:
         _appIsInForeground = true;
         _syncAutomaticMailRefresh();
-        unawaited(_refreshMailboxAutomatically());
+        unawaited(_refreshMailboxAutomatically(forceFullRefresh: true));
         break;
       case AppLifecycleState.inactive:
         break;
@@ -556,7 +556,9 @@ class _MailHomePageState extends State<MailHomePage>
     );
   }
 
-  Future<void> _refreshMailboxAutomatically() async {
+  Future<void> _refreshMailboxAutomatically({
+    bool forceFullRefresh = false,
+  }) async {
     if (!_appIsInForeground ||
         _automaticMailRefreshInProgress ||
         _refreshingMail ||
@@ -576,6 +578,7 @@ class _MailHomePageState extends State<MailHomePage>
         requestId: requestId,
         completeStartupNotificationBaseline: completesNotificationBaseline,
         showRefreshIndicator: false,
+        forceFullRefresh: forceFullRefresh,
       );
       if (!mounted) return;
       if (_systemSettings.newMailNotifications &&
@@ -1354,7 +1357,8 @@ class _MailHomePageState extends State<MailHomePage>
       await _loadMoreMessages();
       return;
     }
-    if (_refreshingMail) return;
+    // A user refresh supersedes any startup or automatic result. Repository
+    // request sharing still coalesces repeated full refreshes.
     final requestId = _nextMessageLoadGeneration();
     if (resetLimit) {
       _hasMoreMessages = true;

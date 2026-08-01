@@ -874,6 +874,75 @@ void main() {
     },
   );
 
+  test('full refresh recovers when a folder UID sequence is reset', () async {
+    const inbox = MailFolder(
+      accountId: 'work',
+      path: 'INBOX',
+      displayName: 'Inbox',
+      kind: MailboxKind.inbox,
+    );
+    final transport =
+        _RecordingTransport()
+          ..foldersByCredential['work'] = [inbox]
+          ..messagesByFolder[inbox.key] = [
+            MailMessage(
+              id: 'work:inbox:100',
+              accountId: 'work',
+              from: 'Alice <alice@example.com>',
+              subject: 'Before reset',
+              preview: 'Before reset',
+              body: '',
+              receivedAt: DateTime.utc(2026, 7, 1),
+            ),
+          ];
+    final repository = CachedTransportMailRepository(
+      cache: _MemoryMailCache(),
+      transport: transport,
+      credentials: const [
+        MailboxCredential(
+          accountId: 'work',
+          address: 'me@example.com',
+          displayName: 'Me',
+          imapHost: 'imap.example.com',
+          imapPort: 993,
+          smtpHost: 'smtp.example.com',
+          smtpPort: 465,
+          username: 'me@example.com',
+          secret: 'secret',
+        ),
+      ],
+    );
+
+    await repository.viewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+    transport.messagesByFolder[inbox.key] = [
+      MailMessage(
+        id: 'work:inbox:1',
+        accountId: 'work',
+        from: 'Bob <bob@example.com>',
+        subject: 'After reset',
+        preview: 'After reset',
+        body: '',
+        receivedAt: DateTime.utc(2026, 7, 2),
+      ),
+    ];
+
+    final incremental = await repository.viewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+    final recovered = await repository.fullRefreshViewPage(
+      view: const MailboxView.smart(MailSmartFolder.allIncoming),
+    );
+
+    expect(incremental.messages.map((message) => message.subject), [
+      'Before reset',
+    ]);
+    expect(recovered.messages.map((message) => message.subject), [
+      'After reset',
+    ]);
+  });
+
   test('account folder view fetches only the selected real folder', () async {
     final projects = MailFolder(
       accountId: 'work',
