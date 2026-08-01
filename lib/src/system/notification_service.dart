@@ -11,7 +11,6 @@ class NyaMailNotificationService {
 
   bool _initialized = false;
   bool _enabled = false;
-  int _nextNotificationId = 1;
   AsyncVoidCallback? _onNotificationSelected;
 
   static bool get isSupported {
@@ -49,17 +48,22 @@ class NyaMailNotificationService {
   }
 
   Future<void> showNewMail({
+    required String notificationKey,
     required String title,
     required String body,
+    String? accountLabel,
     String? payload,
   }) async {
     if (!_enabled || !isSupported) return;
     await _ensureInitialized();
     await _plugin.show(
-      id: _nextNotificationId++,
+      id: notificationIdForKey(notificationKey),
       title: title,
       body: body,
-      notificationDetails: _notificationDetails(),
+      notificationDetails: _notificationDetails(
+        body: body,
+        accountLabel: accountLabel,
+      ),
       payload: payload,
     );
   }
@@ -112,26 +116,47 @@ class NyaMailNotificationService {
     }
   }
 
-  NotificationDetails _notificationDetails() {
-    return const NotificationDetails(
+  NotificationDetails _notificationDetails({
+    required String body,
+    String? accountLabel,
+  }) {
+    return NotificationDetails(
       android: AndroidNotificationDetails(
         'nyamail_new_mail',
         'New mail',
         channelDescription: 'Unread incoming mail discovered by NyaMail.',
         importance: Importance.high,
         priority: Priority.high,
+        category: AndroidNotificationCategory.email,
+        groupKey: 'nyamail_new_mail',
+        subText: accountLabel,
+        styleInformation: BigTextStyleInformation(body),
       ),
       iOS: DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
+        subtitle: accountLabel,
+        threadIdentifier: 'nyamail_new_mail',
       ),
       macOS: DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
+        subtitle: accountLabel,
+        threadIdentifier: 'nyamail_new_mail',
       ),
-      linux: LinuxNotificationDetails(),
+      linux: const LinuxNotificationDetails(),
     );
   }
+}
+
+int notificationIdForKey(String key) {
+  var hash = 0x811c9dc5;
+  for (final codeUnit in key.codeUnits) {
+    hash ^= codeUnit;
+    hash = (hash * 0x01000193) & 0xffffffff;
+  }
+  final positive = hash & 0x7fffffff;
+  return positive == 0 ? 1 : positive;
 }

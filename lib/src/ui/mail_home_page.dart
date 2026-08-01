@@ -21,6 +21,7 @@ import '../mail/mail_appearance.dart';
 import '../mail/mail_html_sanitizer.dart';
 import '../mail/mail_interaction_settings.dart';
 import '../mail/mail_notification_baseline.dart';
+import '../mail/mail_notification_content.dart';
 import '../mail/mailbox_diagnostics.dart';
 import '../mail/mail_models.dart';
 import '../mail/mail_render_settings.dart';
@@ -729,19 +730,17 @@ class _MailHomePageState extends State<MailHomePage>
       completeStartupBaseline: completeStartupBaseline,
     );
     if (!_systemSettings.newMailNotifications || fresh.isEmpty) return;
-    final title =
-        fresh.length == 1
-            ? 'New mail from ${fresh.first.from}'
-            : '${fresh.length} new messages';
-    final body =
-        fresh.length == 1
-            ? _notificationLineFor(fresh.first)
-            : fresh.take(3).map(_notificationLineFor).join('\n');
-    await _notificationService.showNewMail(
-      title: title,
-      body: body,
-      payload: fresh.first.id,
-    );
+    fresh.sort((a, b) => a.receivedAt.compareTo(b.receivedAt));
+    for (final message in fresh) {
+      final content = MailNotificationContent.fromMessage(message);
+      await _notificationService.showNewMail(
+        notificationKey: message.id,
+        title: content.title,
+        body: content.body,
+        accountLabel: _notificationAccountLabel(message.accountId),
+        payload: message.id,
+      );
+    }
   }
 
   bool _isNotifiableIncomingUnread(MailMessage message) {
@@ -749,11 +748,13 @@ class _MailHomePageState extends State<MailHomePage>
         mailMessageMatchesSmartFolder(message, MailSmartFolder.allIncoming);
   }
 
-  String _notificationLineFor(MailMessage message) {
-    final subject = mailMessageSubjectLabel(message.subject);
-    final preview = message.preview.trim();
-    if (preview.isEmpty) return subject;
-    return '$subject - $preview';
+  String? _notificationAccountLabel(String accountId) {
+    for (final account in _accounts) {
+      if (account.id != accountId) continue;
+      final displayName = account.displayName.trim();
+      return displayName.isEmpty ? account.address : displayName;
+    }
+    return null;
   }
 
   Future<bool> _tryUnlockLocalVault(
