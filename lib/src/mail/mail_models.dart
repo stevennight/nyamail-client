@@ -207,6 +207,22 @@ class MailMessage {
   }
 }
 
+MailMessage mailMessageUpdatePreservingLoadedBody({
+  required MailMessage current,
+  required MailMessage update,
+}) {
+  if (current.id != update.id || !current.bodyLoaded || update.bodyLoaded) {
+    return update;
+  }
+  return update.copyWith(
+    body: current.body,
+    htmlBody: current.htmlBody,
+    hasAttachments: current.hasAttachments,
+    attachments: current.attachments,
+    bodyLoaded: true,
+  );
+}
+
 class MailAttachment {
   const MailAttachment({
     required this.filename,

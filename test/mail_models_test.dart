@@ -92,6 +92,50 @@ void main() {
     expect(mailMessageMatchesQuery(message, 'missing'), isFalse);
   });
 
+  test('preview metadata update does not replace an already loaded body', () {
+    final loaded = MailMessage(
+      id: 'work:inbox:race',
+      accountId: 'work',
+      from: 'Alice <alice@example.com>',
+      subject: 'Status',
+      preview: 'Original preview',
+      body: 'Complete message body',
+      htmlBody: '<p>Complete message body</p>',
+      receivedAt: DateTime.utc(2026, 7, 1, 8, 30),
+      read: false,
+      hasAttachments: true,
+      attachments: const [
+        MailAttachment(
+          filename: 'status.pdf',
+          contentType: 'application/pdf',
+          partId: '2',
+        ),
+      ],
+    );
+    final markedReadPreview = loaded.copyWith(
+      preview: 'Updated preview',
+      body: '',
+      htmlBody: '',
+      read: true,
+      hasAttachments: false,
+      attachments: const [],
+      bodyLoaded: false,
+    );
+
+    final merged = mailMessageUpdatePreservingLoadedBody(
+      current: loaded,
+      update: markedReadPreview,
+    );
+
+    expect(merged.read, isTrue);
+    expect(merged.preview, 'Updated preview');
+    expect(merged.bodyLoaded, isTrue);
+    expect(merged.body, 'Complete message body');
+    expect(merged.htmlBody, '<p>Complete message body</p>');
+    expect(merged.hasAttachments, isTrue);
+    expect(merged.attachments.single.filename, 'status.pdf');
+  });
+
   test('unread smart folder matches unread incoming mail only', () {
     final unreadInbox = MailMessage(
       id: 'work:inbox:4',

@@ -5279,8 +5279,31 @@ class _MailHomePageState extends State<MailHomePage>
 
   void _replaceMessages(List<MailMessage> updatedMessages) {
     if (updatedMessages.isEmpty) return;
+    final currentById = {for (final message in _messages) message.id: message};
+    final selected = _selected;
+    if (selected != null &&
+        (selected.bodyLoaded ||
+            !(currentById[selected.id]?.bodyLoaded ?? false))) {
+      currentById[selected.id] = selected;
+    }
+    for (final entry in _mobileMessageNotifiers.entries) {
+      final current = currentById[entry.key];
+      if (entry.value.value.bodyLoaded && !(current?.bodyLoaded ?? false)) {
+        currentById[entry.key] = entry.value.value;
+      }
+    }
+    final mergedUpdates = [
+      for (final update in updatedMessages)
+        if (currentById[update.id] case final current?)
+          mailMessageUpdatePreservingLoadedBody(
+            current: current,
+            update: update,
+          )
+        else
+          update,
+    ];
     setState(() {
-      final byId = {for (final message in updatedMessages) message.id: message};
+      final byId = {for (final message in mergedUpdates) message.id: message};
       final messages = <MailMessage>[];
       for (final message in _messages) {
         final updated = byId[message.id];
@@ -5305,7 +5328,7 @@ class _MailHomePageState extends State<MailHomePage>
         }
       }
     });
-    _updateMobileMessageNotifiers(updatedMessages);
+    _updateMobileMessageNotifiers(mergedUpdates);
   }
 
   void _replaceMessage(MailMessage updated) {

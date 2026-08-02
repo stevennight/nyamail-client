@@ -54,15 +54,12 @@ class MailCache implements MailMessageCache {
         final normalized = _normalizeCachedMessage(message);
         final current = byId[normalized.id];
         final next =
-            current != null && current.bodyLoaded && !normalized.bodyLoaded
-                ? normalized.copyWith(
-                  body: current.body,
-                  htmlBody: current.htmlBody,
-                  hasAttachments: current.hasAttachments,
-                  attachments: current.attachments,
-                  bodyLoaded: true,
-                )
-                : normalized;
+            current == null
+                ? normalized
+                : mailMessageUpdatePreservingLoadedBody(
+                  current: current,
+                  update: normalized,
+                );
         if (current == null || !_sameCachedMessage(current, next)) {
           changed = true;
         }
