@@ -67,7 +67,7 @@ build/releases/nyamail-android-<version>.apk
 build/releases/nyamail-android-<version>.apk.sha256
 ```
 
-The version comes from `pubspec.yaml`, currently `1.0.1+2`. The Windows zip
+The version comes from `pubspec.yaml`, currently `1.0.2+3`. The Windows zip
 contains the Flutter `Release` directory contents and excludes stale zip files
 from previous builds. Use `-SkipWindows`, `-SkipAndroid`, or `-NoPub` when you
 only need part of the build. Release builds use the `stable` update channel by

@@ -46,6 +46,7 @@ import '../security/local_vault_sync_state_store.dart';
 import '../security/local_vault_store.dart';
 import '../security/vault_crypto.dart';
 import '../security/vault_document.dart';
+import '../security/vault_export.dart';
 import '../security/vault_record_crypto.dart';
 import '../security/vault_record_sync_engine.dart';
 import '../security/vault_records.dart';
@@ -2383,6 +2384,12 @@ class _MailHomePageState extends State<MailHomePage>
       case _SettingsAction.clearLocalData:
         await _clearLocalData();
         return false;
+      case _SettingsAction.exportVault:
+        await _exportVault();
+        return true;
+      case _SettingsAction.importVault:
+        await _importVault();
+        return true;
       case _SettingsAction.devices:
         if (_session != null) await _showDevices();
         return true;
@@ -2393,6 +2400,124 @@ class _MailHomePageState extends State<MailHomePage>
         final pairingPackage = _pendingPairingPackage;
         if (pairingPackage != null) await _showPairingQr(pairingPackage);
         return true;
+    }
+  }
+
+  Future<void> _exportVault() async {
+    final profile = await _ensureLocalProfile();
+    final document = _vaultDocument;
+    if (profile == null || document == null || !mounted) return;
+    final input = await showDialog<_VaultPasswordInput>(
+      context: context,
+      builder:
+          (context) => const _VaultPasswordDialog(
+            title: 'Export vault configuration',
+            message:
+                'This exports mailbox credentials and OAuth settings only. Mail, drafts, attachments, and cache are not included.',
+            confirmPassword: true,
+            passwordLabel: 'Export password',
+            actionLabel: 'Export',
+          ),
+    );
+    if (input == null || !mounted) return;
+    try {
+      final encoded = await const VaultExportService().exportDocument(
+        document: document,
+        password: input.password,
+      );
+      final filename =
+          'nyamail-vault-${DateTime.now().toIso8601String().substring(0, 10)}.${VaultExportService.extension}';
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Export vault configuration',
+        fileName: filename,
+        type: FileType.custom,
+        allowedExtensions: [VaultExportService.extension],
+      );
+      if (path == null) return;
+      await io.File(path).writeAsString(encoded, encoding: utf8);
+      if (!mounted) return;
+      _showTransientNotice(
+        'Vault configuration exported successfully.',
+        kind: _NoticeKind.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      _showTransientNotice(
+        'Could not export vault configuration: $error',
+        kind: _NoticeKind.error,
+      );
+    }
+  }
+
+  Future<void> _importVault() async {
+    final profile = await _ensureLocalProfile();
+    if (profile == null || !mounted) return;
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Import vault configuration',
+        type: FileType.custom,
+        allowedExtensions: [VaultExportService.extension],
+        withData: true,
+      );
+      if (result == null || result.files.isEmpty || !mounted) return;
+      final selected = result.files.single;
+      final bytes =
+          selected.bytes ??
+          (selected.path == null
+              ? null
+              : await io.File(selected.path!).readAsBytes());
+      if (bytes == null) {
+        throw const VaultExportException('could not read the selected file');
+      }
+      if (!mounted) return;
+      final input = await showDialog<_VaultPasswordInput>(
+        context: context,
+        builder:
+            (context) => const _VaultPasswordDialog(
+              title: 'Import vault configuration',
+              message:
+                  'Enter the export password. Mail, drafts, attachments, and cache will remain on this device.',
+              confirmPassword: false,
+              passwordLabel: 'Export password',
+              actionLabel: 'Continue',
+            ),
+      );
+      if (input == null || !mounted) return;
+      final incoming = await const VaultExportService().importDocument(
+        encoded: utf8.decode(bytes),
+        password: input.password,
+      );
+      if (!mounted) return;
+      final plan = VaultImportPlan.create(
+        current: _vaultDocument ?? VaultDocument.empty(),
+        incoming: incoming,
+      );
+      final policy =
+          plan.hasConflicts
+              ? await showDialog<VaultImportConflictPolicy>(
+                context: context,
+                builder: (context) => _VaultImportConflictDialog(plan: plan),
+              )
+              : VaultImportConflictPolicy.keepLocal;
+      if (policy == null || !mounted) return;
+      final merged = plan.merge(policy);
+      await _saveLocalVaultDocument(profile: profile, document: merged);
+      await _applyVaultDocument(merged);
+      if (!mounted) return;
+      final conflictCount =
+          plan.mailboxConflicts.length + plan.oauthProviderConflicts.length;
+      final conflictText =
+          conflictCount == 0 ? '' : ', $conflictCount conflicts';
+      _showTransientNotice(
+        'Vault configuration imported$conflictText.',
+        kind: _NoticeKind.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      _showTransientNotice(
+        'Could not import vault configuration: $error',
+        kind: _NoticeKind.error,
+      );
     }
   }
 
@@ -6058,6 +6183,8 @@ enum _SettingsAction {
   oauthProviderSettings,
   systemSettings,
   clearLocalData,
+  exportVault,
+  importVault,
   devices,
   receiveVaultShare,
   showPairingQr,
@@ -6189,44 +6316,6 @@ class _SettingsContent extends StatelessWidget {
           SizedBox(height: spacing),
         ],
         _SettingsSection(
-          title: 'Sync',
-          children: [
-            _SettingsTile(
-              action: _SettingsAction.syncAccount,
-              icon:
-                  session == null ? Icons.login : Icons.verified_user_outlined,
-              title: session == null ? 'Sync account' : session!.email,
-              subtitle: session == null ? 'Not signed in' : 'Signed in',
-            ),
-            _SettingsTile(
-              action: _SettingsAction.devices,
-              icon: Icons.devices_outlined,
-              title: 'Devices',
-              subtitle: session == null ? 'Sign in to manage devices' : null,
-              enabled: session != null,
-            ),
-            _SettingsTile(
-              action: _SettingsAction.receiveVaultShare,
-              icon: Icons.cloud_download_outlined,
-              title:
-                  claimingVaultShare
-                      ? 'Receiving vault share'
-                      : 'Receive vault share',
-              subtitle: session == null ? 'Sign in on this device first' : null,
-              enabled: session != null && !claimingVaultShare,
-              progress: claimingVaultShare,
-            ),
-            _SettingsTile(
-              action: _SettingsAction.showPairingQr,
-              icon: Icons.qr_code_2,
-              title: 'Show pairing QR',
-              subtitle: hasPendingPairingQr ? null : 'No pending pairing code',
-              enabled: hasPendingPairingQr,
-            ),
-          ],
-        ),
-        SizedBox(height: spacing),
-        _SettingsSection(
           title: 'Mail',
           children: [
             _SettingsTile(
@@ -6318,6 +6407,24 @@ class _SettingsContent extends StatelessWidget {
             ),
           ],
         ),
+        SizedBox(height: spacing),
+        _SettingsSection(
+          title: 'Vault data',
+          children: [
+            _SettingsTile(
+              action: _SettingsAction.exportVault,
+              icon: Icons.file_upload_outlined,
+              title: 'Export vault configuration',
+              subtitle: 'Encrypted mailbox and OAuth settings only',
+            ),
+            _SettingsTile(
+              action: _SettingsAction.importVault,
+              icon: Icons.file_download_outlined,
+              title: 'Import vault configuration',
+              subtitle: 'Merge with the local vault',
+            ),
+          ],
+        ),
       ],
     );
   }
@@ -6406,7 +6513,6 @@ class _SettingsTile extends StatelessWidget {
     required this.title,
     this.subtitle,
     this.enabled = true,
-    this.progress = false,
     this.destructive = false,
   });
 
@@ -6415,7 +6521,6 @@ class _SettingsTile extends StatelessWidget {
   final String title;
   final String? subtitle;
   final bool enabled;
-  final bool progress;
   final bool destructive;
 
   @override
@@ -6430,13 +6535,7 @@ class _SettingsTile extends StatelessWidget {
       color: Colors.transparent,
       child: ListTile(
         enabled: enabled,
-        leading:
-            progress
-                ? const SizedBox.square(
-                  dimension: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-                : Icon(icon, color: enabled ? foreground : secondary),
+        leading: Icon(icon, color: enabled ? foreground : secondary),
         title: Text(
           title,
           maxLines: 1,
@@ -11370,11 +11469,15 @@ class _VaultPasswordDialog extends StatefulWidget {
     required this.title,
     required this.message,
     required this.confirmPassword,
+    this.passwordLabel = 'Vault password',
+    this.actionLabel = 'Continue',
   });
 
   final String title;
   final String message;
   final bool confirmPassword;
+  final String passwordLabel;
+  final String actionLabel;
 
   @override
   State<_VaultPasswordDialog> createState() => _VaultPasswordDialogState();
@@ -11413,7 +11516,7 @@ class _VaultPasswordDialogState extends State<_VaultPasswordDialog> {
               onSubmitted: (_) {
                 if (!widget.confirmPassword) _submit();
               },
-              decoration: const InputDecoration(labelText: 'Vault password'),
+              decoration: InputDecoration(labelText: widget.passwordLabel),
             ),
             if (widget.confirmPassword) ...[
               const SizedBox(height: 10),
@@ -11441,7 +11544,7 @@ class _VaultPasswordDialogState extends State<_VaultPasswordDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        FilledButton(onPressed: _submit, child: const Text('Continue')),
+        FilledButton(onPressed: _submit, child: Text(widget.actionLabel)),
       ],
     );
   }
@@ -11457,6 +11560,80 @@ class _VaultPasswordDialogState extends State<_VaultPasswordDialog> {
       return;
     }
     Navigator.of(context).pop(_VaultPasswordInput(password));
+  }
+}
+
+class _VaultImportConflictDialog extends StatefulWidget {
+  const _VaultImportConflictDialog({required this.plan});
+
+  final VaultImportPlan plan;
+
+  @override
+  State<_VaultImportConflictDialog> createState() =>
+      _VaultImportConflictDialogState();
+}
+
+class _VaultImportConflictDialogState
+    extends State<_VaultImportConflictDialog> {
+  VaultImportConflictPolicy _policy = VaultImportConflictPolicy.keepLocal;
+
+  @override
+  Widget build(BuildContext context) {
+    final plan = widget.plan;
+    final conflictCount =
+        plan.mailboxConflicts.length + plan.oauthProviderConflicts.length;
+    return AlertDialog(
+      title: const Text('Import conflicts found'),
+      content: _DialogContent(
+        width: 500,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${plan.newMailboxCount} new mailbox accounts and ${plan.newOAuthProviderCount} new OAuth providers will be added. $conflictCount existing entries match the import.',
+            ),
+            const SizedBox(height: 12),
+            RadioGroup<VaultImportConflictPolicy>(
+              groupValue: _policy,
+              onChanged: (value) {
+                if (value != null) setState(() => _policy = value);
+              },
+              child: const Column(
+                children: [
+                  RadioListTile<VaultImportConflictPolicy>(
+                    contentPadding: EdgeInsets.zero,
+                    value: VaultImportConflictPolicy.keepLocal,
+                    title: Text('Keep local entries'),
+                    subtitle: Text(
+                      'Safer when the imported file may be older.',
+                    ),
+                  ),
+                  RadioListTile<VaultImportConflictPolicy>(
+                    contentPadding: EdgeInsets.zero,
+                    value: VaultImportConflictPolicy.replaceLocal,
+                    title: Text('Replace matching entries'),
+                    subtitle: Text(
+                      'Use credentials and settings from the file.',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_policy),
+          child: const Text('Import'),
+        ),
+      ],
+    );
   }
 }
 
