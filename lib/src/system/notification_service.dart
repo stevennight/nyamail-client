@@ -1,9 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-import 'tray_service.dart';
+typedef NotificationSelectionCallback = Future<void> Function(String? payload);
 
 class NyaMailNotificationService {
   final FlutterLocalNotificationsPlugin _plugin =
@@ -11,7 +12,8 @@ class NyaMailNotificationService {
 
   bool _initialized = false;
   bool _enabled = false;
-  AsyncVoidCallback? _onNotificationSelected;
+  bool _launchDetailsHandled = false;
+  NotificationSelectionCallback? _onNotificationSelected;
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -31,7 +33,7 @@ class NyaMailNotificationService {
 
   Future<void> configure({
     required bool enabled,
-    AsyncVoidCallback? onNotificationSelected,
+    NotificationSelectionCallback? onNotificationSelected,
   }) async {
     _onNotificationSelected = onNotificationSelected;
     if (!isSupported) {
@@ -82,12 +84,32 @@ class NyaMailNotificationService {
           guid: '5f12e660-1bdb-4d76-9cdb-2c5574eac6e5',
         ),
       ),
-      onDidReceiveNotificationResponse: (_) {
-        final callback = _onNotificationSelected;
-        if (callback != null) callback();
+      onDidReceiveNotificationResponse: (response) {
+        _dispatchNotificationSelection(response.payload);
       },
     );
     _initialized = true;
+    await _dispatchLaunchNotificationIfNeeded();
+  }
+
+  Future<void> _dispatchLaunchNotificationIfNeeded() async {
+    if (_launchDetailsHandled) return;
+    _launchDetailsHandled = true;
+    try {
+      final details = await _plugin.getNotificationAppLaunchDetails();
+      if (details?.didNotificationLaunchApp ?? false) {
+        _dispatchNotificationSelection(details?.notificationResponse?.payload);
+      }
+    } catch (error) {
+      debugPrint(
+        '[NyaMail notifications] could not read launch notification: $error',
+      );
+    }
+  }
+
+  void _dispatchNotificationSelection(String? payload) {
+    final callback = _onNotificationSelected;
+    if (callback != null) unawaited(callback(payload));
   }
 
   Future<void> _requestPermissions() async {
@@ -149,6 +171,11 @@ class NyaMailNotificationService {
       linux: const LinuxNotificationDetails(),
     );
   }
+}
+
+String? notificationMessageIdFromPayload(String? payload) {
+  final value = payload?.trim();
+  return value == null || value.isEmpty ? null : value;
 }
 
 int notificationIdForKey(String key) {

@@ -216,6 +216,7 @@ class MailHomePage extends StatefulWidget {
 class _MailHomePageState extends State<MailHomePage>
     with WidgetsBindingObserver {
   static const _messagePageSize = 30;
+  static const _notificationMessageLookupLimit = 100;
   static const _mailActionUndoWindow = Duration(seconds: 5);
 
   LocalSession? _session;
@@ -276,6 +277,8 @@ class _MailHomePageState extends State<MailHomePage>
   bool _appIsInForeground = true;
   int _pendingStartupMailboxWork = 0;
   bool _pollingNewMail = false;
+  String? _pendingNotificationMessageId;
+  bool _openingNotificationMessage = false;
   final _newMailNotificationBaseline = MailNotificationBaseline();
   late final LocalVaultAuthenticator _vaultAuthenticator =
       LocalVaultAuthenticator();
@@ -450,13 +453,110 @@ class _MailHomePageState extends State<MailHomePage>
     );
     await _notificationService.configure(
       enabled: settings.newMailNotifications,
-      onNotificationSelected: _showMainWindowFromSystemSurface,
+      onNotificationSelected: _handleNotificationSelected,
     );
+    if (!settings.openMessageFromNotification) {
+      _pendingNotificationMessageId = null;
+    }
     _syncAutomaticMailRefresh();
   }
 
   Future<void> _showMainWindowFromSystemSurface() async {
     await _trayService.showWindow();
+  }
+
+  Future<void> _handleNotificationSelected(String? payload) async {
+    await _showMainWindowFromSystemSurface();
+    if (!mounted || !_systemSettings.openMessageFromNotification) return;
+    final messageId = notificationMessageIdFromPayload(payload);
+    if (messageId == null) return;
+    _pendingNotificationMessageId = messageId;
+    await _openPendingNotificationMessageIfReady();
+  }
+
+  Future<void> _openPendingNotificationMessageIfReady() async {
+    final messageId = _pendingNotificationMessageId;
+    if (messageId == null ||
+        _openingNotificationMessage ||
+        !_hasUnlockedLocalVault ||
+        _loading) {
+      return;
+    }
+
+    _openingNotificationMessage = true;
+    try {
+      MailMessage? target = _messageForId(_messages, messageId);
+      MailMessagePage? targetPage;
+      const targetView = MailboxView.smart(MailSmartFolder.allIncoming);
+
+      if (target == null) {
+        targetPage = await _mailRepository.cachedViewPage(
+          view: targetView,
+          limit: _notificationMessageLookupLimit,
+        );
+        target = _messageForId(
+          _visibleMessagesForDisplay(targetPage.messages),
+          messageId,
+        );
+      }
+
+      if (target == null) {
+        targetPage = await _loadRemoteViewPage(
+          view: targetView,
+          limit: _notificationMessageLookupLimit,
+        );
+        target = _messageForId(
+          _visibleMessagesForDisplay(targetPage.messages),
+          messageId,
+        );
+      }
+
+      if (!mounted || _pendingNotificationMessageId != messageId) return;
+      if (target == null) {
+        _pendingNotificationMessageId = null;
+        _showTransientNotice(
+          'The message from this notification is no longer available.',
+          kind: _NoticeKind.warning,
+        );
+        return;
+      }
+
+      if (!_messages.any((message) => message.id == messageId)) {
+        final messages = _visibleMessagesForDisplay(targetPage!.messages);
+        setState(() {
+          _search.clear();
+          _view = targetView;
+          _selectedAccountId = null;
+          _messages = messages;
+          _selectedMessageIds = const <String>{};
+          _hasMoreMessages = targetPage!.hasMore;
+        });
+        target = _messageForId(messages, messageId)!;
+      }
+
+      _pendingNotificationMessageId = null;
+      Navigator.of(context).popUntil((route) => route.isFirst);
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      if (_readerPaneVisible) {
+        _selectMessage(target);
+      } else {
+        unawaited(_openMobileMessage(target));
+      }
+    } catch (error) {
+      if (!mounted || _pendingNotificationMessageId != messageId) return;
+      _pendingNotificationMessageId = null;
+      debugPrint('[NyaMail notifications] could not open message: $error');
+      _showTransientNotice(
+        'Could not open the message from this notification.',
+        kind: _NoticeKind.warning,
+      );
+    } finally {
+      _openingNotificationMessage = false;
+      if (mounted && _pendingNotificationMessageId != null) {
+        unawaited(_openPendingNotificationMessageIfReady());
+      }
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -573,6 +673,9 @@ class _MailHomePageState extends State<MailHomePage>
     });
     _debugVault('finish bootstrap: unlocked frame ready');
     _resetNewMailNotificationBaseline();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_openPendingNotificationMessageIfReady());
+    });
     final requestId = _nextMessageLoadGeneration();
     _pendingStartupMailboxWork++;
     unawaited(
@@ -5389,6 +5492,13 @@ class _MailHomePageState extends State<MailHomePage>
     }
     return fallbackToFirst ? messages.first : null;
   }
+
+  MailMessage? _messageForId(List<MailMessage> messages, String id) {
+    for (final message in messages) {
+      if (message.id == id) return message;
+    }
+    return null;
+  }
 }
 
 class _MailUndoSnapshot {
@@ -6432,6 +6542,21 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
                       ? null
                       : _setNewMailNotifications,
             ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.mark_email_read_outlined),
+              title: const Text('Open message from notification'),
+              subtitle: const Text(
+                'Open the matching message when a notification is selected.',
+              ),
+              value: _settings.openMessageFromNotification,
+              onChanged:
+                  _loading ||
+                          !_settings.newMailNotifications ||
+                          !NyaMailNotificationService.isSupported
+                      ? null
+                      : _setOpenMessageFromNotification,
+            ),
             if (_error != null) ...[
               const SizedBox(height: 8),
               Text(
@@ -6479,6 +6604,12 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
   Future<void> _setNewMailNotifications(bool enabled) async {
     await _setBehaviorSetting(
       _settings.copyWith(newMailNotifications: enabled),
+    );
+  }
+
+  Future<void> _setOpenMessageFromNotification(bool enabled) async {
+    await _setBehaviorSetting(
+      _settings.copyWith(openMessageFromNotification: enabled),
     );
   }
 
