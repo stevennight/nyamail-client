@@ -2432,9 +2432,9 @@ class _MailHomePageState extends State<MailHomePage>
         fileName: filename,
         type: FileType.custom,
         allowedExtensions: [VaultExportService.extension],
+        bytes: Uint8List.fromList(utf8.encode(encoded)),
       );
       if (path == null) return;
-      await io.File(path).writeAsString(encoded, encoding: utf8);
       if (!mounted) return;
       _showTransientNotice(
         'Vault configuration exported successfully.',
