@@ -83,7 +83,9 @@ signing is incomplete.
 `.github/workflows/ci.yml` runs analysis and tests for pull requests. Pushes to
 `main`, tags matching `v*`, and manual runs also build signed Windows and
 Android release artifacts with `scripts/build-release.ps1` and upload their
-SHA256 files.
+SHA256 files. Tag builds create a GitHub Release and attach both platform
+artifacts and checksum files. To publish an existing tag, manually run the
+workflow and provide that tag in the optional `release_tag` input.
 
 Configure this repository variable in GitHub Actions:
 
