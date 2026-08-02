@@ -49,7 +49,10 @@ jobs:
     name: Windows release
     if: github.event_name != 'pull_request'
     needs: quality
-    runs-on: windows-latest
+    # Flutter's Windows plugins still include the legacy coroutine header.
+    # Pin VS 2022 until those plugins support the MSVC 14.51 toolchain shipped
+    # by windows-latest.
+    runs-on: windows-2022
     env:
       NYAMAIL_API_BASE_URL: ${{ vars.NYAMAIL_API_BASE_URL }}
       NYAMAIL_RELEASE_PUBLIC_KEY: ${{ secrets.NYAMAIL_RELEASE_PUBLIC_KEY }}
