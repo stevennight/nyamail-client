@@ -2295,55 +2295,61 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   Future<void> _showSettings() async {
-    var keepOpen = true;
-    _SettingsFeedback? feedback;
-    while (keepOpen) {
-      if (!mounted) return;
-      final smallScreen = MediaQuery.sizeOf(context).width < 720;
-      final action =
-          smallScreen
-              ? await Navigator.of(context).push<_SettingsAction>(
-                MaterialPageRoute(
-                  fullscreenDialog: true,
-                  builder:
-                      (context) => _SettingsPage(
-                        session: _session,
-                        profile: _profile,
-                        accountCount: _accounts.length,
-                        claimingVaultShare: _claimingVaultShare,
-                        hasPendingPairingQr: _pendingPairingPackage != null,
-                        feedback: feedback,
-                      ),
-                ),
-              )
-              : await showDialog<_SettingsAction>(
-                context: context,
-                builder:
-                    (context) => _SettingsDialog(
-                      session: _session,
-                      profile: _profile,
-                      accountCount: _accounts.length,
-                      claimingVaultShare: _claimingVaultShare,
-                      hasPendingPairingQr: _pendingPairingPackage != null,
-                      feedback: feedback,
-                    ),
-              );
-      if (!mounted || action == null) return;
-      feedback = null;
-      if (action == _SettingsAction.addMailbox) {
-        feedback = await _showAddMailbox(showResultNotice: false);
-        keepOpen = true;
-        continue;
-      }
+    if (!mounted) return;
+    final smallScreen = MediaQuery.sizeOf(context).width < 720;
+    final onAction = _runSettingsAction;
+    if (smallScreen) {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          fullscreenDialog: true,
+          builder:
+              (context) => _SettingsPage(
+                session: _session,
+                profile: _profile,
+                accountCount: _accounts.length,
+                claimingVaultShare: _claimingVaultShare,
+                hasPendingPairingQr: _pendingPairingPackage != null,
+                onAction: onAction,
+              ),
+        ),
+      );
+    } else {
+      await showDialog<void>(
+        context: context,
+        builder:
+            (context) => _SettingsDialog(
+              session: _session,
+              profile: _profile,
+              accountCount: _accounts.length,
+              claimingVaultShare: _claimingVaultShare,
+              hasPendingPairingQr: _pendingPairingPackage != null,
+              onAction: onAction,
+            ),
+      );
+    }
+  }
+
+  Future<_SettingsActionResult> _runSettingsAction(
+    _SettingsAction action,
+  ) async {
+    if (!mounted) {
+      return const _SettingsActionResult(keepOpen: false);
+    }
+    if (action == _SettingsAction.addMailbox) {
+      final feedback = await _showAddMailbox(showResultNotice: false);
+      return _SettingsActionResult(keepOpen: true, feedback: feedback);
+    }
+    _capturedSettingsFeedback = null;
+    _captureSettingsNotices = true;
+    try {
+      final keepOpen = await _handleSettingsAction(action);
+      return _SettingsActionResult(
+        keepOpen: keepOpen,
+        feedback: _capturedSettingsFeedback,
+      );
+    } finally {
+      _captureSettingsNotices = false;
       _capturedSettingsFeedback = null;
-      _captureSettingsNotices = true;
-      try {
-        keepOpen = await _handleSettingsAction(action);
-        feedback = _capturedSettingsFeedback;
-      } finally {
-        _captureSettingsNotices = false;
-        _capturedSettingsFeedback = null;
-      }
     }
   }
 
@@ -6190,6 +6196,16 @@ enum _SettingsAction {
   showPairingQr,
 }
 
+typedef _SettingsActionHandler =
+    Future<_SettingsActionResult> Function(_SettingsAction action);
+
+class _SettingsActionResult {
+  const _SettingsActionResult({required this.keepOpen, this.feedback});
+
+  final bool keepOpen;
+  final _SettingsFeedback? feedback;
+}
+
 class _SettingsFeedback {
   const _SettingsFeedback({
     required this.message,
@@ -6200,14 +6216,14 @@ class _SettingsFeedback {
   final _NoticeKind kind;
 }
 
-class _SettingsDialog extends StatelessWidget {
+class _SettingsDialog extends StatefulWidget {
   const _SettingsDialog({
     required this.session,
     required this.profile,
     required this.accountCount,
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
-    this.feedback,
+    required this.onAction,
   });
 
   final LocalSession? session;
@@ -6215,7 +6231,21 @@ class _SettingsDialog extends StatelessWidget {
   final int accountCount;
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
-  final _SettingsFeedback? feedback;
+  final _SettingsActionHandler onAction;
+
+  @override
+  State<_SettingsDialog> createState() => _SettingsDialogState();
+}
+
+class _SettingsDialogState extends State<_SettingsDialog> {
+  _SettingsFeedback? _feedback;
+
+  Future<void> _handleAction(_SettingsAction action) async {
+    final result = await widget.onAction(action);
+    if (!mounted) return;
+    setState(() => _feedback = result.feedback);
+    if (!result.keepOpen) Navigator.of(context).pop();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -6225,12 +6255,13 @@ class _SettingsDialog extends StatelessWidget {
         width: 560,
         maxHeight: 680,
         child: _SettingsContent(
-          session: session,
-          profile: profile,
-          accountCount: accountCount,
-          claimingVaultShare: claimingVaultShare,
-          hasPendingPairingQr: hasPendingPairingQr,
-          feedback: feedback,
+          session: widget.session,
+          profile: widget.profile,
+          accountCount: widget.accountCount,
+          claimingVaultShare: widget.claimingVaultShare,
+          hasPendingPairingQr: widget.hasPendingPairingQr,
+          feedback: _feedback,
+          onAction: _handleAction,
           compact: false,
         ),
       ),
@@ -6244,14 +6275,14 @@ class _SettingsDialog extends StatelessWidget {
   }
 }
 
-class _SettingsPage extends StatelessWidget {
+class _SettingsPage extends StatefulWidget {
   const _SettingsPage({
     required this.session,
     required this.profile,
     required this.accountCount,
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
-    this.feedback,
+    required this.onAction,
   });
 
   final LocalSession? session;
@@ -6259,7 +6290,21 @@ class _SettingsPage extends StatelessWidget {
   final int accountCount;
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
-  final _SettingsFeedback? feedback;
+  final _SettingsActionHandler onAction;
+
+  @override
+  State<_SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<_SettingsPage> {
+  _SettingsFeedback? _feedback;
+
+  Future<void> _handleAction(_SettingsAction action) async {
+    final result = await widget.onAction(action);
+    if (!mounted) return;
+    setState(() => _feedback = result.feedback);
+    if (!result.keepOpen) Navigator.of(context).pop();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -6270,12 +6315,13 @@ class _SettingsPage extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           children: [
             _SettingsContent(
-              session: session,
-              profile: profile,
-              accountCount: accountCount,
-              claimingVaultShare: claimingVaultShare,
-              hasPendingPairingQr: hasPendingPairingQr,
-              feedback: feedback,
+              session: widget.session,
+              profile: widget.profile,
+              accountCount: widget.accountCount,
+              claimingVaultShare: widget.claimingVaultShare,
+              hasPendingPairingQr: widget.hasPendingPairingQr,
+              feedback: _feedback,
+              onAction: _handleAction,
               compact: true,
             ),
           ],
@@ -6293,6 +6339,7 @@ class _SettingsContent extends StatelessWidget {
     required this.claimingVaultShare,
     required this.hasPendingPairingQr,
     required this.compact,
+    required this.onAction,
     this.feedback,
   });
 
@@ -6302,6 +6349,7 @@ class _SettingsContent extends StatelessWidget {
   final bool claimingVaultShare;
   final bool hasPendingPairingQr;
   final bool compact;
+  final Future<void> Function(_SettingsAction action) onAction;
   final _SettingsFeedback? feedback;
 
   @override
@@ -6320,6 +6368,7 @@ class _SettingsContent extends StatelessWidget {
           children: [
             _SettingsTile(
               action: _SettingsAction.addMailbox,
+              onAction: onAction,
               icon: Icons.add,
               title: 'Add mailbox',
               subtitle:
@@ -6331,6 +6380,7 @@ class _SettingsContent extends StatelessWidget {
             ),
             _SettingsTile(
               action: _SettingsAction.mailboxes,
+              onAction: onAction,
               icon: Icons.alternate_email,
               title: 'Mailboxes',
               subtitle:
@@ -6341,17 +6391,20 @@ class _SettingsContent extends StatelessWidget {
             ),
             _SettingsTile(
               action: _SettingsAction.clearMailCache,
+              onAction: onAction,
               icon: Icons.cleaning_services_outlined,
               title: 'Clear mail cache',
               subtitle: 'Re-fetch messages and rebuild local index',
             ),
             _SettingsTile(
               action: _SettingsAction.oauthProviderSettings,
+              onAction: onAction,
               icon: Icons.vpn_key_outlined,
               title: 'OAuth providers',
             ),
             _SettingsTile(
               action: _SettingsAction.checkUpdates,
+              onAction: onAction,
               icon: Icons.system_update_alt,
               title: 'Check for updates',
             ),
@@ -6363,16 +6416,19 @@ class _SettingsContent extends StatelessWidget {
           children: [
             _SettingsTile(
               action: _SettingsAction.appThemeSettings,
+              onAction: onAction,
               icon: Icons.palette_outlined,
               title: 'App appearance',
             ),
             _SettingsTile(
               action: _SettingsAction.mailSettings,
+              onAction: onAction,
               icon: Icons.tune,
               title: 'Mail rendering',
             ),
             _SettingsTile(
               action: _SettingsAction.mailInteractionSettings,
+              onAction: onAction,
               icon: Icons.touch_app_outlined,
               title: 'Mail list actions',
             ),
@@ -6384,6 +6440,7 @@ class _SettingsContent extends StatelessWidget {
           children: [
             _SettingsTile(
               action: _SettingsAction.systemSettings,
+              onAction: onAction,
               icon: Icons.power_settings_new_outlined,
               title: 'Startup, tray, notifications',
             ),
@@ -6395,12 +6452,14 @@ class _SettingsContent extends StatelessWidget {
           children: [
             _SettingsTile(
               action: _SettingsAction.localVaultSettings,
+              onAction: onAction,
               icon: Icons.lock_outline,
               title: 'Local vault',
               subtitle: profile?.label,
             ),
             _SettingsTile(
               action: _SettingsAction.clearLocalData,
+              onAction: onAction,
               icon: Icons.delete_forever_outlined,
               title: 'Clear local data',
               destructive: true,
@@ -6413,12 +6472,14 @@ class _SettingsContent extends StatelessWidget {
           children: [
             _SettingsTile(
               action: _SettingsAction.exportVault,
+              onAction: onAction,
               icon: Icons.file_upload_outlined,
               title: 'Export vault configuration',
               subtitle: 'Encrypted mailbox and OAuth settings only',
             ),
             _SettingsTile(
               action: _SettingsAction.importVault,
+              onAction: onAction,
               icon: Icons.file_download_outlined,
               title: 'Import vault configuration',
               subtitle: 'Merge with the local vault',
@@ -6509,6 +6570,7 @@ class _SettingsSection extends StatelessWidget {
 class _SettingsTile extends StatelessWidget {
   const _SettingsTile({
     required this.action,
+    required this.onAction,
     required this.icon,
     required this.title,
     this.subtitle,
@@ -6517,6 +6579,7 @@ class _SettingsTile extends StatelessWidget {
   });
 
   final _SettingsAction action;
+  final Future<void> Function(_SettingsAction action) onAction;
   final IconData icon;
   final String title;
   final String? subtitle;
@@ -6547,7 +6610,7 @@ class _SettingsTile extends StatelessWidget {
                 ? null
                 : Text(subtitle!, maxLines: 1, overflow: TextOverflow.ellipsis),
         trailing: enabled ? Icon(Icons.chevron_right, color: secondary) : null,
-        onTap: enabled ? () => Navigator.of(context).pop(action) : null,
+        onTap: enabled ? () => unawaited(onAction(action)) : null,
       ),
     );
   }
