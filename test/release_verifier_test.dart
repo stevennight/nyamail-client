@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'package:cryptography/cryptography.dart' as crypto_graphy;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nyamail/src/api/models.dart';
-import 'package:nyamail/src/api/nyamail_api.dart';
 import 'package:nyamail/src/release/release_service.dart';
 import 'package:nyamail/src/release/release_verifier.dart';
 
@@ -27,25 +26,28 @@ void main() {
   );
 
   test(
-      'release verifier accepts an Ed25519 signature over stable payload fields',
-      () async {
-    final algorithm = crypto_graphy.Ed25519();
-    final keyPair = await algorithm.newKeyPair();
-    final publicKey = await keyPair.extractPublicKey();
-    final signature = await algorithm.sign(
-      utf8.encode(ReleaseVerifier.releaseSignaturePayload(artifact)),
-      keyPair: keyPair,
-    );
-    final signed = _copyArtifact(
-      artifact,
-      signature: base64Encode(signature.bytes),
-      url: 'https://mirror.example.test/nyamail.zip',
-    );
+    'release verifier accepts an Ed25519 signature over stable payload fields',
+    () async {
+      final algorithm = crypto_graphy.Ed25519();
+      final keyPair = await algorithm.newKeyPair();
+      final publicKey = await keyPair.extractPublicKey();
+      final signature = await algorithm.sign(
+        utf8.encode(ReleaseVerifier.releaseSignaturePayload(artifact)),
+        keyPair: keyPair,
+      );
+      final signed = _copyArtifact(
+        artifact,
+        signature: base64Encode(signature.bytes),
+        url: 'https://mirror.example.test/nyamail.zip',
+      );
 
-    final verifier = ReleaseVerifier(publicKey: base64Encode(publicKey.bytes));
+      final verifier = ReleaseVerifier(
+        publicKey: base64Encode(publicKey.bytes),
+      );
 
-    expect(await verifier.verify(signed), isTrue);
-  });
+      expect(await verifier.verify(signed), isTrue);
+    },
+  );
 
   test('release verifier rejects tampered signed fields', () async {
     final algorithm = crypto_graphy.Ed25519();
@@ -92,22 +94,54 @@ void main() {
     expect(await verifier.verify(signedByGo), isTrue);
   });
 
-  test('release service allows unsigned artifacts only on dev channel',
-      () async {
-    final devService = ReleaseService(
-      api: NyaMailApi(baseUrl: 'http://localhost'),
-      channel: 'dev',
-      verifier: ReleaseVerifier(publicKey: ''),
-    );
-    final stableService = ReleaseService(
-      api: NyaMailApi(baseUrl: 'http://localhost'),
-      channel: 'stable',
-      verifier: ReleaseVerifier(publicKey: ''),
-    );
-    final unsigned = _copyArtifact(artifact, signature: 'unsigned-dev-build');
+  test(
+    'release service allows unsigned artifacts only on dev channel',
+    () async {
+      final devService = ReleaseService(
+        channel: 'dev',
+        verifier: ReleaseVerifier(publicKey: ''),
+      );
+      final stableService = ReleaseService(
+        channel: 'stable',
+        verifier: ReleaseVerifier(publicKey: ''),
+      );
+      final unsigned = _copyArtifact(artifact, signature: 'unsigned-dev-build');
 
-    expect(await devService.verifyManifestSignature(unsigned), isTrue);
-    expect(await stableService.verifyManifestSignature(unsigned), isFalse);
+      expect(await devService.verifyManifestSignature(unsigned), isTrue);
+      expect(await stableService.verifyManifestSignature(unsigned), isFalse);
+    },
+  );
+
+  test('release service accepts a trusted GitHub artifact checksum', () async {
+    final service = ReleaseService(channel: 'stable');
+    const githubArtifact = ReleaseArtifact(
+      id: 'v1.0.5/nyamail-windows-x64-1.0.5+6.zip',
+      component: 'client',
+      platform: 'windows',
+      arch: 'amd64',
+      channel: 'stable',
+      version: '1.0.5',
+      build: 6,
+      commit: '3025ac0',
+      url:
+          'https://github.com/stevennight/nyamail-client/releases/download/'
+          'v1.0.5/nyamail-windows-x64-1.0.5%2B6.zip',
+      sha256:
+          '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      signature: ReleaseArtifact.githubReleaseSignature,
+      minApiVersion: '',
+      force: false,
+      rollout: 100,
+      notes: '',
+    );
+
+    expect(await service.verifyManifestSignature(githubArtifact), isTrue);
+    expect(
+      await service.verifyManifestSignature(
+        _copyArtifact(githubArtifact, url: 'https://example.test/update.zip'),
+      ),
+      isFalse,
+    );
   });
 }
 

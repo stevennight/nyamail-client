@@ -80,7 +80,7 @@ Widget _mailHomePage({
       onApiBaseUrlChanged: (_) async {},
       appThemeSetting: AppThemeSetting.system,
       onAppThemeSettingChanged: (_) async {},
-      releaseService: _NoopReleaseService(api: api),
+      releaseService: _NoopReleaseService(),
       secureStore: secureStore,
       localVaultStore: localVaultStore,
       localVaultRecordStore: localVaultRecordStore,
@@ -104,7 +104,7 @@ Widget _mailHomePage({
 }
 
 class _NoopReleaseService extends ReleaseService {
-  _NoopReleaseService({required super.api})
+  _NoopReleaseService()
     : super(channel: 'dev', verifier: ReleaseVerifier(publicKey: ''));
 
   @override

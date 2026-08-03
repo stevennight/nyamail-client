@@ -79,10 +79,7 @@ void main() {
   test(
     'release service maps the current runtime to a release architecture',
     () {
-      final service = ReleaseService(
-        api: NyaMailApi(baseUrl: 'http://localhost'),
-        channel: 'dev',
-      );
+      final service = ReleaseService(channel: 'dev');
 
       expect(service.currentArch, isNotEmpty);
       expect(['amd64', 'arm64', 'universal'], contains(service.currentArch));
@@ -98,7 +95,6 @@ void main() {
       final bytes = utf8.encode('verified update bytes');
       try {
         final service = ReleaseService(
-          api: NyaMailApi(baseUrl: 'https://updates.example.test'),
           channel: 'dev',
           httpClient: MockClient((request) async {
             expect(
@@ -135,7 +131,6 @@ void main() {
         await existingFile.parent.create(recursive: true);
         await existingFile.writeAsBytes(oldBytes);
         final service = ReleaseService(
-          api: NyaMailApi(baseUrl: 'https://updates.example.test'),
           channel: 'dev',
           httpClient: MockClient(
             (_) async => http.Response.bytes(wrongBytes, 200),

@@ -108,7 +108,6 @@ class _NyaMailAppState extends State<NyaMailApp> {
                 appThemeSetting: _themeSetting,
                 onAppThemeSettingChanged: _setThemeSetting,
                 releaseService: ReleaseService(
-                  api: api,
                   channel: _config.releaseChannel,
                   verifier: ReleaseVerifier(
                     publicKey: _config.releasePublicKey,

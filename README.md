@@ -2,7 +2,7 @@
 
 This repository contains the Flutter client app for Windows, Linux, macOS, Android, and iOS.
 
-The client is local-first. It can create and unlock a local encrypted vault, add mailboxes, connect directly to mail providers, cache mail locally, and optionally connect to a self-hosted NyaMail server for encrypted sync and update checks.
+The client is local-first. It can create and unlock a local encrypted vault, add mailboxes, connect directly to mail providers, cache mail locally, and optionally connect to a self-hosted NyaMail server for encrypted sync.
 
 ## Run
 
@@ -67,11 +67,19 @@ build/releases/nyamail-android-<version>.apk
 build/releases/nyamail-android-<version>.apk.sha256
 ```
 
-The version comes from `pubspec.yaml`, currently `1.0.5+6`. The Windows zip
+The version comes from `pubspec.yaml`, currently `1.0.6+7`. The Windows zip
 contains the Flutter `Release` directory contents and excludes stale zip files
 from previous builds. Use `-SkipWindows`, `-SkipAndroid`, or `-NoPub` when you
 only need part of the build. Release builds use the `stable` update channel by
 default.
+
+The in-app `Check for updates` action reads the latest published release from
+the public GitHub repository, matches the current platform artifact, downloads
+the asset and its SHA-256 checksum, and verifies the download before handing it
+off to the platform installer. Windows updates are installed into the app's
+per-user managed release directory and restart the client. Android updates are
+opened with the system package installer and may require the device's install
+unknown apps permission.
 
 Android release builds require a production signing key. Local builds load
 `android/key.properties`; CI loads the same four values through environment

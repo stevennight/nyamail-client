@@ -1,4 +1,4 @@
-import 'dart:io' show Directory, File, Platform, Process, ProcessStartMode;
+import 'dart:io' show Directory, File, Platform, Process, ProcessStartMode, pid;
 
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
@@ -7,7 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../api/models.dart';
-import '../api/nyamail_api.dart';
+import 'github_release_client.dart';
 import 'android_update_installer.dart';
 import 'release_verifier.dart';
 import 'windows_updater.dart' as updater;
@@ -16,22 +16,22 @@ typedef SupportDirectoryProvider = Future<Directory> Function();
 
 class ReleaseService {
   ReleaseService({
-    required NyaMailApi api,
     required String channel,
     ReleaseVerifier? verifier,
+    GitHubReleaseClient? githubClient,
     AndroidUpdateInstaller? androidInstaller,
     http.Client? httpClient,
     SupportDirectoryProvider? supportDirectoryProvider,
-  }) : _api = api,
-       _channel = channel,
+  }) : _channel = channel,
+       _githubClient = githubClient ?? GitHubReleaseClient(),
        _verifier = verifier,
        _androidInstaller = androidInstaller ?? const AndroidUpdateInstaller(),
        _httpClient = httpClient ?? http.Client(),
        _supportDirectoryProvider =
            supportDirectoryProvider ?? getApplicationSupportDirectory;
 
-  final NyaMailApi _api;
   final String _channel;
+  final GitHubReleaseClient _githubClient;
   final ReleaseVerifier? _verifier;
   final AndroidUpdateInstaller _androidInstaller;
   final http.Client _httpClient;
@@ -40,11 +40,12 @@ class ReleaseService {
   Future<ReleaseCheckResult> check() async {
     final packageInfo = await PackageInfo.fromPlatform();
     final build = int.tryParse(packageInfo.buildNumber) ?? 0;
-    return _api.checkRelease(
+    return _githubClient.check(
       platform: currentPlatform,
       arch: currentArch,
       channel: _channel,
-      build: build,
+      currentVersion: packageInfo.version,
+      currentBuild: build,
     );
   }
 
@@ -102,6 +103,9 @@ class ReleaseService {
 
   Future<bool> verifyManifestSignature(ReleaseArtifact artifact) async {
     final signature = artifact.signature.trim();
+    if (signature == ReleaseArtifact.githubReleaseSignature) {
+      return _isTrustedGitHubArtifact(artifact);
+    }
     if (signature.isEmpty || signature == 'unsigned-dev-build') {
       return _channel == 'dev';
     }
@@ -118,6 +122,7 @@ class ReleaseService {
       zipPath: zipFile.path,
       installRoot: installRoot,
       currentExe: Platform.resolvedExecutable,
+      currentPid: pid,
     );
     await script.writeAsString(scriptBody, flush: true);
     final result = await Process.start('powershell.exe', [
@@ -140,11 +145,24 @@ class ReleaseService {
     required String zipPath,
     required String installRoot,
     required String currentExe,
+    int? currentPid,
   }) => updater.windowsUpdaterScript(
     zipPath: zipPath,
     installRoot: installRoot,
     currentExe: currentExe,
+    currentPid: currentPid,
   );
+
+  bool _isTrustedGitHubArtifact(ReleaseArtifact artifact) {
+    final uri = Uri.tryParse(artifact.url);
+    if (uri == null) return false;
+    return uri.scheme == 'https' &&
+        uri.host == 'github.com' &&
+        uri.path.startsWith(
+          '/${GitHubReleaseClient.repository}/releases/download/',
+        ) &&
+        RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(artifact.sha256.trim());
+  }
 
   String get currentPlatform => updater.currentReleasePlatform();
 

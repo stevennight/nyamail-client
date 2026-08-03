@@ -1504,7 +1504,7 @@ class _MailHomePageState extends State<MailHomePage>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'The release manifest was accepted. Download, verify, and install this artifact?',
+                        'The GitHub Release checksum was accepted. Download, verify, and install this artifact?',
                       ),
                       const SizedBox(height: 16),
                       _UpdateDetailRow(

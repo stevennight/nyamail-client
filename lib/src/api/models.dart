@@ -320,6 +320,8 @@ class AuthSession {
 }
 
 class ReleaseArtifact {
+  static const githubReleaseSignature = 'github-release';
+
   const ReleaseArtifact({
     required this.id,
     required this.component,

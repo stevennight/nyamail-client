@@ -5,15 +5,18 @@ String windowsUpdaterScript({
   required String zipPath,
   required String installRoot,
   required String currentExe,
+  int? currentPid,
 }) {
   final escapedZip = _escapePowerShellSingleQuoted(zipPath);
   final escapedInstallRoot = _escapePowerShellSingleQuoted(installRoot);
   final escapedCurrentExe = _escapePowerShellSingleQuoted(currentExe);
+  final currentPidValue = currentPid ?? 0;
   return '''
 \$ErrorActionPreference = 'Stop'
 \$zip = '$escapedZip'
 \$installRoot = '$escapedInstallRoot'
 \$currentExe = '$escapedCurrentExe'
+\$currentPid = $currentPidValue
 \$installRootFull = [System.IO.Path]::GetFullPath(\$installRoot)
 \$stamp = Get-Date -Format 'yyyyMMddHHmmss'
 \$target = Join-Path \$installRoot \$stamp
@@ -31,6 +34,27 @@ if (-not \$currentFull.StartsWith(\$installPrefix, \$comparison)) {
 New-Item -ItemType Directory -Force -Path \$target | Out-Null
 Start-Sleep -Seconds 2
 Expand-Archive -LiteralPath \$zip -DestinationPath \$target -Force
+if (\$currentPid -gt 0) {
+  \$currentProcess = Get-Process -Id \$currentPid -ErrorAction SilentlyContinue
+  if (\$null -ne \$currentProcess) {
+    \$currentProcessPath = \$null
+    try {
+      \$currentProcessPath = \$currentProcess.Path
+    } catch {
+      \$currentProcessPath = \$null
+    }
+    \$currentExeFull = [System.IO.Path]::GetFullPath(\$currentExe)
+    if (-not [string]::IsNullOrWhiteSpace(\$currentProcessPath) -and
+        -not [string]::Equals(\$currentProcessPath, \$currentExeFull, \$comparison)) {
+      throw "Refusing to stop an unexpected process for \$currentExeFull"
+    }
+    \$currentProcess.CloseMainWindow() | Out-Null
+    if (-not \$currentProcess.WaitForExit(10000)) {
+      \$currentProcess.Kill()
+      \$currentProcess.WaitForExit()
+    }
+  }
+}
 if (Test-Path -LiteralPath \$current) {
   \$currentItem = Get-Item -LiteralPath \$current -Force
   if ((\$currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
