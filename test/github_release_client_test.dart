@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -84,6 +85,27 @@ void main() {
         candidateBuild: 1,
       ),
       isTrue,
+    );
+  });
+
+  test('times out when the GitHub API does not respond', () async {
+    final client = GitHubReleaseClient(
+      requestTimeout: const Duration(milliseconds: 10),
+      client: MockClient((_) async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        return http.Response('{}', 200);
+      }),
+    );
+
+    await expectLater(
+      client.check(
+        platform: 'windows',
+        arch: 'amd64',
+        channel: 'stable',
+        currentVersion: '1.0.5',
+        currentBuild: 6,
+      ),
+      throwsA(isA<TimeoutException>()),
     );
   });
 }

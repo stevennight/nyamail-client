@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -253,6 +254,7 @@ class _MailHomePageState extends State<MailHomePage>
   _NoticeKind _bannerKind = _NoticeKind.info;
   bool _captureSettingsNotices = false;
   _SettingsFeedback? _capturedSettingsFeedback;
+  bool _checkingForUpdates = false;
   bool _refreshingMail = false;
   int? _refreshingMailRequestId;
   bool _mailUndoSnackBarVisible = false;
@@ -1429,9 +1431,20 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   Future<void> _checkUpdates({bool silent = false}) async {
+    if (_checkingForUpdates) return;
+    _checkingForUpdates = true;
+    const checkingMessage = 'Checking for updates...';
+    if (!silent && mounted) {
+      setState(
+        () => _setPersistentNotice(checkingMessage, kind: _NoticeKind.progress),
+      );
+    }
     try {
       final result = await widget.releaseService.check();
       if (!mounted) return;
+      if (!silent && _banner == checkingMessage) {
+        setState(() => _banner = null);
+      }
       if (!result.updateAvailable || result.latest == null) {
         if (!silent) {
           _showTransientNotice('NyaMail is up to date.');
@@ -1474,16 +1487,26 @@ class _MailHomePageState extends State<MailHomePage>
         'Update downloaded, verified, and opened.',
         kind: _NoticeKind.success,
       );
-    } catch (_) {
+    } catch (error) {
       if (!silent && mounted) {
         setState(
           () => _setPersistentNotice(
-            'Could not complete the update.',
+            'Could not check for updates: ${_updateErrorMessage(error)}',
             kind: _NoticeKind.error,
           ),
         );
       }
+    } finally {
+      _checkingForUpdates = false;
     }
+  }
+
+  String _updateErrorMessage(Object error) {
+    if (error is TimeoutException) {
+      return 'GitHub did not respond within 15 seconds.';
+    }
+    final message = error.toString().replaceFirst('Exception: ', '').trim();
+    return message.isEmpty ? 'the request timed out or failed.' : message;
   }
 
   Future<bool> _confirmUpdateInstall(ReleaseArtifact artifact) async {
@@ -1494,7 +1517,7 @@ class _MailHomePageState extends State<MailHomePage>
           builder:
               (dialogContext) => AlertDialog(
                 title: Text(
-                  artifact.force ? 'Required update' : 'Install update?',
+                  artifact.force ? 'Required update' : 'Update available',
                 ),
                 content: _DialogContent(
                   width: 460,
@@ -1504,7 +1527,7 @@ class _MailHomePageState extends State<MailHomePage>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'The GitHub Release checksum was accepted. Download, verify, and install this artifact?',
+                        'A new version is available. Review the release information, then download and install the matching platform package.',
                       ),
                       const SizedBox(height: 16),
                       _UpdateDetailRow(
@@ -1530,6 +1553,8 @@ class _MailHomePageState extends State<MailHomePage>
                         ),
                       if (artifact.notes.trim().isNotEmpty) ...[
                         const SizedBox(height: 12),
+                        const Text('Release notes'),
+                        const SizedBox(height: 4),
                         Text(
                           artifact.notes.trim(),
                           style: Theme.of(dialogContext).textTheme.bodySmall,
@@ -1547,7 +1572,7 @@ class _MailHomePageState extends State<MailHomePage>
                   FilledButton.icon(
                     onPressed: () => Navigator.of(dialogContext).pop(true),
                     icon: const Icon(Icons.download),
-                    label: const Text('Download'),
+                    label: const Text('Download and install'),
                   ),
                 ],
               ),
@@ -2387,6 +2412,9 @@ class _MailHomePageState extends State<MailHomePage>
       case _SettingsAction.systemSettings:
         await _showSystemSettings();
         return true;
+      case _SettingsAction.about:
+        await _showAbout();
+        return true;
       case _SettingsAction.clearLocalData:
         await _clearLocalData();
         return false;
@@ -2546,6 +2574,24 @@ class _MailHomePageState extends State<MailHomePage>
             settings: _systemSettings,
             onSettingsChanged: _setSystemBehaviorSettings,
           ),
+    );
+  }
+
+  Future<void> _showAbout() async {
+    final packageInfo = await PackageInfo.fromPlatform();
+    if (!mounted) return;
+    showAboutDialog(
+      context: context,
+      applicationName: 'NyaMail',
+      applicationVersion: '${packageInfo.version}+${packageInfo.buildNumber}',
+      applicationIcon: const Icon(Icons.mail_lock_outlined, size: 42),
+      applicationLegalese: 'Local-first encrypted mail client',
+      children: const [
+        SizedBox(height: 16),
+        Text(
+          'NyaMail connects directly to your mail providers and keeps vault configuration encrypted on your device.',
+        ),
+      ],
     );
   }
 
@@ -6188,6 +6234,7 @@ enum _SettingsAction {
   mailInteractionSettings,
   oauthProviderSettings,
   systemSettings,
+  about,
   clearLocalData,
   exportVault,
   importVault,
@@ -6483,6 +6530,19 @@ class _SettingsContent extends StatelessWidget {
               icon: Icons.file_download_outlined,
               title: 'Import vault configuration',
               subtitle: 'Merge with the local vault',
+            ),
+          ],
+        ),
+        SizedBox(height: spacing),
+        _SettingsSection(
+          title: 'Application',
+          children: [
+            _SettingsTile(
+              action: _SettingsAction.about,
+              onAction: onAction,
+              icon: Icons.info_outline,
+              title: 'About',
+              subtitle: 'Version and application information',
             ),
           ],
         ),

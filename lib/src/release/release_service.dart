@@ -14,6 +14,8 @@ import 'windows_updater.dart' as updater;
 
 typedef SupportDirectoryProvider = Future<Directory> Function();
 
+const _updateDownloadTimeout = Duration(minutes: 5);
+
 class ReleaseService {
   ReleaseService({
     required String channel,
@@ -76,7 +78,7 @@ class ReleaseService {
 
   Future<File> downloadAndVerify(ReleaseArtifact artifact) async {
     final uri = Uri.parse(artifact.url);
-    final response = await _httpClient.get(uri);
+    final response = await _httpClient.get(uri).timeout(_updateDownloadTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw StateError('Download failed with HTTP ${response.statusCode}');
     }

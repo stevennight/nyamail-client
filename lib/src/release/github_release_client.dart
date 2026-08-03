@@ -5,15 +5,20 @@ import 'package:http/http.dart' as http;
 import '../api/models.dart';
 
 class GitHubReleaseClient {
-  GitHubReleaseClient({http.Client? client, Uri? apiBaseUri})
-    : _httpClient = client ?? http.Client(),
-      _apiBaseUri =
-          apiBaseUri ??
-          Uri.parse('https://api.github.com/repos/stevennight/nyamail-client');
+  GitHubReleaseClient({
+    http.Client? client,
+    Uri? apiBaseUri,
+    Duration requestTimeout = const Duration(seconds: 15),
+  }) : _httpClient = client ?? http.Client(),
+       _requestTimeout = requestTimeout,
+       _apiBaseUri =
+           apiBaseUri ??
+           Uri.parse('https://api.github.com/repos/stevennight/nyamail-client');
 
   static const repository = 'stevennight/nyamail-client';
 
   final http.Client _httpClient;
+  final Duration _requestTimeout;
   final Uri _apiBaseUri;
 
   Future<ReleaseCheckResult> check({
@@ -93,7 +98,9 @@ class GitHubReleaseClient {
   }
 
   Future<Map<String, Object?>> _getObject(Uri uri) async {
-    final response = await _httpClient.get(uri, headers: _headers);
+    final response = await _httpClient
+        .get(uri, headers: _headers)
+        .timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw StateError(
         'GitHub Release check failed with HTTP ${response.statusCode}.',
@@ -110,7 +117,9 @@ class GitHubReleaseClient {
     String url, {
     required String artifactName,
   }) async {
-    final response = await _httpClient.get(Uri.parse(url), headers: _headers);
+    final response = await _httpClient
+        .get(Uri.parse(url), headers: _headers)
+        .timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw StateError(
         'GitHub Release checksum download failed with HTTP ${response.statusCode}.',
