@@ -7040,6 +7040,10 @@ class _Sidebar extends StatefulWidget {
 }
 
 class _SidebarState extends State<_Sidebar> {
+  static const _sidebarTileShape = RoundedRectangleBorder(
+    borderRadius: BorderRadius.all(Radius.circular(24)),
+  );
+
   final _folderFilter = TextEditingController();
 
   @override
@@ -7102,6 +7106,10 @@ class _SidebarState extends State<_Sidebar> {
           for (final item in smartFolders)
             ListTile(
               selected: widget.view.smartFolder == item,
+              selectedColor: Theme.of(context).colorScheme.onSecondaryContainer,
+              selectedTileColor:
+                  Theme.of(context).colorScheme.secondaryContainer,
+              shape: _sidebarTileShape,
               leading: Icon(_iconForSmartFolder(item)),
               title: Text(_labelForSmartFolder(item)),
               dense: true,
@@ -7232,6 +7240,11 @@ class _SidebarState extends State<_Sidebar> {
                 return ListTile(
                   contentPadding: const EdgeInsets.only(left: 56, right: 12),
                   selected: widget.view.folder?.key == folder.key,
+                  selectedColor:
+                      Theme.of(context).colorScheme.onSecondaryContainer,
+                  selectedTileColor:
+                      Theme.of(context).colorScheme.secondaryContainer,
+                  shape: _sidebarTileShape,
                   leading: Icon(_iconForMailbox(folder.kind), size: 18),
                   title: Text(
                     folder.displayName,
