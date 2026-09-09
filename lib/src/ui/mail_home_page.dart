@@ -2086,6 +2086,9 @@ class _MailHomePageState extends State<MailHomePage>
                       Expanded(
                         child: _Reader(
                           message: _selected,
+                          bodyLoading:
+                              _selected != null &&
+                              _messageBodyLoads.containsKey(_selected!.id),
                           mailboxContextLabel: _mailboxContextLabelForMessage(
                             _selected,
                             _accounts,
@@ -4778,6 +4781,9 @@ class _MailHomePageState extends State<MailHomePage>
                     builder:
                         (context, current, _) => _Reader(
                           message: current,
+                          bodyLoading: _messageBodyLoads.containsKey(
+                            current.id,
+                          ),
                           mailboxContextLabel: _mailboxContextLabelForMessage(
                             current,
                             _accounts,
@@ -8578,6 +8584,7 @@ class _MessageEmptyState extends StatelessWidget {
 class _Reader extends StatelessWidget {
   const _Reader({
     required this.message,
+    this.bodyLoading = false,
     this.mailboxContextLabel = '',
     required this.onSendReply,
     required this.onSendReplyAll,
@@ -8595,6 +8602,7 @@ class _Reader extends StatelessWidget {
   });
 
   final MailMessage? message;
+  final bool bodyLoading;
   final String mailboxContextLabel;
   final Future<void> Function(
     MailMessage message,
@@ -8632,6 +8640,7 @@ class _Reader extends StatelessWidget {
     }
     return _ReaderBody(
       message: message,
+      bodyLoading: bodyLoading,
       mailboxContextLabel: mailboxContextLabel,
       onSendReply: onSendReply,
       onSendReplyAll: onSendReplyAll,
@@ -9335,6 +9344,7 @@ class _ComposeDialogState extends State<_ComposeDialog> {
 class _ReaderBody extends StatefulWidget {
   const _ReaderBody({
     required this.message,
+    this.bodyLoading = false,
     required this.mailboxContextLabel,
     required this.onSendReply,
     required this.onSendReplyAll,
@@ -9352,6 +9362,7 @@ class _ReaderBody extends StatefulWidget {
   });
 
   final MailMessage message;
+  final bool bodyLoading;
   final String mailboxContextLabel;
   final Future<void> Function(
     MailMessage message,
@@ -9721,13 +9732,22 @@ class _ReaderBodyState extends State<_ReaderBody> {
           Expanded(
             child: ListView(
               children: [
-                if (!message.bodyLoaded) ...[
+                if (!message.bodyLoaded && widget.bodyLoading) ...[
                   const LinearProgressIndicator(),
                   const SizedBox(height: 12),
                   Text(
                     'Loading full message...',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
+                  if (message.preview.trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      message.preview.trim(),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 16),
                 ],
                 MailHtmlView(
