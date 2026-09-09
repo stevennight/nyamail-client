@@ -4614,7 +4614,10 @@ class _MailHomePageState extends State<MailHomePage>
   }
 
   Future<MailMessage?> _ensureMessageBody(MailMessage message) {
-    if (message.bodyLoaded) return Future.value(message);
+    if (message.bodyLoaded &&
+        (message.body.isNotEmpty || message.htmlBody.isNotEmpty)) {
+      return Future.value(message);
+    }
     final current = _messageBodyLoads[message.id];
     if (current != null) return current;
 

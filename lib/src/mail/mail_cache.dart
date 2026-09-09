@@ -10,14 +10,43 @@ import '../security/local_cache_crypto.dart';
 import 'mail_models.dart';
 import 'mail_transport.dart';
 
+/// Body payload for a single cached message.
+///
+/// Message bodies are stored separately from the list index so that opening a
+/// mailbox never has to deserialize (or rewrite) every HTML body on disk.
+class MailMessageBody {
+  const MailMessageBody({required this.body, required this.htmlBody});
+
+  final String body;
+  final String htmlBody;
+
+  bool get isEmpty => body.isEmpty && htmlBody.isEmpty;
+}
+
 abstract class MailMessageCache {
   Future<void> saveMessages(List<MailMessage> messages);
+
+  /// Loads cached messages.
+  ///
+  /// When [includeBodies] is false the returned messages carry no body text and
+  /// report `bodyLoaded == false`; callers fetch the body on demand through
+  /// [loadBody]. Bodies are always merged when a [query] is supplied because the
+  /// search matcher inspects body text.
   Future<List<MailMessage>> loadMessages({
     MailboxKind? mailbox,
     String? accountId,
     String? folderPath,
     String? query,
+    bool includeBodies = true,
   });
+
+  /// Returns the stored body for [messageId].
+  ///
+  /// Returns `null` when the message is unknown or its body has never been
+  /// fetched; returns an empty [MailMessageBody] when the body was fetched but
+  /// genuinely carries no text.
+  Future<MailMessageBody?> loadBody(String messageId);
+
   Future<void> updateMessage(MailMessage message);
   Future<void> deleteMessage(String messageId);
   Future<void> deleteMessages(Iterable<String> messageIds);
@@ -45,28 +74,53 @@ class MailCache implements MailMessageCache {
   @override
   Future<void> saveMessages(List<MailMessage> messages) async {
     if (messages.isEmpty) return;
-    final file = await _cacheFile();
-    await _lockFor(file).synchronized(() async {
-      final existing = await _loadMessagesFromFile(file);
-      final byId = {for (final message in existing) message.id: message};
-      var changed = false;
-      for (final message in messages) {
-        final normalized = _normalizeCachedMessage(message);
-        final current = byId[normalized.id];
-        final next =
-            current == null
+    final indexFile = await _indexFile();
+    final bodiesFile = await _bodiesFile();
+    await _lockFor(indexFile).synchronized(() async {
+      final loaded = await _loadFromFiles(indexFile, bodiesFile);
+      final byId = {for (final message in loaded.messages) message.id: message};
+      final bodies = Map<String, MailMessageBody>.of(loaded.bodies);
+      var indexChanged = false;
+      var bodiesChanged = false;
+      for (final incoming in messages) {
+        final normalized = _normalizeCachedMessage(incoming);
+        final currentIndex = byId[normalized.id];
+        final currentBody = bodies[normalized.id];
+        final currentFull =
+            currentIndex == null ? null : _mergeBody(currentIndex, currentBody);
+        final nextFull =
+            currentFull == null
                 ? normalized
                 : mailMessageUpdatePreservingLoadedBody(
-                  current: current,
+                  current: currentFull,
                   update: normalized,
                 );
-        if (current == null || !_sameCachedMessage(current, next)) {
-          changed = true;
+        final nextIndex = _stripBody(nextFull);
+        final nextBody = _bodyForStorage(nextFull);
+
+        if (currentIndex == null ||
+            !_sameIndexMessage(currentIndex, nextIndex)) {
+          indexChanged = true;
         }
-        byId[normalized.id] = next;
+        if (!_sameBody(currentBody, nextBody)) {
+          bodiesChanged = true;
+        }
+        byId[normalized.id] = nextIndex;
+        if (nextBody == null) {
+          bodies.remove(normalized.id);
+        } else {
+          bodies[normalized.id] = nextBody;
+        }
       }
-      if (!changed) return;
-      await _writeMessagesToFile(file, byId.values);
+      if (!indexChanged && !bodiesChanged) return;
+      await _writeCache(
+        indexFile: indexFile,
+        bodiesFile: bodiesFile,
+        messages: byId.values,
+        bodies: bodies,
+        writeIndex: indexChanged,
+        writeBodies: bodiesChanged,
+      );
     });
   }
 
@@ -76,32 +130,29 @@ class MailCache implements MailMessageCache {
     String? accountId,
     String? folderPath,
     String? query,
+    bool includeBodies = true,
   }) async {
-    final file = await _cacheFile();
-    return _lockFor(file).synchronized(() async {
-      final decoded = await _loadMessagesFromFile(file);
+    final indexFile = await _indexFile();
+    final bodiesFile = await _bodiesFile();
+    return _lockFor(indexFile).synchronized(() async {
+      final loaded = await _loadFromFiles(indexFile, bodiesFile);
       final normalizedQuery = query?.trim() ?? '';
-      if (mailbox == null &&
-          accountId == null &&
-          folderPath == null &&
-          normalizedQuery.isEmpty) {
-        return decoded;
+      final mergeBodies = includeBodies || normalizedQuery.isNotEmpty;
+      final scoped = <MailMessage>[];
+      for (final message in loaded.messages) {
+        if (mailbox != null && message.effectiveMailbox != mailbox) continue;
+        if (accountId != null && message.accountId != accountId) continue;
+        if (folderPath != null && message.effectiveFolderPath != folderPath) {
+          continue;
+        }
+        scoped.add(
+          mergeBodies
+              ? _mergeBody(message, loaded.bodies[message.id])
+              : (message.bodyLoaded
+                  ? message.copyWith(bodyLoaded: false)
+                  : message),
+        );
       }
-      final scoped = decoded
-          .where((message) {
-            if (mailbox != null && message.effectiveMailbox != mailbox) {
-              return false;
-            }
-            if (accountId != null && message.accountId != accountId) {
-              return false;
-            }
-            if (folderPath != null &&
-                message.effectiveFolderPath != folderPath) {
-              return false;
-            }
-            return true;
-          })
-          .toList(growable: false);
       if (normalizedQuery.isEmpty) return scoped;
       return scoped
           .where((message) => mailMessageMatchesQuery(message, normalizedQuery))
@@ -109,59 +160,25 @@ class MailCache implements MailMessageCache {
     });
   }
 
-  Future<List<MailMessage>> _loadMessagesFromFile(File file) async {
-    final memory = _memoryFor(file);
-    final remembered = memory.messages;
-    if (remembered != null) return remembered;
-    if (!await file.exists()) return _rememberMessages(file, const []);
-    try {
-      final raw = await file.readAsString(encoding: utf8);
-      final secret = _normalizedLocalCacheSecret;
-      final decoded =
-          raw.length >= _backgroundCacheWorkThreshold
-              ? await Isolate.run(() => _decodeCachedMessages(raw, secret))
-              : await _decodeCachedMessages(raw, secret);
-      if (decoded.shouldQuarantine) {
-        await _quarantineUnreadableCache(file);
-        return _rememberMessages(file, const []);
-      }
-      return _rememberMessages(file, decoded.messages);
-    } catch (error) {
-      if (_isCacheFormatError(error)) {
-        await _quarantineUnreadableCache(file);
-        return _rememberMessages(file, const []);
-      }
-      rethrow;
-    }
-  }
-
-  Future<File> _cacheFile() async {
-    final provider = supportDirectoryProvider ?? getApplicationSupportDirectory;
-    final dir = await provider();
-    final namespace = _safeCacheNamespace(this.namespace);
-    if (namespace == null) {
-      return File('${dir.path}/mail-cache/messages.json');
-    }
-    return File('${dir.path}/mail-cache/$namespace/messages.json');
-  }
-
   @override
-  Future<void> clear() async {
-    final file = await _cacheFile();
-    await _lockFor(file).synchronized(() async {
-      final namespace = _safeCacheNamespace(this.namespace);
-      if (namespace == null) {
-        if (await file.exists()) {
-          await file.delete();
+  Future<MailMessageBody?> loadBody(String messageId) async {
+    final indexFile = await _indexFile();
+    final bodiesFile = await _bodiesFile();
+    return _lockFor(indexFile).synchronized(() async {
+      final loaded = await _loadFromFiles(indexFile, bodiesFile);
+      MailMessage? indexMessage;
+      for (final message in loaded.messages) {
+        if (message.id == messageId) {
+          indexMessage = message;
+          break;
         }
-        _forgetMessagesForFile(file);
-        return;
       }
-      final dir = file.parent;
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-      _forgetMessagesInDirectory(dir);
+      if (indexMessage == null) return null;
+      final stored = loaded.bodies[messageId];
+      if (stored != null) return stored;
+      return indexMessage.bodyLoaded
+          ? const MailMessageBody(body: '', htmlBody: '')
+          : null;
     });
   }
 
@@ -179,15 +196,138 @@ class MailCache implements MailMessageCache {
   Future<void> deleteMessages(Iterable<String> messageIds) async {
     final ids = messageIds.where((id) => id.trim().isNotEmpty).toSet();
     if (ids.isEmpty) return;
-    final file = await _cacheFile();
-    await _lockFor(file).synchronized(() async {
-      final existing = await _loadMessagesFromFile(file);
-      final remaining = existing
+    final indexFile = await _indexFile();
+    final bodiesFile = await _bodiesFile();
+    await _lockFor(indexFile).synchronized(() async {
+      final loaded = await _loadFromFiles(indexFile, bodiesFile);
+      final remaining = loaded.messages
           .where((message) => !ids.contains(message.id))
           .toList(growable: false);
-      if (remaining.length == existing.length) return;
-      await _writeMessagesToFile(file, remaining);
+      if (remaining.length == loaded.messages.length) return;
+      final bodies = Map<String, MailMessageBody>.of(loaded.bodies);
+      final removedBody = ids.any(bodies.containsKey);
+      bodies.removeWhere((id, _) => ids.contains(id));
+      await _writeCache(
+        indexFile: indexFile,
+        bodiesFile: bodiesFile,
+        messages: remaining,
+        bodies: bodies,
+        writeIndex: true,
+        writeBodies: removedBody,
+      );
     });
+  }
+
+  @override
+  Future<void> clear() async {
+    final indexFile = await _indexFile();
+    final bodiesFile = await _bodiesFile();
+    await _lockFor(indexFile).synchronized(() async {
+      final namespace = _safeCacheNamespace(this.namespace);
+      if (namespace == null) {
+        for (final file in [indexFile, bodiesFile]) {
+          if (await file.exists()) {
+            await file.delete();
+          }
+        }
+        _forgetMessagesForFile(indexFile);
+        return;
+      }
+      final dir = indexFile.parent;
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+      _forgetMessagesInDirectory(dir);
+    });
+  }
+
+  Future<_LoadedCache> _loadFromFiles(File indexFile, File bodiesFile) async {
+    final memory = _memoryFor(indexFile);
+    final rememberedMessages = memory.messages;
+    if (rememberedMessages != null) {
+      return _LoadedCache(rememberedMessages, memory.bodies ?? const {});
+    }
+    if (!await indexFile.exists()) {
+      return _rememberCache(indexFile, const [], const {});
+    }
+    try {
+      final rawIndex = await indexFile.readAsString(encoding: utf8);
+      final secret = _normalizedLocalCacheSecret;
+      final decodedIndex =
+          rawIndex.length >= _backgroundCacheWorkThreshold
+              ? await Isolate.run(() => _decodeIndex(rawIndex, secret))
+              : await _decodeIndex(rawIndex, secret);
+      if (decodedIndex.shouldQuarantine) {
+        await _quarantineUnreadableCache(indexFile);
+        await _quarantineUnreadableCache(bodiesFile);
+        return _rememberCache(indexFile, const [], const {});
+      }
+
+      final bodiesFileExisted = await bodiesFile.exists();
+      var bodies = <String, MailMessageBody>{};
+      var writeBodies = false;
+      var writeIndex = false;
+      if (bodiesFileExisted) {
+        final rawBodies = await bodiesFile.readAsString(encoding: utf8);
+        final decodedBodies =
+            rawBodies.length >= _backgroundCacheWorkThreshold
+                ? await Isolate.run(() => _decodeBodies(rawBodies, secret))
+                : await _decodeBodies(rawBodies, secret);
+        if (decodedBodies.shouldQuarantine) {
+          await _quarantineUnreadableCache(bodiesFile);
+        } else {
+          bodies = decodedBodies.bodies;
+        }
+        // Legacy body columns lingering in an already-split index: drop them.
+        if (decodedIndex.inlineBodies.isNotEmpty) {
+          writeIndex = true;
+        }
+      } else if (decodedIndex.inlineBodies.isNotEmpty) {
+        // First run after the split: migrate bodies out of messages.json.
+        bodies = decodedIndex.inlineBodies;
+        writeIndex = true;
+        writeBodies = true;
+      }
+
+      final remembered = _rememberCache(
+        indexFile,
+        decodedIndex.messages,
+        bodies,
+      );
+      if (writeIndex || writeBodies) {
+        await _writeCache(
+          indexFile: indexFile,
+          bodiesFile: bodiesFile,
+          messages: remembered.messages,
+          bodies: bodies,
+          writeIndex: writeIndex,
+          writeBodies: writeBodies,
+        );
+      }
+      return remembered;
+    } catch (error) {
+      if (_isCacheFormatError(error)) {
+        await _quarantineUnreadableCache(indexFile);
+        await _quarantineUnreadableCache(bodiesFile);
+        return _rememberCache(indexFile, const [], const {});
+      }
+      rethrow;
+    }
+  }
+
+  Future<File> _indexFile() async {
+    final provider = supportDirectoryProvider ?? getApplicationSupportDirectory;
+    final dir = await provider();
+    final namespace = _safeCacheNamespace(this.namespace);
+    if (namespace == null) {
+      return File('${dir.path}/mail-cache/messages.json');
+    }
+    return File('${dir.path}/mail-cache/$namespace/messages.json');
+  }
+
+  Future<File> _bodiesFile() async {
+    final indexFile = await _indexFile();
+    return File('${indexFile.parent.path}/bodies.json');
   }
 
   _AsyncMutex _lockFor(File file) {
@@ -214,19 +354,24 @@ class MailCache implements MailMessageCache {
     return memory;
   }
 
-  List<MailMessage> _rememberMessages(
+  _LoadedCache _rememberCache(
     File file,
     Iterable<MailMessage> messages,
+    Map<String, MailMessageBody> bodies,
   ) {
     final remembered = List<MailMessage>.unmodifiable(
-      messages.map(_normalizeCachedMessage),
+      messages.map((message) => _normalizeCachedMessage(_stripBody(message))),
     );
-    _memoryFor(file).messages = remembered;
-    return remembered;
+    final rememberedBodies = Map<String, MailMessageBody>.unmodifiable(bodies);
+    final memory =
+        _memoryFor(file)
+          ..messages = remembered
+          ..bodies = rememberedBodies;
+    return _LoadedCache(memory.messages!, memory.bodies!);
   }
 
   void _forgetMessagesForFile(File file) {
-    final prefix = '${file.path}\u0000';
+    final prefix = '${file.path} ';
     _memoryCaches.removeWhere((key, _) => key.startsWith(prefix));
   }
 
@@ -235,7 +380,7 @@ class MailCache implements MailMessageCache {
     final prefix =
         normalizedDir.endsWith('/') ? normalizedDir : '$normalizedDir/';
     _memoryCaches.removeWhere((key, _) {
-      final path = key.split('\u0000').first;
+      final path = key.split(' ').first;
       final normalizedPath = path.replaceAll('\\', '/');
       return normalizedPath == normalizedDir ||
           normalizedPath.startsWith(prefix);
@@ -246,23 +391,53 @@ class MailCache implements MailMessageCache {
     final secret = _normalizedLocalCacheSecret;
     final keyMaterial = secret ?? 'plaintext';
     final fingerprint = sha256.convert(utf8.encode(keyMaterial)).toString();
-    return '${file.path}\u0000$fingerprint';
+    return '${file.path} $fingerprint';
   }
 
-  Future<void> _writeMessagesToFile(
-    File file,
-    Iterable<MailMessage> messages,
-  ) async {
-    final snapshot = List<MailMessage>.of(messages)
+  Future<void> _writeCache({
+    required File indexFile,
+    required File bodiesFile,
+    required Iterable<MailMessage> messages,
+    required Map<String, MailMessageBody> bodies,
+    required bool writeIndex,
+    required bool writeBodies,
+  }) async {
+    final snapshot = List<MailMessage>.of(messages.map(_stripBody))
       ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
-    await file.parent.create(recursive: true);
     final secret = _normalizedLocalCacheSecret;
-    final output =
-        _estimatedCachePayloadSize(snapshot) >= _backgroundCacheWorkThreshold
-            ? await Isolate.run(
-              () => _serializeCachedMessages(snapshot, secret),
-            )
-            : await _serializeCachedMessages(snapshot, secret);
+
+    if (writeIndex) {
+      final output =
+          _estimatedIndexPayloadSize(snapshot) >= _backgroundCacheWorkThreshold
+              ? await Isolate.run(() => _serializeIndex(snapshot, secret))
+              : await _serializeIndex(snapshot, secret);
+      await _writeFileAtomically(indexFile, output);
+    }
+    if (writeBodies) {
+      if (bodies.isEmpty) {
+        if (await bodiesFile.exists()) {
+          await bodiesFile.delete();
+        }
+      } else {
+        final payload = Map<String, MailMessageBody>.of(bodies);
+        final output =
+            _estimatedBodiesPayloadSize(payload) >=
+                    _backgroundCacheWorkThreshold
+                ? await Isolate.run(() => _serializeBodies(payload, secret))
+                : await _serializeBodies(payload, secret);
+        await _writeFileAtomically(bodiesFile, output);
+      }
+    }
+
+    _memoryFor(indexFile)
+      ..messages = List<MailMessage>.unmodifiable(
+        snapshot.map(_normalizeCachedMessage),
+      )
+      ..bodies = Map<String, MailMessageBody>.unmodifiable(bodies);
+  }
+
+  Future<void> _writeFileAtomically(File file, String output) async {
+    await file.parent.create(recursive: true);
     final temp = File(
       '${file.path}.tmp-${DateTime.now().toUtc().microsecondsSinceEpoch}',
     );
@@ -275,7 +450,6 @@ class MailCache implements MailMessageCache {
       }
       await temp.rename(file.path);
     }
-    _rememberMessages(file, snapshot);
   }
 
   String? get _normalizedLocalCacheSecret {
@@ -306,74 +480,176 @@ class MailCache implements MailMessageCache {
   }
 }
 
+MailMessage _mergeBody(MailMessage indexMessage, MailMessageBody? body) {
+  if (body == null) return indexMessage;
+  return indexMessage.copyWith(
+    body: body.body,
+    htmlBody: body.htmlBody,
+    bodyLoaded: true,
+  );
+}
+
+MailMessage _stripBody(MailMessage message) {
+  if (message.body.isEmpty && message.htmlBody.isEmpty) return message;
+  return message.copyWith(body: '', htmlBody: '');
+}
+
+MailMessageBody? _bodyForStorage(MailMessage message) {
+  if (!message.bodyLoaded) return null;
+  if (message.body.isEmpty && message.htmlBody.isEmpty) return null;
+  return MailMessageBody(body: message.body, htmlBody: message.htmlBody);
+}
+
+bool _sameBody(MailMessageBody? first, MailMessageBody? second) {
+  if (identical(first, second)) return true;
+  if (first == null || second == null) return false;
+  return first.body == second.body && first.htmlBody == second.htmlBody;
+}
+
 class _CachedMessageFile {
   List<MailMessage>? messages;
+  Map<String, MailMessageBody>? bodies;
   int lastAccess = 0;
 }
 
-class _DecodedCachedMessages {
-  const _DecodedCachedMessages.loaded(this.messages) : shouldQuarantine = false;
-  const _DecodedCachedMessages.unreadableEncrypted()
+class _LoadedCache {
+  const _LoadedCache(this.messages, this.bodies);
+
+  final List<MailMessage> messages;
+  final Map<String, MailMessageBody> bodies;
+}
+
+class _DecodedIndex {
+  const _DecodedIndex.loaded(this.messages, this.inlineBodies)
+    : shouldQuarantine = false;
+  const _DecodedIndex.unreadableEncrypted()
     : messages = const [],
+      inlineBodies = const {},
       shouldQuarantine = false;
-  const _DecodedCachedMessages.invalid()
+  const _DecodedIndex.invalid()
     : messages = const [],
+      inlineBodies = const {},
       shouldQuarantine = true;
 
   final List<MailMessage> messages;
+  final Map<String, MailMessageBody> inlineBodies;
   final bool shouldQuarantine;
 }
 
-Future<_DecodedCachedMessages> _decodeCachedMessages(
-  String raw,
-  String? secret,
-) async {
+class _DecodedBodies {
+  const _DecodedBodies.loaded(this.bodies) : shouldQuarantine = false;
+  const _DecodedBodies.unreadableEncrypted()
+    : bodies = const {},
+      shouldQuarantine = false;
+  const _DecodedBodies.invalid() : bodies = const {}, shouldQuarantine = true;
+
+  final Map<String, MailMessageBody> bodies;
+  final bool shouldQuarantine;
+}
+
+Future<_DecodedIndex> _decodeIndex(String raw, String? secret) async {
   var plaintext = raw;
   if (secret != null) {
     final decrypted = await LocalCacheCipher(secret).tryDecryptText(raw);
     if (decrypted != null) {
       plaintext = decrypted;
     } else if (LocalCacheCipher.looksEncrypted(raw)) {
-      return const _DecodedCachedMessages.unreadableEncrypted();
+      return const _DecodedIndex.unreadableEncrypted();
     }
   } else if (LocalCacheCipher.looksEncrypted(raw)) {
-    return const _DecodedCachedMessages.unreadableEncrypted();
+    return const _DecodedIndex.unreadableEncrypted();
   }
   try {
     final decodedJson = jsonDecode(plaintext);
-    if (decodedJson is! List) return const _DecodedCachedMessages.invalid();
-    return _DecodedCachedMessages.loaded([
-      for (final item in decodedJson)
-        _messageFromJson((item as Map).cast<String, Object?>()),
-    ]);
+    if (decodedJson is! List) return const _DecodedIndex.invalid();
+    final messages = <MailMessage>[];
+    final inlineBodies = <String, MailMessageBody>{};
+    for (final item in decodedJson) {
+      final map = (item as Map).cast<String, Object?>();
+      final message = _messageFromJson(map);
+      messages.add(_stripBody(message));
+      final rawBody = map['body'] as String? ?? '';
+      final rawHtml = map['html_body'] as String? ?? '';
+      final bodyLoaded = map['body_loaded'] as bool? ?? true;
+      if (bodyLoaded && (rawBody.isNotEmpty || rawHtml.isNotEmpty)) {
+        inlineBodies[message.id] = MailMessageBody(
+          body: rawBody,
+          htmlBody: rawHtml,
+        );
+      }
+    }
+    return _DecodedIndex.loaded(messages, inlineBodies);
   } on FormatException {
-    return const _DecodedCachedMessages.invalid();
+    return const _DecodedIndex.invalid();
   } on TypeError {
-    return const _DecodedCachedMessages.invalid();
+    return const _DecodedIndex.invalid();
   } on ArgumentError {
-    return const _DecodedCachedMessages.invalid();
+    return const _DecodedIndex.invalid();
   }
 }
 
-Future<String> _serializeCachedMessages(
+Future<_DecodedBodies> _decodeBodies(String raw, String? secret) async {
+  var plaintext = raw;
+  if (secret != null) {
+    final decrypted = await LocalCacheCipher(secret).tryDecryptText(raw);
+    if (decrypted != null) {
+      plaintext = decrypted;
+    } else if (LocalCacheCipher.looksEncrypted(raw)) {
+      return const _DecodedBodies.unreadableEncrypted();
+    }
+  } else if (LocalCacheCipher.looksEncrypted(raw)) {
+    return const _DecodedBodies.unreadableEncrypted();
+  }
+  try {
+    final decodedJson = jsonDecode(plaintext);
+    if (decodedJson is! Map) return const _DecodedBodies.invalid();
+    final bodies = <String, MailMessageBody>{};
+    decodedJson.forEach((key, value) {
+      final map = (value as Map).cast<String, Object?>();
+      bodies[key as String] = MailMessageBody(
+        body: map['body'] as String? ?? '',
+        htmlBody: map['html_body'] as String? ?? '',
+      );
+    });
+    return _DecodedBodies.loaded(bodies);
+  } on FormatException {
+    return const _DecodedBodies.invalid();
+  } on TypeError {
+    return const _DecodedBodies.invalid();
+  } on ArgumentError {
+    return const _DecodedBodies.invalid();
+  }
+}
+
+Future<String> _serializeIndex(
   List<MailMessage> messages,
   String? secret,
 ) async {
   final plaintext = jsonEncode([
-    for (final message in messages) _messageToJson(message),
+    for (final message in messages) _indexToJson(message),
   ]);
   if (secret == null) return plaintext;
   return LocalCacheCipher(secret).encryptText(plaintext);
 }
 
-Map<String, Object?> _messageToJson(MailMessage message) => {
+Future<String> _serializeBodies(
+  Map<String, MailMessageBody> bodies,
+  String? secret,
+) async {
+  final plaintext = jsonEncode({
+    for (final entry in bodies.entries)
+      entry.key: {'body': entry.value.body, 'html_body': entry.value.htmlBody},
+  });
+  if (secret == null) return plaintext;
+  return LocalCacheCipher(secret).encryptText(plaintext);
+}
+
+Map<String, Object?> _indexToJson(MailMessage message) => {
   'id': message.id,
   'account_id': message.accountId,
   'from': message.from,
   'subject': message.subject,
   'preview': message.preview,
-  'body': message.body,
-  'html_body': message.htmlBody,
   'received_at': message.receivedAt.toUtc().toIso8601String(),
   'to': message.to,
   'cc': message.cc,
@@ -451,14 +727,12 @@ MailMessage _normalizeCachedMessage(MailMessage message) {
   );
 }
 
-bool _sameCachedMessage(MailMessage first, MailMessage second) {
+bool _sameIndexMessage(MailMessage first, MailMessage second) {
   return first.id == second.id &&
       first.accountId == second.accountId &&
       first.from == second.from &&
       first.subject == second.subject &&
       first.preview == second.preview &&
-      first.body == second.body &&
-      first.htmlBody == second.htmlBody &&
       first.receivedAt.isAtSameMomentAs(second.receivedAt) &&
       _sameStringList(first.to, second.to) &&
       _sameStringList(first.cc, second.cc) &&
@@ -499,7 +773,7 @@ bool _sameAttachments(List<MailAttachment> first, List<MailAttachment> second) {
   return true;
 }
 
-int _estimatedCachePayloadSize(Iterable<MailMessage> messages) {
+int _estimatedIndexPayloadSize(Iterable<MailMessage> messages) {
   var size = 0;
   for (final message in messages) {
     size +=
@@ -508,8 +782,6 @@ int _estimatedCachePayloadSize(Iterable<MailMessage> messages) {
         message.from.length +
         message.subject.length +
         message.preview.length +
-        message.body.length +
-        message.htmlBody.length +
         message.folderPath.length +
         message.folderDisplayName.length;
     for (final recipient in [
@@ -526,6 +798,18 @@ int _estimatedCachePayloadSize(Iterable<MailMessage> messages) {
           attachment.partId.length +
           attachment.transferEncoding.length;
     }
+    if (size >= MailCache._backgroundCacheWorkThreshold) return size;
+  }
+  return size;
+}
+
+int _estimatedBodiesPayloadSize(Map<String, MailMessageBody> bodies) {
+  var size = 0;
+  for (final entry in bodies.entries) {
+    size +=
+        entry.key.length +
+        entry.value.body.length +
+        entry.value.htmlBody.length;
     if (size >= MailCache._backgroundCacheWorkThreshold) return size;
   }
   return size;

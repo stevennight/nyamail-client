@@ -2278,7 +2278,10 @@ class _MemoryMailCache implements MailMessageCache {
     String? accountId,
     String? folderPath,
     String? query,
+    bool includeBodies = true,
   }) async {
+    final normalizedQuery = query?.trim() ?? '';
+    final mergeBodies = includeBodies || normalizedQuery.isNotEmpty;
     final values =
         _messages.values
             .where((message) => mailbox == null || message.mailbox == mailbox)
@@ -2290,12 +2293,29 @@ class _MemoryMailCache implements MailMessageCache {
                   folderPath == null ||
                   message.effectiveFolderPath == folderPath,
             )
+            .map(
+              (message) =>
+                  mergeBodies || !message.bodyLoaded
+                      ? message
+                      : message.copyWith(
+                        body: '',
+                        htmlBody: '',
+                        bodyLoaded: false,
+                      ),
+            )
             .toList()
           ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
-    if (query == null || query.trim().isEmpty) return values;
+    if (normalizedQuery.isEmpty) return values;
     return values
-        .where((message) => mailMessageMatchesQuery(message, query))
+        .where((message) => mailMessageMatchesQuery(message, query!))
         .toList();
+  }
+
+  @override
+  Future<MailMessageBody?> loadBody(String messageId) async {
+    final message = _messages[messageId];
+    if (message == null || !message.bodyLoaded) return null;
+    return MailMessageBody(body: message.body, htmlBody: message.htmlBody);
   }
 
   @override

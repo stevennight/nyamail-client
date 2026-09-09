@@ -828,6 +828,20 @@ class CachedTransportMailRepository
 
   @override
   Future<MailMessage> loadMessageBody(MailMessage message) async {
+    if (message.bodyLoaded &&
+        (message.body.isNotEmpty || message.htmlBody.isNotEmpty)) {
+      return message;
+    }
+    // The list/view code paths return messages without body text to keep opening
+    // a mailbox cheap; serve the body from the local cache before going remote.
+    final cachedBody = await _cache.loadBody(message.id);
+    if (cachedBody != null) {
+      return message.copyWith(
+        body: cachedBody.body,
+        htmlBody: cachedBody.htmlBody,
+        bodyLoaded: true,
+      );
+    }
     if (_credentials.isEmpty || message.bodyLoaded) return message;
     final credential = _credentialFor(message);
     if (credential == null) return message;
@@ -1347,7 +1361,10 @@ class CachedTransportMailRepository
     required MailboxKind mailbox,
     required List<int> remoteUids,
   }) async {
-    final cached = await _cache.loadMessages(mailbox: mailbox);
+    final cached = await _cache.loadMessages(
+      mailbox: mailbox,
+      includeBodies: false,
+    );
     final staleIds = await _staleMessageIdsForRemoteUids([
       for (final message in cached)
         if (message.accountId == credential.accountId) message.id,
@@ -1364,6 +1381,7 @@ class CachedTransportMailRepository
       mailbox: folder.kind,
       accountId: credential.accountId,
       folderPath: folder.path,
+      includeBodies: false,
     );
     final staleIds = await _staleMessageIdsForRemoteUids([
       for (final message in cached) message.id,
@@ -1415,7 +1433,10 @@ class CachedTransportMailRepository
     String? query,
     int? maxResults,
   }) async {
-    final cached = await _cache.loadMessages(query: query);
+    final cached = await _cache.loadMessages(
+      query: query,
+      includeBodies: false,
+    );
     final activeAccountIds =
         _credentials.map((credential) => credential.accountId).toSet();
     final scoped = <MailMessage>[];
@@ -1436,7 +1457,10 @@ class CachedTransportMailRepository
     String? query,
     int? maxResults,
   }) async {
-    final cached = await _cache.loadMessages(query: query);
+    final cached = await _cache.loadMessages(
+      query: query,
+      includeBodies: false,
+    );
     final activeAccountIds =
         _credentials.map((credential) => credential.accountId).toSet();
     return _dedupeCachedMessages(
@@ -1498,7 +1522,10 @@ class CachedTransportMailRepository
     required String accountId,
     required MailboxKind mailbox,
   }) async {
-    final cached = await _cache.loadMessages(mailbox: mailbox);
+    final cached = await _cache.loadMessages(
+      mailbox: mailbox,
+      includeBodies: false,
+    );
     int? oldest;
     for (final message in cached) {
       if (message.accountId != accountId) continue;
@@ -1514,6 +1541,7 @@ class CachedTransportMailRepository
       mailbox: folder.kind,
       accountId: folder.accountId,
       folderPath: folder.path,
+      includeBodies: false,
     );
     int? oldest;
     for (final message in cached) {
