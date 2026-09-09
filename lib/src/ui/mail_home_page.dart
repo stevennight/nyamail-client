@@ -107,6 +107,39 @@ String _displaySender(String from) {
   return value.replaceAll('<', '').replaceAll('>', '').trim();
 }
 
+/// Bare address portion of a `Name <addr>` sender string, or '' when there is no
+/// distinct address to show under the display name.
+String _senderAddress(String from) {
+  final value = from.trim();
+  final open = value.indexOf('<');
+  final close = value.indexOf('>', open + 1);
+  if (open >= 0 && close > open) {
+    return value.substring(open + 1, close).trim();
+  }
+  return value.contains('@') ? value : '';
+}
+
+/// First printable character for a sender avatar, upper-cased.
+String _senderInitial(String label) {
+  for (final rune in label.trim().runes) {
+    final ch = String.fromCharCode(rune).trim();
+    if (ch.isNotEmpty) return ch.toUpperCase();
+  }
+  return '?';
+}
+
+/// Stable, reasonably saturated fill colour for a sender avatar.
+Color _senderAvatarColor(String key, ColorScheme scheme) {
+  if (key.trim().isEmpty) return scheme.secondaryContainer;
+  var hash = 0x811c9dc5;
+  for (final unit in key.codeUnits) {
+    hash = (hash ^ unit) * 0x01000193 & 0xffffffff;
+  }
+  final hue = (hash % 360).toDouble();
+  final lightness = scheme.brightness == Brightness.dark ? 0.55 : 0.5;
+  return HSLColor.fromAHSL(1, hue, 0.5, lightness).toColor();
+}
+
 const _mailHomeShortcuts = <ShortcutActivator, Intent>{
   SingleActivator(LogicalKeyboardKey.keyN, control: true): _ComposeMailIntent(),
   SingleActivator(LogicalKeyboardKey.keyN, meta: true): _ComposeMailIntent(),
@@ -8670,6 +8703,97 @@ class _ReaderEmptyState extends StatelessWidget {
   }
 }
 
+class _ReaderSenderHeader extends StatelessWidget {
+  const _ReaderSenderHeader({required this.message});
+
+  final MailMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final name = _displaySender(message.from);
+    final address = _senderAddress(message.from);
+    final avatarColor = _senderAvatarColor(
+      address.isNotEmpty ? address : name,
+      colorScheme,
+    );
+    final onAvatar =
+        ThemeData.estimateBrightnessForColor(avatarColor) == Brightness.dark
+            ? Colors.white
+            : Colors.black;
+    final recipientLines = <String>[
+      if (message.to.isNotEmpty) 'To ${message.to.join(', ')}',
+      if (message.cc.isNotEmpty) 'Cc ${message.cc.join(', ')}',
+      if (message.replyTo.isNotEmpty)
+        'Reply-To ${message.replyTo.join(', ')}',
+    ];
+    final subdued = theme.textTheme.bodySmall?.copyWith(
+      color: colorScheme.onSurfaceVariant,
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            CircleAvatar(
+              radius: 20,
+              backgroundColor: avatarColor,
+              foregroundColor: onAvatar,
+              child: Text(
+                _senderInitial(name.isNotEmpty ? name : address),
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    name,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  if (address.isNotEmpty && address != name)
+                    Text(
+                      address,
+                      style: subdued,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              mailMessageDisplayDate(message.receivedAt),
+              style: subdued,
+            ),
+          ],
+        ),
+        if (recipientLines.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          for (final line in recipientLines)
+            Padding(
+              padding: const EdgeInsetsDirectional.only(start: 52, top: 2),
+              child: Text(
+                line,
+                style: subdued,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+        ],
+      ],
+    );
+  }
+}
+
 class _ComposeDialog extends StatefulWidget {
   const _ComposeDialog({
     this.title = 'New message',
@@ -9631,17 +9755,8 @@ class _ReaderBodyState extends State<_ReaderBody> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           header,
-          const SizedBox(height: 8),
-          for (final line in mailMessageDetailLines(message))
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text(
-                line,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ),
+          const SizedBox(height: 12),
+          _ReaderSenderHeader(message: message),
           if (widget.mailboxContextLabel.trim().isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 4),
