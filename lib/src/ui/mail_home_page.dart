@@ -1963,22 +1963,17 @@ class _MailHomePageState extends State<MailHomePage>
                 ),
               )
               : null,
+      appBar: _MailHomeAppBar(
+        title: _labelForMailboxView(_view, _accounts),
+        onCompose: _accounts.isEmpty ? null : _showCompose,
+        onRefresh: _refreshingMail ? null : _loadMessages,
+        refreshing: _refreshingMail,
+        onSettings: _showSettings,
+      ),
       body: SafeArea(
+        top: false,
         child: Column(
           children: [
-            _TopBar(
-              session: _session,
-              profile: _profile,
-              compactTitle:
-                  useFolderDrawer
-                      ? _labelForMailboxView(_view, _accounts)
-                      : null,
-              showFolderMenu: useFolderDrawer,
-              onCompose: _accounts.isEmpty ? null : _showCompose,
-              onRefresh: _refreshingMail ? null : _loadMessages,
-              refreshing: _refreshingMail,
-              onSettings: _showSettings,
-            ),
             if (_banner != null)
               _InlineNoticeBanner(
                 message: _banner!,
@@ -6098,154 +6093,56 @@ class _VaultGatePage extends StatelessWidget {
   }
 }
 
-class _TopBar extends StatelessWidget {
-  const _TopBar({
-    required this.session,
-    required this.profile,
-    required this.compactTitle,
-    required this.showFolderMenu,
+class _MailHomeAppBar extends StatelessWidget implements PreferredSizeWidget {
+  const _MailHomeAppBar({
+    required this.title,
     required this.onCompose,
     required this.onRefresh,
     required this.refreshing,
     required this.onSettings,
   });
 
-  final LocalSession? session;
-  final LocalProfile? profile;
-  final String? compactTitle;
-  final bool showFolderMenu;
+  final String title;
   final VoidCallback? onCompose;
   final VoidCallback? onRefresh;
   final bool refreshing;
   final VoidCallback onSettings;
 
   @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final compact = constraints.maxWidth < 860;
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surface,
-            border: Border(
-              bottom: BorderSide(
-                color: Theme.of(context).colorScheme.outlineVariant,
-              ),
-            ),
-          ),
-          child: compact ? _compactRow(context) : _wideRow(context),
-        );
-      },
-    );
-  }
-
-  Widget _wideRow(BuildContext context) {
-    return Row(
-      children: [
-        if (showFolderMenu) ...[
-          IconButton(
-            tooltip: 'Folders',
-            onPressed: () => Scaffold.of(context).openDrawer(),
-            icon: const Icon(Icons.menu_open),
-          ),
-          const SizedBox(width: 4),
-        ],
-        const Icon(Icons.mail_lock_outlined),
-        const SizedBox(width: 10),
-        Text('NyaMail', style: Theme.of(context).textTheme.titleLarge),
-        if (compactTitle != null) ...[
-          const SizedBox(width: 12),
-          Icon(
-            Icons.chevron_right,
-            size: 18,
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
-          const SizedBox(width: 8),
-          Flexible(
-            child: Text(
-              compactTitle!,
-              style: Theme.of(context).textTheme.titleMedium,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ],
-        const Spacer(),
-        IconButton(
-          tooltip:
-              onCompose == null
-                  ? 'Add a mailbox before composing'
-                  : 'New message',
-          onPressed: onCompose,
-          icon: const Icon(Icons.edit_outlined),
-        ),
-        IconButton(
-          tooltip: refreshing ? 'Refreshing mail...' : 'Refresh mail',
-          onPressed: refreshing ? null : onRefresh,
-          icon: _RefreshButtonIcon(refreshing: refreshing),
-        ),
-        IconButton(
-          tooltip: 'Settings',
-          onPressed: onSettings,
-          icon: const Icon(Icons.settings_outlined),
-        ),
-      ],
-    );
-  }
-
-  Widget _compactRow(BuildContext context) {
-    return Row(
-      children: [
-        IconButton(
-          tooltip: 'Folders',
-          onPressed:
-              showFolderMenu ? () => Scaffold.of(context).openDrawer() : null,
-          icon: const Icon(Icons.menu_open),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Text(
-            compactTitle ?? profile?.label ?? 'NyaMail',
-            style: Theme.of(context).textTheme.titleMedium,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-        ),
-        IconButton(
-          tooltip:
-              onCompose == null
-                  ? 'Add a mailbox before composing'
-                  : 'New message',
-          onPressed: onCompose,
-          icon: const Icon(Icons.edit_outlined),
-        ),
-        IconButton(
-          tooltip: refreshing ? 'Refreshing mail...' : 'Refresh mail',
-          onPressed: refreshing ? null : onRefresh,
-          icon: _RefreshButtonIcon(refreshing: refreshing),
-        ),
-        IconButton(
-          tooltip: 'Settings',
-          onPressed: onSettings,
-          icon: const Icon(Icons.settings_outlined),
-        ),
-      ],
-    );
-  }
-}
-
-class _RefreshButtonIcon extends StatelessWidget {
-  const _RefreshButtonIcon({required this.refreshing});
-
-  final bool refreshing;
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight + 4);
 
   @override
   Widget build(BuildContext context) {
-    if (!refreshing) return const Icon(Icons.refresh);
-    return const SizedBox.square(
-      dimension: 20,
-      child: CircularProgressIndicator(strokeWidth: 2),
+    return AppBar(
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      actions: [
+        IconButton(
+          tooltip:
+              onCompose == null
+                  ? 'Add a mailbox before composing'
+                  : 'New message',
+          onPressed: onCompose,
+          icon: const Icon(Icons.edit_outlined),
+        ),
+        IconButton(
+          tooltip: refreshing ? 'Refreshing mail…' : 'Refresh mail',
+          onPressed: onRefresh,
+          icon: const Icon(Icons.refresh),
+        ),
+        IconButton(
+          tooltip: 'Settings',
+          onPressed: onSettings,
+          icon: const Icon(Icons.settings_outlined),
+        ),
+        const SizedBox(width: 4),
+      ],
+      bottom: PreferredSize(
+        preferredSize: const Size.fromHeight(4),
+        child:
+            refreshing
+                ? const LinearProgressIndicator(minHeight: 4)
+                : const SizedBox(height: 4),
+      ),
     );
   }
 }
