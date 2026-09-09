@@ -67,6 +67,10 @@ const _oauthRefreshTimeout = Duration(seconds: 20);
 const _folderDiscoveryTimeout = Duration(seconds: 45);
 const _automaticMailRefreshInterval = Duration(minutes: 1);
 
+/// Fixed amber for the "starred" affordance so it reads as a star regardless of
+/// the accent colour.
+const _starColor = Color(0xFFF5A623);
+
 const _mailHomeShortcuts = <ShortcutActivator, Intent>{
   SingleActivator(LogicalKeyboardKey.keyN, control: true): _ComposeMailIntent(),
   SingleActivator(LogicalKeyboardKey.keyN, meta: true): _ComposeMailIntent(),
@@ -7907,7 +7911,7 @@ class _MessageListTile extends StatelessWidget {
           ),
           if (message.starred) ...[
             const SizedBox(width: 6),
-            Icon(Icons.star, size: 16, color: colorScheme.tertiary),
+            const Icon(Icons.star, size: 16, color: _starColor),
           ],
           if (message.hasAttachments) ...[
             const SizedBox(width: 6),

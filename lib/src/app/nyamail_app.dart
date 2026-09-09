@@ -16,6 +16,7 @@ import '../security/vault_crypto.dart';
 import '../security/vault_record_crypto.dart';
 import '../ui/mail_home_page.dart';
 import 'app_config.dart';
+import 'app_theme.dart';
 import 'app_theme_settings.dart';
 
 class NyaMailApp extends StatefulWidget {
@@ -76,26 +77,8 @@ class _NyaMailAppState extends State<NyaMailApp> {
       title: 'NyaMail',
       debugShowCheckedModeBanner: false,
       themeMode: _themeSetting.themeMode,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF277E7A),
-          brightness: Brightness.light,
-        ),
-        useMaterial3: true,
-        visualDensity: VisualDensity.standard,
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(),
-          isDense: true,
-        ),
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF56A3A6),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-        visualDensity: VisualDensity.standard,
-      ),
+      theme: buildLightTheme(),
+      darkTheme: buildDarkTheme(),
       home:
           _loading || api == null || apiBaseUrl == null
               ? const Scaffold(body: Center(child: CircularProgressIndicator()))
