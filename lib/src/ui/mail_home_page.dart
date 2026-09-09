@@ -274,6 +274,7 @@ class _MailHomePageState extends State<MailHomePage>
   String? _unlockedVaultSecret;
   String? _unlockedVaultPassword;
   MailboxView _view = const MailboxView.smart(MailSmartFolder.allIncoming);
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
   String? _selectedAccountId;
   MailMessage? _selected;
   MailRenderSettings _renderSettings = MailRenderSettings.defaults;
@@ -1936,6 +1937,7 @@ class _MailHomePageState extends State<MailHomePage>
     }
     final shellWidth = MediaQuery.sizeOf(context).width;
     final useFolderDrawer = shellWidth < _kSidebarBreakpoint;
+    final isMobile = shellWidth < _kSinglePaneBreakpoint;
     final scaffold = Scaffold(
       drawer:
           useFolderDrawer
@@ -1970,6 +1972,24 @@ class _MailHomePageState extends State<MailHomePage>
         refreshing: _refreshingMail,
         onSettings: _showSettings,
       ),
+      floatingActionButton:
+          isMobile && _accounts.isNotEmpty
+              ? FloatingActionButton(
+                onPressed: _showCompose,
+                tooltip: 'New message',
+                child: const Icon(Icons.edit_outlined),
+              )
+              : null,
+      bottomNavigationBar:
+          isMobile
+              ? _MailBottomNav(
+                currentIndex: _mobileNavIndex(),
+                onSelectView:
+                    (smart) => _changeView(MailboxView.smart(smart)),
+                onOpenFolders: () => _scaffoldKey.currentState?.openDrawer(),
+              )
+              : null,
+      key: _scaffoldKey,
       body: SafeArea(
         top: false,
         child: Column(
@@ -2317,6 +2337,17 @@ class _MailHomePageState extends State<MailHomePage>
         );
       });
     }
+  }
+
+  /// Index into [_MailBottomNav]'s destinations for the active view.
+  /// 0 = All incoming, 1 = Unread, 2 = Inbox, 3 = a specific folder ("Folders").
+  int _mobileNavIndex() {
+    return switch (_view.smartFolder) {
+      MailSmartFolder.allIncoming => 0,
+      MailSmartFolder.unread => 1,
+      MailSmartFolder.inbox => 2,
+      _ => _view.folder != null ? 3 : 0,
+    };
   }
 
   void _changeView(MailboxView view) {
@@ -6143,6 +6174,50 @@ class _MailHomeAppBar extends StatelessWidget implements PreferredSizeWidget {
                 ? const LinearProgressIndicator(minHeight: 4)
                 : const SizedBox(height: 4),
       ),
+    );
+  }
+}
+
+class _MailBottomNav extends StatelessWidget {
+  const _MailBottomNav({
+    required this.currentIndex,
+    required this.onSelectView,
+    required this.onOpenFolders,
+  });
+
+  final int currentIndex;
+  final ValueChanged<MailSmartFolder> onSelectView;
+  final VoidCallback onOpenFolders;
+
+  static const _views = [
+    MailSmartFolder.allIncoming,
+    MailSmartFolder.unread,
+    MailSmartFolder.inbox,
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return NavigationBar(
+      selectedIndex: currentIndex.clamp(0, _views.length),
+      onDestinationSelected: (index) {
+        if (index == _views.length) {
+          onOpenFolders();
+          return;
+        }
+        onSelectView(_views[index]);
+      },
+      destinations: [
+        for (final view in _views)
+          NavigationDestination(
+            icon: Icon(_iconForSmartFolder(view)),
+            label: _labelForSmartFolder(view),
+          ),
+        const NavigationDestination(
+          icon: Icon(Icons.folder_outlined),
+          selectedIcon: Icon(Icons.folder),
+          label: 'Folders',
+        ),
+      ],
     );
   }
 }
