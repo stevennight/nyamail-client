@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -30,7 +31,15 @@ class _MailHtmlViewState extends State<MailHtmlView> {
   static const _minimumHeight = 96.0;
   static const _maximumHeight = 30000.0;
 
+  /// Ignore height reports that only nudge the pane by a few pixels. Combined
+  /// with the JS-side coalescing this stops the WebView <-> Flutter resize loop
+  /// that otherwise locks the UI thread while the window is being resized.
+  static const _heightChangeThreshold = 8.0;
+  static const _heightApplyDelay = Duration(milliseconds: 90);
+
   double _height = _initialHeight;
+  double _reportedHeight = _initialHeight;
+  Timer? _heightApplyTimer;
   bool _loadImagesTriggered = false;
 
   @override
@@ -40,9 +49,30 @@ class _MailHtmlViewState extends State<MailHtmlView> {
         oldWidget.policy.loadRemoteImages != widget.policy.loadRemoteImages ||
         oldWidget.policy.loadExternalStylesAndFonts !=
             widget.policy.loadExternalStylesAndFonts) {
+      _heightApplyTimer?.cancel();
+      _heightApplyTimer = null;
       _height = _initialHeight;
+      _reportedHeight = _initialHeight;
       _loadImagesTriggered = false;
     }
+  }
+
+  @override
+  void dispose() {
+    _heightApplyTimer?.cancel();
+    super.dispose();
+  }
+
+  void _onReportedHeight(double raw) {
+    final clamped = raw.clamp(_minimumHeight, _maximumHeight).toDouble();
+    _reportedHeight = clamped;
+    if ((clamped - _height).abs() < _heightChangeThreshold) return;
+    _heightApplyTimer ??= Timer(_heightApplyDelay, () {
+      _heightApplyTimer = null;
+      if (!mounted) return;
+      if ((_reportedHeight - _height).abs() < _heightChangeThreshold) return;
+      setState(() => _height = _reportedHeight);
+    });
   }
 
   @override
@@ -108,10 +138,7 @@ class _MailHtmlViewState extends State<MailHtmlView> {
                     final next =
                         raw is num ? raw.toDouble() : double.tryParse('$raw');
                     if (next == null || !mounted) return null;
-                    final clamped =
-                        next.clamp(_minimumHeight, _maximumHeight).toDouble();
-                    if ((clamped - _height).abs() < 2) return null;
-                    setState(() => _height = clamped);
+                    _onReportedHeight(next);
                     return null;
                   },
                 );
@@ -287,19 +314,41 @@ class _MailHtmlViewState extends State<MailHtmlView> {
     ));
     window.flutter_inappwebview.callHandler('nyamailHeight', height);
   }
+  // Coalesce observer bursts: measuring re-mutates the DOM (scaling wide
+  // content, setting an explicit frame height), which would otherwise retrigger
+  // the observers every frame and lock up the UI thread while the window is
+  // being resized.
+  var nyamailHeightScheduled = false;
+  var nyamailHeightTimer = null;
+  var nyamailLastPost = 0;
+  function schedulePostHeight() {
+    if (nyamailHeightScheduled) return;
+    nyamailHeightScheduled = true;
+    var run = function() {
+      nyamailHeightScheduled = false;
+      nyamailLastPost = Date.now();
+      postHeight();
+    };
+    var since = Date.now() - nyamailLastPost;
+    if (since >= 120) {
+      (window.requestAnimationFrame || window.setTimeout)(run);
+    } else {
+      if (nyamailHeightTimer) clearTimeout(nyamailHeightTimer);
+      nyamailHeightTimer = setTimeout(run, 120 - since);
+    }
+  }
   if (window.__nyamailResizeObserver) {
     window.__nyamailResizeObserver.disconnect();
   }
   if (window.ResizeObserver) {
-    window.__nyamailResizeObserver = new ResizeObserver(postHeight);
+    window.__nyamailResizeObserver = new ResizeObserver(schedulePostHeight);
     window.__nyamailResizeObserver.observe(document.documentElement);
-    if (document.body) window.__nyamailResizeObserver.observe(document.body);
   }
   if (window.__nyamailMutationObserver) {
     window.__nyamailMutationObserver.disconnect();
   }
   if (window.MutationObserver && document.body) {
-    window.__nyamailMutationObserver = new MutationObserver(postHeight);
+    window.__nyamailMutationObserver = new MutationObserver(schedulePostHeight);
     window.__nyamailMutationObserver.observe(document.body, {
       childList: true,
       subtree: true
