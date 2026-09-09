@@ -52,6 +52,7 @@ import '../security/vault_record_crypto.dart';
 import '../security/vault_record_sync_engine.dart';
 import '../security/vault_records.dart';
 import '../security/vault_share_crypto.dart';
+import '../system/notification_grouping.dart';
 import '../system/notification_service.dart';
 import '../system/startup_service.dart';
 import '../system/system_behavior_settings.dart';
@@ -462,6 +463,15 @@ class _MailHomePageState extends State<MailHomePage>
       enabled: settings.newMailNotifications,
       onNotificationSelected: _handleNotificationSelected,
     );
+    if (settings.newMailNotifications) {
+      await _notificationService.ensureAccountChannels([
+        for (final account in _accounts)
+          NewMailNotificationAccount(
+            id: account.id,
+            label: _notificationAccountLabel(account.id) ?? account.address,
+          ),
+      ]);
+    }
     if (!settings.openMessageFromNotification) {
       _pendingNotificationMessageId = null;
     }
@@ -916,6 +926,13 @@ class _MailHomePageState extends State<MailHomePage>
     );
     if (!_systemSettings.newMailNotifications || fresh.isEmpty) return;
     fresh.sort((a, b) => a.receivedAt.compareTo(b.receivedAt));
+    final grouping = _systemSettings.notificationGrouping;
+
+    final byAccount = <String, List<MailMessage>>{};
+    for (final message in fresh) {
+      byAccount.putIfAbsent(message.accountId, () => []).add(message);
+    }
+
     for (final message in fresh) {
       final content = MailNotificationContent.fromMessage(message);
       await _notificationService.showNewMail(
@@ -923,9 +940,50 @@ class _MailHomePageState extends State<MailHomePage>
         title: content.title,
         body: content.body,
         accountLabel: _notificationAccountLabel(message.accountId),
+        accountId: message.accountId,
         payload: message.id,
+        grouping: grouping,
       );
     }
+
+    if (grouping == NotificationGrouping.individual) return;
+    if (grouping == NotificationGrouping.perAccount) {
+      for (final entry in byAccount.entries) {
+        await _notificationService.showNewMailSummary(
+          messageCount: entry.value.length,
+          lines: _notificationSummaryLines(entry.value),
+          accountLabel: _notificationAccountLabel(entry.key),
+          accountId: entry.key,
+          grouping: grouping,
+        );
+      }
+      return;
+    }
+    // stack: one summary across every account.
+    await _notificationService.showNewMailSummary(
+      messageCount: fresh.length,
+      lines: _notificationSummaryLines(fresh),
+      accountLabel:
+          byAccount.length == 1
+              ? _notificationAccountLabel(fresh.first.accountId)
+              : null,
+      grouping: grouping,
+    );
+  }
+
+  List<String> _notificationSummaryLines(List<MailMessage> messages) {
+    final ordered = [...messages]
+      ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+    return [
+      for (final message in ordered.take(6))
+        () {
+          final content = MailNotificationContent.fromMessage(message);
+          final firstBodyLine = content.body.split('\n').first.trim();
+          return firstBodyLine.isEmpty
+              ? content.title
+              : '${content.title}: $firstBodyLine';
+        }(),
+    ];
   }
 
   bool _isNotifiableIncomingUnread(MailMessage message) {
@@ -6786,6 +6844,37 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
                       ? null
                       : _setOpenMessageFromNotification,
             ),
+            if (NyaMailNotificationService.isSupported &&
+                _settings.newMailNotifications) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  'Grouping',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              RadioGroup<NotificationGrouping>(
+                groupValue: _settings.notificationGrouping,
+                onChanged: (value) {
+                  if (value != null && !_loading) {
+                    _setNotificationGrouping(value);
+                  }
+                },
+                child: Column(
+                  children: [
+                    for (final mode in NotificationGrouping.values)
+                      RadioListTile<NotificationGrouping>(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        title: Text(mode.label),
+                        subtitle: Text(mode.description),
+                        value: mode,
+                      ),
+                  ],
+                ),
+              ),
+            ],
             if (_error != null) ...[
               const SizedBox(height: 8),
               Text(
@@ -6839,6 +6928,12 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
   Future<void> _setOpenMessageFromNotification(bool enabled) async {
     await _setBehaviorSetting(
       _settings.copyWith(openMessageFromNotification: enabled),
+    );
+  }
+
+  Future<void> _setNotificationGrouping(NotificationGrouping grouping) async {
+    await _setBehaviorSetting(
+      _settings.copyWith(notificationGrouping: grouping),
     );
   }
 

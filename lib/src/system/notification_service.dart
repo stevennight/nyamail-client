@@ -4,7 +4,20 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
+import 'notification_grouping.dart';
+
 typedef NotificationSelectionCallback = Future<void> Function(String? payload);
+
+class NewMailNotificationAccount {
+  const NewMailNotificationAccount({required this.id, required this.label});
+
+  final String id;
+  final String label;
+}
+
+const _baseChannelId = 'nyamail_new_mail';
+const _baseChannelName = 'New mail';
+const _baseGroupKey = 'nyamail_new_mail';
 
 class NyaMailNotificationService {
   final FlutterLocalNotificationsPlugin _plugin =
@@ -14,6 +27,7 @@ class NyaMailNotificationService {
   bool _enabled = false;
   bool _launchDetailsHandled = false;
   NotificationSelectionCallback? _onNotificationSelected;
+  final Set<String> _createdChannelIds = <String>{};
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -49,12 +63,30 @@ class NyaMailNotificationService {
     _enabled = true;
   }
 
+  /// Pre-creates a per-account notification channel for each account so the
+  /// "one group per account" mode can route to it. Android only; a no-op
+  /// elsewhere.
+  Future<void> ensureAccountChannels(
+    Iterable<NewMailNotificationAccount> accounts,
+  ) async {
+    if (!_enabled || !isSupported || !Platform.isAndroid) return;
+    await _ensureInitialized();
+    for (final account in accounts) {
+      await _ensureAndroidChannel(
+        id: _accountChannelId(account.id),
+        name: 'New mail — ${account.label}',
+      );
+    }
+  }
+
   Future<void> showNewMail({
     required String notificationKey,
     required String title,
     required String body,
     String? accountLabel,
+    String? accountId,
     String? payload,
+    NotificationGrouping grouping = NotificationGrouping.stack,
   }) async {
     if (!_enabled || !isSupported) return;
     await _ensureInitialized();
@@ -62,11 +94,57 @@ class NyaMailNotificationService {
       id: notificationIdForKey(notificationKey),
       title: title,
       body: body,
-      notificationDetails: _notificationDetails(
+      notificationDetails: _messageDetails(
         body: body,
         accountLabel: accountLabel,
+        accountId: accountId,
+        grouping: grouping,
       ),
       payload: payload,
+    );
+  }
+
+  /// Posts (or refreshes) the summary notification that lets a stack of
+  /// new-mail notifications collapse into one row. Android only; on Apple
+  /// platforms the thread identifier already groups them, so this is a no-op.
+  Future<void> showNewMailSummary({
+    required int messageCount,
+    required List<String> lines,
+    String? accountLabel,
+    String? accountId,
+    NotificationGrouping grouping = NotificationGrouping.stack,
+  }) async {
+    if (!_enabled || !isSupported || !Platform.isAndroid) return;
+    if (grouping == NotificationGrouping.individual) return;
+    await _ensureInitialized();
+    final groupKey = _groupKeyFor(grouping, accountId);
+    final channelId = _channelIdFor(grouping, accountId);
+    final channelName = _channelNameFor(grouping, accountLabel);
+    await _ensureAndroidChannel(id: channelId, name: channelName);
+    final summaryTitle =
+        messageCount == 1 ? '1 new message' : '$messageCount new messages';
+    await _plugin.show(
+      id: notificationIdForKey('summary:$groupKey'),
+      title: summaryTitle,
+      body: accountLabel ?? 'NyaMail',
+      notificationDetails: NotificationDetails(
+        android: AndroidNotificationDetails(
+          channelId,
+          channelName,
+          channelDescription: 'Unread incoming mail discovered by NyaMail.',
+          importance: Importance.high,
+          priority: Priority.high,
+          category: AndroidNotificationCategory.email,
+          groupKey: groupKey,
+          setAsGroupSummary: true,
+          onlyAlertOnce: true,
+          styleInformation: InboxStyleInformation(
+            lines,
+            contentTitle: summaryTitle,
+            summaryText: accountLabel,
+          ),
+        ),
+      ),
     );
   }
 
@@ -74,7 +152,7 @@ class NyaMailNotificationService {
     if (_initialized) return;
     await _plugin.initialize(
       settings: const InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        android: AndroidInitializationSettings('@drawable/ic_stat_mail'),
         iOS: DarwinInitializationSettings(),
         macOS: DarwinInitializationSettings(),
         linux: LinuxInitializationSettings(defaultActionName: 'Open NyaMail'),
@@ -89,6 +167,9 @@ class NyaMailNotificationService {
       },
     );
     _initialized = true;
+    if (Platform.isAndroid) {
+      await _ensureAndroidChannel(id: _baseChannelId, name: _baseChannelName);
+    }
     await _dispatchLaunchNotificationIfNeeded();
   }
 
@@ -110,6 +191,25 @@ class NyaMailNotificationService {
   void _dispatchNotificationSelection(String? payload) {
     final callback = _onNotificationSelected;
     if (callback != null) unawaited(callback(payload));
+  }
+
+  Future<void> _ensureAndroidChannel({
+    required String id,
+    required String name,
+  }) async {
+    if (!Platform.isAndroid || !_createdChannelIds.add(id)) return;
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >()
+        ?.createNotificationChannel(
+          AndroidNotificationChannel(
+            id,
+            name,
+            description: 'Unread incoming mail discovered by NyaMail.',
+            importance: Importance.high,
+          ),
+        );
   }
 
   Future<void> _requestPermissions() async {
@@ -138,19 +238,31 @@ class NyaMailNotificationService {
     }
   }
 
-  NotificationDetails _notificationDetails({
+  NotificationDetails _messageDetails({
     required String body,
+    required NotificationGrouping grouping,
     String? accountLabel,
+    String? accountId,
   }) {
+    final groupKey =
+        grouping == NotificationGrouping.individual
+            ? null
+            : _groupKeyFor(grouping, accountId);
+    final threadIdentifier =
+        grouping == NotificationGrouping.individual
+            ? null
+            : _groupKeyFor(grouping, accountId);
+    final channelId = _channelIdFor(grouping, accountId);
+    final channelName = _channelNameFor(grouping, accountLabel);
     return NotificationDetails(
       android: AndroidNotificationDetails(
-        'nyamail_new_mail',
-        'New mail',
+        channelId,
+        channelName,
         channelDescription: 'Unread incoming mail discovered by NyaMail.',
         importance: Importance.high,
         priority: Priority.high,
         category: AndroidNotificationCategory.email,
-        groupKey: 'nyamail_new_mail',
+        groupKey: groupKey,
         subText: accountLabel,
         styleInformation: BigTextStyleInformation(body),
       ),
@@ -159,18 +271,47 @@ class NyaMailNotificationService {
         presentBadge: true,
         presentSound: true,
         subtitle: accountLabel,
-        threadIdentifier: 'nyamail_new_mail',
+        threadIdentifier: threadIdentifier,
       ),
       macOS: DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
         subtitle: accountLabel,
-        threadIdentifier: 'nyamail_new_mail',
+        threadIdentifier: threadIdentifier,
       ),
       linux: const LinuxNotificationDetails(),
     );
   }
+
+  String _groupKeyFor(NotificationGrouping grouping, String? accountId) {
+    if (grouping == NotificationGrouping.perAccount &&
+        accountId != null &&
+        accountId.isNotEmpty) {
+      return '$_baseGroupKey:$accountId';
+    }
+    return _baseGroupKey;
+  }
+
+  String _channelIdFor(NotificationGrouping grouping, String? accountId) {
+    if (grouping == NotificationGrouping.perAccount &&
+        accountId != null &&
+        accountId.isNotEmpty) {
+      return _accountChannelId(accountId);
+    }
+    return _baseChannelId;
+  }
+
+  String _channelNameFor(NotificationGrouping grouping, String? accountLabel) {
+    if (grouping == NotificationGrouping.perAccount &&
+        accountLabel != null &&
+        accountLabel.trim().isNotEmpty) {
+      return 'New mail — ${accountLabel.trim()}';
+    }
+    return _baseChannelName;
+  }
+
+  String _accountChannelId(String accountId) => '$_baseChannelId:$accountId';
 }
 
 String? notificationMessageIdFromPayload(String? payload) {
