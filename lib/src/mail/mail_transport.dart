@@ -224,6 +224,18 @@ abstract class IncrementalMailTransport {
 class SocketMailTransport implements MailTransport, IncrementalMailTransport {
   const SocketMailTransport();
 
+  /// Shared pool of logged-in IMAP connections.
+  ///
+  /// Every operation used to open a fresh TCP+TLS connection, log in, list the
+  /// folders and select a mailbox before doing any work. The pool keeps a small
+  /// number of authenticated connections per account and reuses them, so a
+  /// mailbox switch or a flag toggle is a single command round trip.
+  static final _ImapConnectionPool _pool = _ImapConnectionPool();
+
+  /// Closes every pooled IMAP connection. Call on sign-out or app shutdown;
+  /// connections are recreated lazily on the next request.
+  static Future<void> disposeConnections() => _pool.disposeAll();
+
   @override
   Future<void> validateCredential({
     required MailboxCredential credential,
@@ -247,15 +259,18 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
   @override
   Future<List<MailFolder>> listFolders({
     required MailboxCredential credential,
-  }) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final mailboxes = await imap.listMailboxes();
-      return _foldersFromList(credential, mailboxes);
-    } finally {
-      await imap.close();
-    }
+  }) {
+    return _pool.run(
+      credential,
+      action: (imap) async {
+        final mailboxes = await imap.listMailboxes();
+        _pool.updateResolver(
+          credential,
+          _ImapMailboxResolver.fromList(mailboxes),
+        );
+        return _foldersFromList(credential, mailboxes);
+      },
+    );
   }
 
   @override
@@ -264,40 +279,42 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required MailboxKind mailbox,
     int limit = 30,
   }) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      final folder = _standardFolderForMailbox(
-        credential: credential,
-        mailbox: mailbox,
-        path: resolver.nameFor(mailbox),
-      );
-      await imap.selectMailbox(folder.path);
-      final uids = await imap.uidSearchAll();
-      final messages = <MailMessage>[];
-      for (final uid in await _selectUidPageInBackground(uids, limit: limit)) {
-        final fetched = await imap.uidFetchMessage(uid);
-        messages.add(
-          await _parseFetchedRfc822Message(
-            _Rfc822ParseRequest(
-              raw: fetched.raw,
-              id: _messageId(credential.accountId, mailbox, uid),
-              accountId: credential.accountId,
-              mailbox: mailbox,
-              folderPath: folder.path,
-              folderDisplayName: folder.displayName,
-              read: fetched.flags.contains(r'\Seen'),
-              starred: fetched.flags.contains(r'\Flagged'),
-              receivedAt: fetched.internalDate,
+    final resolver = await _pool.resolver(credential);
+    final folder = _standardFolderForMailbox(
+      credential: credential,
+      mailbox: mailbox,
+      path: resolver.nameFor(mailbox),
+    );
+    return _pool.run(
+      credential,
+      selectMailbox: folder.path,
+      action: (imap) async {
+        final uids = await imap.uidSearchAll();
+        final messages = <MailMessage>[];
+        for (final uid in await _selectUidPageInBackground(
+          uids,
+          limit: limit,
+        )) {
+          final fetched = await imap.uidFetchMessage(uid);
+          messages.add(
+            await _parseFetchedRfc822Message(
+              _Rfc822ParseRequest(
+                raw: fetched.raw,
+                id: _messageId(credential.accountId, mailbox, uid),
+                accountId: credential.accountId,
+                mailbox: mailbox,
+                folderPath: folder.path,
+                folderDisplayName: folder.displayName,
+                read: fetched.flags.contains(r'\Seen'),
+                starred: fetched.flags.contains(r'\Flagged'),
+                receivedAt: fetched.internalDate,
+              ),
             ),
-          ),
-        );
-      }
-      return messages;
-    } finally {
-      await imap.close();
-    }
+          );
+        }
+        return messages;
+      },
+    );
   }
 
   @override
@@ -307,79 +324,78 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     int limit = 30,
     int? beforeUid,
   }) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      final folder = _standardFolderForMailbox(
-        credential: credential,
-        mailbox: mailbox,
-        path: resolver.nameFor(mailbox),
-      );
-      await imap.selectMailbox(folder.path);
-      final uids = await imap.uidSearchAll();
-      final selectedUids = await _selectUidPageInBackground(
-        uids,
-        limit: limit,
-        beforeUid: beforeUid,
-      );
-      final messages = <MailMessage>[];
-      var complete = true;
-      Map<int, _FetchedImapMessage> fetchedByUid;
-      try {
-        fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
-      } catch (_) {
-        complete = false;
-        fetchedByUid = const <int, _FetchedImapMessage>{};
-      }
-      final requests = <_Rfc822ParseRequest>[];
-      for (final uid in selectedUids) {
-        final fetched = fetchedByUid[uid];
-        if (fetched == null) {
-          complete = false;
-          continue;
-        }
-        requests.add(
-          _Rfc822ParseRequest(
-            raw: fetched.raw,
-            id: _messageId(credential.accountId, mailbox, uid),
-            accountId: credential.accountId,
-            mailbox: mailbox,
-            folderPath: folder.path,
-            folderDisplayName: folder.displayName,
-            read: fetched.flags.contains(r'\Seen'),
-            starred: fetched.flags.contains(r'\Flagged'),
-            bodyLoaded: false,
-            receivedAt: fetched.internalDate,
-          ),
+    final resolver = await _pool.resolver(credential);
+    final folder = _standardFolderForMailbox(
+      credential: credential,
+      mailbox: mailbox,
+      path: resolver.nameFor(mailbox),
+    );
+    return _pool.run(
+      credential,
+      selectMailbox: folder.path,
+      action: (imap) async {
+        final uids = await imap.uidSearchAll();
+        final selectedUids = await _selectUidPageInBackground(
+          uids,
+          limit: limit,
+          beforeUid: beforeUid,
         );
-      }
-      for (final result in await _parseFetchedRfc822Previews(requests)) {
-        final parsed = result.message;
-        if (parsed == null) {
+        final messages = <MailMessage>[];
+        var complete = true;
+        Map<int, _FetchedImapMessage> fetchedByUid;
+        try {
+          fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
+        } catch (_) {
           complete = false;
-          continue;
+          fetchedByUid = const <int, _FetchedImapMessage>{};
         }
-        messages.add(
-          parsed.copyWith(
-            body: '',
-            htmlBody: '',
-            hasAttachments: false,
-            attachments: const [],
-            bodyLoaded: false,
-          ),
+        final requests = <_Rfc822ParseRequest>[];
+        for (final uid in selectedUids) {
+          final fetched = fetchedByUid[uid];
+          if (fetched == null) {
+            complete = false;
+            continue;
+          }
+          requests.add(
+            _Rfc822ParseRequest(
+              raw: fetched.raw,
+              id: _messageId(credential.accountId, mailbox, uid),
+              accountId: credential.accountId,
+              mailbox: mailbox,
+              folderPath: folder.path,
+              folderDisplayName: folder.displayName,
+              read: fetched.flags.contains(r'\Seen'),
+              starred: fetched.flags.contains(r'\Flagged'),
+              bodyLoaded: false,
+              receivedAt: fetched.internalDate,
+            ),
+          );
+        }
+        for (final result in await _parseFetchedRfc822Previews(requests)) {
+          final parsed = result.message;
+          if (parsed == null) {
+            complete = false;
+            continue;
+          }
+          messages.add(
+            parsed.copyWith(
+              body: '',
+              htmlBody: '',
+              hasAttachments: false,
+              attachments: const [],
+              bodyLoaded: false,
+            ),
+          );
+        }
+        return MailPreviewPage(
+          messages: messages,
+          selectedUids: selectedUids,
+          remoteUids: uids,
+          hasMore: _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid),
+          complete: complete,
         );
-      }
-      return MailPreviewPage(
-        messages: messages,
-        selectedUids: selectedUids,
-        remoteUids: uids,
-        hasMore: _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid),
-        complete: complete,
-      );
-    } finally {
-      await imap.close();
-    }
+      },
+    );
   }
 
   @override
@@ -418,88 +434,87 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required int limit,
     int? beforeUid,
     int? afterUid,
-  }) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      await imap.selectMailbox(folder.path);
-      final uids =
-          afterUid == null
-              ? await imap.uidSearchAll()
-              : await imap.uidSearchAfter(afterUid);
-      final selectedUids =
-          afterUid == null
-              ? await _selectUidPageInBackground(
-                uids,
-                limit: limit,
-                beforeUid: beforeUid,
-              )
-              : await _selectNewUidPageInBackground(
-                uids,
-                afterUid: afterUid,
-                limit: limit * _incrementalPreviewPageMultiplier,
-              );
-      final messages = <MailMessage>[];
-      var complete = true;
-      Map<int, _FetchedImapMessage> fetchedByUid;
-      try {
-        fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
-      } catch (_) {
-        complete = false;
-        fetchedByUid = const <int, _FetchedImapMessage>{};
-      }
-      final requests = <_Rfc822ParseRequest>[];
-      for (final uid in selectedUids) {
-        final fetched = fetchedByUid[uid];
-        if (fetched == null) {
-          complete = false;
-          continue;
-        }
-        requests.add(
-          _Rfc822ParseRequest(
-            raw: fetched.raw,
-            id: _messageIdForFolder(credential.accountId, folder, uid),
-            accountId: credential.accountId,
-            mailbox: folder.kind,
-            folderPath: folder.path,
-            folderDisplayName: folder.displayName,
-            read: fetched.flags.contains(r'\Seen'),
-            starred: fetched.flags.contains(r'\Flagged'),
-            bodyLoaded: false,
-            receivedAt: fetched.internalDate,
-          ),
-        );
-      }
-      for (final result in await _parseFetchedRfc822Previews(requests)) {
-        final parsed = result.message;
-        if (parsed == null) {
-          complete = false;
-          continue;
-        }
-        messages.add(
-          parsed.copyWith(
-            body: '',
-            htmlBody: '',
-            hasAttachments: false,
-            attachments: const [],
-            bodyLoaded: false,
-          ),
-        );
-      }
-      return MailPreviewPage(
-        messages: messages,
-        selectedUids: selectedUids,
-        remoteUids: afterUid == null ? uids : null,
-        hasMore:
+  }) {
+    return _pool.run(
+      credential,
+      selectMailbox: folder.path,
+      action: (imap) async {
+        final uids =
             afterUid == null
-                ? _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid)
-                : uids.where((uid) => uid > afterUid).length >
-                    selectedUids.length,
-        complete: complete,
-      );
-    } finally {
-      await imap.close();
-    }
+                ? await imap.uidSearchAll()
+                : await imap.uidSearchAfter(afterUid);
+        final selectedUids =
+            afterUid == null
+                ? await _selectUidPageInBackground(
+                  uids,
+                  limit: limit,
+                  beforeUid: beforeUid,
+                )
+                : await _selectNewUidPageInBackground(
+                  uids,
+                  afterUid: afterUid,
+                  limit: limit * _incrementalPreviewPageMultiplier,
+                );
+        final messages = <MailMessage>[];
+        var complete = true;
+        Map<int, _FetchedImapMessage> fetchedByUid;
+        try {
+          fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
+        } catch (_) {
+          complete = false;
+          fetchedByUid = const <int, _FetchedImapMessage>{};
+        }
+        final requests = <_Rfc822ParseRequest>[];
+        for (final uid in selectedUids) {
+          final fetched = fetchedByUid[uid];
+          if (fetched == null) {
+            complete = false;
+            continue;
+          }
+          requests.add(
+            _Rfc822ParseRequest(
+              raw: fetched.raw,
+              id: _messageIdForFolder(credential.accountId, folder, uid),
+              accountId: credential.accountId,
+              mailbox: folder.kind,
+              folderPath: folder.path,
+              folderDisplayName: folder.displayName,
+              read: fetched.flags.contains(r'\Seen'),
+              starred: fetched.flags.contains(r'\Flagged'),
+              bodyLoaded: false,
+              receivedAt: fetched.internalDate,
+            ),
+          );
+        }
+        for (final result in await _parseFetchedRfc822Previews(requests)) {
+          final parsed = result.message;
+          if (parsed == null) {
+            complete = false;
+            continue;
+          }
+          messages.add(
+            parsed.copyWith(
+              body: '',
+              htmlBody: '',
+              hasAttachments: false,
+              attachments: const [],
+              bodyLoaded: false,
+            ),
+          );
+        }
+        return MailPreviewPage(
+          messages: messages,
+          selectedUids: selectedUids,
+          remoteUids: afterUid == null ? uids : null,
+          hasMore:
+              afterUid == null
+                  ? _hasMoreUidPage(uids, limit: limit, beforeUid: beforeUid)
+                  : uids.where((uid) => uid > afterUid).length >
+                      selectedUids.length,
+          complete: complete,
+        );
+      },
+    );
   }
 
   @override
@@ -507,31 +522,30 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required MailboxCredential credential,
     required MailMessage message,
   }) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      final folderName = _folderNameForMessage(resolver, message);
-      await imap.selectMailbox(folderName);
-      final fetched = await imap.uidFetchMessage(_imapUid(message.id));
-      return _parseFetchedRfc822Message(
-        _Rfc822ParseRequest(
-          raw: fetched.raw,
-          id: message.id,
-          accountId: credential.accountId,
-          mailbox: message.mailbox,
-          folderPath: folderName,
-          folderDisplayName: message.folderDisplayName,
-          read: fetched.flags.contains(r'\Seen'),
-          starred: fetched.flags.contains(r'\Flagged'),
-          bodyLoaded: true,
-          receivedAt: fetched.internalDate,
-          fallbackReceivedAt: message.receivedAt,
-        ),
-      );
-    } finally {
-      await imap.close();
-    }
+    final resolver = await _pool.resolver(credential);
+    final folderName = _folderNameForMessage(resolver, message);
+    return _pool.run(
+      credential,
+      selectMailbox: folderName,
+      action: (imap) async {
+        final fetched = await imap.uidFetchMessage(_imapUid(message.id));
+        return _parseFetchedRfc822Message(
+          _Rfc822ParseRequest(
+            raw: fetched.raw,
+            id: message.id,
+            accountId: credential.accountId,
+            mailbox: message.mailbox,
+            folderPath: folderName,
+            folderDisplayName: message.folderDisplayName,
+            read: fetched.flags.contains(r'\Seen'),
+            starred: fetched.flags.contains(r'\Flagged'),
+            bodyLoaded: true,
+            receivedAt: fetched.internalDate,
+            fallbackReceivedAt: message.receivedAt,
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -568,7 +582,7 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required String messageId,
     required bool seen,
   }) {
-    return _withImap(credential, messageId, (imap) {
+    return _withImap(credential, messageId, (imap, _) {
       return imap.uidStoreFlag(_imapUid(messageId), r'\Seen', seen);
     });
   }
@@ -579,7 +593,7 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required String messageId,
     required bool flagged,
   }) {
-    return _withImap(credential, messageId, (imap) {
+    return _withImap(credential, messageId, (imap, _) {
       return imap.uidStoreFlag(_imapUid(messageId), r'\Flagged', flagged);
     });
   }
@@ -590,8 +604,7 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     required String messageId,
     required MailboxKind destination,
   }) {
-    return _withImap(credential, messageId, (imap) {
-      final resolver = _ImapMailboxResolver.current(imap);
+    return _withImap(credential, messageId, (imap, resolver) {
       return imap.uidMoveMessage(
         _imapUid(messageId),
         resolver.nameFor(destination),
@@ -610,58 +623,54 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
         'Attachment part id is unavailable for this message.',
       );
     }
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      await imap.selectMailbox(_folderNameFromMessageId(resolver, messageId));
-      final body = await imap.uidFetchBodyPartBytes(
-        _imapUid(messageId),
-        attachment.partId,
-      );
-      return DownloadedAttachment(
-        filename: attachment.filename,
-        contentType: attachment.contentType,
-        bytes: _decodeTransferBytes(body, attachment.transferEncoding),
-      );
-    } finally {
-      await imap.close();
-    }
+    final resolver = await _pool.resolver(credential);
+    final folderName = _folderNameFromMessageId(resolver, messageId);
+    return _pool.run(
+      credential,
+      selectMailbox: folderName,
+      action: (imap) async {
+        final body = await imap.uidFetchBodyPartBytes(
+          _imapUid(messageId),
+          attachment.partId,
+        );
+        return DownloadedAttachment(
+          filename: attachment.filename,
+          contentType: attachment.contentType,
+          bytes: _decodeTransferBytes(body, attachment.transferEncoding),
+        );
+      },
+    );
   }
 
   Future<T> _withImap<T>(
     MailboxCredential credential,
     String messageId,
-    Future<T> Function(_ImapConnection imap) action,
+    Future<T> Function(_ImapConnection imap, _ImapMailboxResolver resolver)
+    action,
   ) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      imap.mailboxResolver = resolver;
-      await imap.selectMailbox(_folderNameFromMessageId(resolver, messageId));
-      return await action(imap);
-    } finally {
-      await imap.close();
-    }
+    final resolver = await _pool.resolver(credential);
+    final folderName = _folderNameFromMessageId(resolver, messageId);
+    return _pool.run(
+      credential,
+      selectMailbox: folderName,
+      action: (imap) => action(imap, resolver),
+    );
   }
 
   Future<void> _appendToSent(
     MailboxCredential credential,
     String rawMessage,
   ) async {
-    final imap = await _ImapConnection.connect(credential);
-    try {
-      await imap.login();
-      final resolver = await _ImapMailboxResolver.discover(imap);
-      await imap.appendMessage(
-        resolver.nameFor(MailboxKind.sent),
-        rawMessage,
-        flags: const [r'\Seen'],
-      );
-    } finally {
-      await imap.close();
-    }
+    final resolver = await _pool.resolver(credential);
+    await _pool.run(
+      credential,
+      action:
+          (imap) => imap.appendMessage(
+            resolver.nameFor(MailboxKind.sent),
+            rawMessage,
+            flags: const [r'\Seen'],
+          ),
+    );
   }
 }
 
@@ -1251,13 +1260,299 @@ DateTime? _dateTimeFromOffsetParts({
   );
 }
 
+/// Keeps a handful of authenticated IMAP connections per account alive and
+/// hands them out one command at a time, so callers skip the TCP + TLS + LOGIN
+/// + LIST + SELECT dance that every request used to pay for.
+class _ImapConnectionPool {
+  _ImapConnectionPool();
+
+  static const _maxConnectionsPerEndpoint = 3;
+  static const _healthCheckIdleThreshold = Duration(seconds: 10);
+  static const _idleEvictionThreshold = Duration(minutes: 5);
+  static const _sweepInterval = Duration(minutes: 1);
+
+  final Map<String, _PooledEndpoint> _endpoints = <String, _PooledEndpoint>{};
+  Timer? _sweepTimer;
+
+  Future<T> run<T>(
+    MailboxCredential credential, {
+    String? selectMailbox,
+    required Future<T> Function(_ImapConnection imap) action,
+  }) {
+    _ensureSweepTimer();
+    return _endpointFor(
+      credential,
+    ).run(selectMailbox: selectMailbox, action: action);
+  }
+
+  Future<_ImapMailboxResolver> resolver(MailboxCredential credential) {
+    _ensureSweepTimer();
+    return _endpointFor(credential).resolver();
+  }
+
+  void updateResolver(
+    MailboxCredential credential,
+    _ImapMailboxResolver resolver,
+  ) {
+    _endpoints[_keyFor(credential)]?.cacheResolver(resolver);
+  }
+
+  Future<void> disposeAll() async {
+    _sweepTimer?.cancel();
+    _sweepTimer = null;
+    final endpoints = _endpoints.values.toList(growable: false);
+    _endpoints.clear();
+    for (final endpoint in endpoints) {
+      await endpoint.closeAll();
+    }
+  }
+
+  _PooledEndpoint _endpointFor(MailboxCredential credential) {
+    return _endpoints.putIfAbsent(
+      _keyFor(credential),
+      () => _PooledEndpoint(credential),
+    );
+  }
+
+  String _keyFor(MailboxCredential credential) {
+    return [
+      credential.accountId,
+      credential.imapHost,
+      credential.imapPort.toString(),
+      credential.username,
+      credential.authType.name,
+    ].join('\u0000');
+  }
+
+  void _ensureSweepTimer() {
+    _sweepTimer ??= Timer.periodic(_sweepInterval, (_) => _sweep());
+  }
+
+  void _sweep() {
+    final now = DateTime.now();
+    _endpoints.removeWhere((_, endpoint) {
+      endpoint.evictIdle(now, _idleEvictionThreshold);
+      return endpoint.isEmpty;
+    });
+    if (_endpoints.isEmpty) {
+      _sweepTimer?.cancel();
+      _sweepTimer = null;
+    }
+  }
+}
+
+class _PooledEndpoint {
+  _PooledEndpoint(this._credential);
+
+  final MailboxCredential _credential;
+  final List<_PooledConnection> _connections = <_PooledConnection>[];
+  final List<Completer<_PooledConnection>> _waiters =
+      <Completer<_PooledConnection>>[];
+
+  _ImapMailboxResolver? _resolver;
+  Future<_ImapMailboxResolver>? _pendingResolver;
+
+  bool get isEmpty => _connections.isEmpty;
+
+  void cacheResolver(_ImapMailboxResolver resolver) {
+    _resolver = resolver;
+  }
+
+  Future<_ImapMailboxResolver> resolver() {
+    final cached = _resolver;
+    if (cached != null) return Future.value(cached);
+    return _pendingResolver ??= _loadResolver().whenComplete(() {
+      _pendingResolver = null;
+    });
+  }
+
+  Future<_ImapMailboxResolver> _loadResolver() async {
+    final resolver = await run(
+      selectMailbox: null,
+      action:
+          (imap) async =>
+              _ImapMailboxResolver.fromList(await imap.listMailboxes()),
+    );
+    _resolver = resolver;
+    return resolver;
+  }
+
+  Future<T> run<T>({
+    required String? selectMailbox,
+    required Future<T> Function(_ImapConnection imap) action,
+  }) async {
+    final connection = await _acquire();
+    var attemptedFresh = false;
+    try {
+      while (true) {
+        try {
+          final reused = await connection.ensureConnected(_credential);
+          attemptedFresh = !reused;
+          if (selectMailbox != null) {
+            await connection.ensureSelected(selectMailbox);
+          }
+          connection.markUsed();
+          final result = await action(connection.imap!);
+          connection.markUsed();
+          return result;
+        } catch (error) {
+          if (_isConnectionFailure(error)) {
+            await connection.discard();
+            // A stale pooled connection can fail before the command reaches the
+            // server; retry once against a guaranteed-fresh connection.
+            if (!attemptedFresh) {
+              attemptedFresh = true;
+              continue;
+            }
+          }
+          rethrow;
+        }
+      }
+    } finally {
+      _release(connection);
+    }
+  }
+
+  Future<_PooledConnection> _acquire() {
+    for (final connection in _connections) {
+      if (!connection.busy) {
+        connection.busy = true;
+        return Future.value(connection);
+      }
+    }
+    if (_connections.length < _ImapConnectionPool._maxConnectionsPerEndpoint) {
+      final connection = _PooledConnection()..busy = true;
+      _connections.add(connection);
+      return Future.value(connection);
+    }
+    final completer = Completer<_PooledConnection>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  void _release(_PooledConnection connection) {
+    connection.busy = false;
+    while (_waiters.isNotEmpty) {
+      final next = _connections.firstWhere(
+        (candidate) => !candidate.busy,
+        orElse: () => connection,
+      );
+      if (next.busy) break;
+      next.busy = true;
+      _waiters.removeAt(0).complete(next);
+    }
+  }
+
+  void evictIdle(DateTime now, Duration threshold) {
+    _connections.removeWhere((connection) {
+      if (connection.busy) return false;
+      if (now.difference(connection.lastUsed) < threshold) return false;
+      unawaited(connection.discard());
+      return true;
+    });
+  }
+
+  Future<void> closeAll() async {
+    final connections = _connections.toList(growable: false);
+    _connections.clear();
+    for (final waiter in _waiters) {
+      if (!waiter.isCompleted) {
+        waiter.completeError(
+          const MailTransportException('IMAP connection pool closed'),
+        );
+      }
+    }
+    _waiters.clear();
+    _resolver = null;
+    _pendingResolver = null;
+    for (final connection in connections) {
+      await connection.discard();
+    }
+  }
+}
+
+class _PooledConnection {
+  _ImapConnection? imap;
+  bool busy = false;
+  DateTime lastUsed = DateTime.now();
+  String? _selectedMailbox;
+
+  /// Ensures the connection is open and logged in. Returns whether an existing
+  /// connection was reused (as opposed to a fresh one being established).
+  Future<bool> ensureConnected(MailboxCredential credential) async {
+    final existing = imap;
+    if (existing != null) {
+      if (DateTime.now().difference(lastUsed) >
+          _ImapConnectionPool._healthCheckIdleThreshold) {
+        try {
+          await existing.noop();
+        } catch (_) {
+          await discard();
+        }
+      }
+      if (imap != null) return true;
+    }
+    final connection = await _ImapConnection.connect(credential);
+    try {
+      await connection.login();
+    } catch (error) {
+      try {
+        await connection.close();
+      } catch (_) {
+        // The login failure is the interesting error.
+      }
+      rethrow;
+    }
+    imap = connection;
+    _selectedMailbox = null;
+    return false;
+  }
+
+  Future<void> ensureSelected(String mailbox) async {
+    if (_selectedMailbox == mailbox) return;
+    _selectedMailbox = null;
+    await imap!.selectMailbox(mailbox);
+    _selectedMailbox = mailbox;
+  }
+
+  void markUsed() {
+    lastUsed = DateTime.now();
+  }
+
+  Future<void> discard() async {
+    final connection = imap;
+    imap = null;
+    _selectedMailbox = null;
+    if (connection != null) {
+      try {
+        await connection.close();
+      } catch (_) {
+        // Already broken; nothing to clean up.
+      }
+    }
+  }
+}
+
+bool _isConnectionFailure(Object error) {
+  if (error is SocketException || error is TimeoutException) return true;
+  if (error is MailTransportException) {
+    final message = error.message.toLowerCase();
+    return message.contains('socket closed') ||
+        message.contains('connection') ||
+        message.contains('greeting') ||
+        message.contains('timed out') ||
+        message.contains('timeout') ||
+        message.contains('pool closed');
+  }
+  return false;
+}
+
 class _ImapConnection {
   _ImapConnection(this._socket, this._credential, this._reader);
 
   final Socket _socket;
   final MailboxCredential _credential;
   final _SocketLineReader _reader;
-  _ImapMailboxResolver? mailboxResolver;
   int _tag = 0;
 
   static Future<_ImapConnection> connect(MailboxCredential credential) async {
@@ -1560,6 +1855,9 @@ class _ImapConnection {
     }
   }
 
+  /// Lightweight round trip used to check a pooled connection is still alive.
+  Future<void> noop() => _command('NOOP');
+
   Future<void> close() async {
     try {
       await _command('LOGOUT');
@@ -1608,17 +1906,6 @@ class _ImapMailboxResolver {
 
   final Map<MailboxKind, String> _names;
 
-  static Future<_ImapMailboxResolver> discover(_ImapConnection imap) async {
-    if (imap.mailboxResolver != null) return imap.mailboxResolver!;
-    final resolver = _ImapMailboxResolver.fromList(await imap.listMailboxes());
-    imap.mailboxResolver = resolver;
-    return resolver;
-  }
-
-  static _ImapMailboxResolver current(_ImapConnection imap) {
-    return imap.mailboxResolver ?? _ImapMailboxResolver.fallback();
-  }
-
   factory _ImapMailboxResolver.fromList(List<_ImapMailboxInfo> mailboxes) {
     final names = <MailboxKind, String>{MailboxKind.inbox: 'INBOX'};
     for (final mailbox in mailboxes) {
@@ -1633,12 +1920,6 @@ class _ImapMailboxResolver {
       names.putIfAbsent(kind, () => _fallbackName(kind));
     }
     return _ImapMailboxResolver(names);
-  }
-
-  factory _ImapMailboxResolver.fallback() {
-    return _ImapMailboxResolver({
-      for (final kind in standardMailboxKinds) kind: _fallbackName(kind),
-    });
   }
 
   String nameFor(MailboxKind kind) => _names[kind] ?? _fallbackName(kind);

@@ -324,6 +324,7 @@ class _MailHomePageState extends State<MailHomePage>
     WidgetsBinding.instance.removeObserver(this);
     _automaticMailRefreshTimer?.cancel();
     unawaited(_flushPendingMailActions());
+    unawaited(SocketMailTransport.disposeConnections());
     unawaited(_trayService.dispose());
     _mobileMessageNotifiers.clear();
     _messageBodyLoads.clear();
@@ -342,6 +343,9 @@ class _MailHomePageState extends State<MailHomePage>
         _automaticMailRefreshTimer?.cancel();
         _automaticMailRefreshTimer = null;
         unawaited(_flushPendingMailActions());
+        // Mobile platforms drop idle sockets in the background anyway; release
+        // pooled IMAP connections so we reconnect cleanly on resume.
+        unawaited(SocketMailTransport.disposeConnections());
         break;
       case AppLifecycleState.resumed:
         _appIsInForeground = true;

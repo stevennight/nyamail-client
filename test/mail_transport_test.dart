@@ -7,6 +7,10 @@ import 'package:nyamail/src/mail/mail_models.dart';
 import 'package:nyamail/src/mail/mail_transport.dart';
 
 void main() {
+  tearDown(() async {
+    await SocketMailTransport.disposeConnections();
+  });
+
   test('parseRfc822Message extracts core fields', () {
     final message = parseRfc822Message(
       [
@@ -530,6 +534,72 @@ void main() {
     }
   });
 
+  test('SocketMailTransport reuses one pooled IMAP connection', () async {
+    final server = await _FakeImapServer.start(searchUids: [501]);
+    final credential = MailboxCredential(
+      accountId: 'pool-acc',
+      address: 'me@example.com',
+      displayName: 'Me',
+      imapHost: InternetAddress.loopbackIPv4.address,
+      imapPort: server.port,
+      smtpHost: 'smtp.example.com',
+      smtpPort: 465,
+      username: 'me@example.com',
+      secret: 'secret',
+      useTls: false,
+    );
+    try {
+      const transport = SocketMailTransport();
+      await transport.listFolders(credential: credential);
+      await transport.fetchMessagePreviews(
+        credential: credential,
+        mailbox: MailboxKind.inbox,
+        limit: 5,
+      );
+      await transport.setSeen(
+        credential: credential,
+        messageId: 'pool-acc:inbox:501',
+        seen: true,
+      );
+
+      expect(server.connectionCount, 1);
+      expect(server.loginCount, 1);
+      // INBOX is selected once and reused for the preview fetch and the flag.
+      expect(server.selectCount, 1);
+    } finally {
+      await SocketMailTransport.disposeConnections();
+      await server.close();
+    }
+  });
+
+  test('SocketMailTransport reconnects after the pool is disposed', () async {
+    final server = await _FakeImapServer.start();
+    final credential = MailboxCredential(
+      accountId: 'pool-acc-2',
+      address: 'me@example.com',
+      displayName: 'Me',
+      imapHost: InternetAddress.loopbackIPv4.address,
+      imapPort: server.port,
+      smtpHost: 'smtp.example.com',
+      smtpPort: 465,
+      username: 'me@example.com',
+      secret: 'secret',
+      useTls: false,
+    );
+    try {
+      const transport = SocketMailTransport();
+      await transport.listFolders(credential: credential);
+      await SocketMailTransport.disposeConnections();
+      await transport.listFolders(credential: credential);
+
+      expect(server.connectionCount, 2);
+      expect(server.loginCount, 2);
+    } finally {
+      await SocketMailTransport.disposeConnections();
+      await server.close();
+    }
+  });
+
   test(
     'SocketMailTransport uses IMAP INTERNALDATE for received time',
     () async {
@@ -993,8 +1063,24 @@ class _FakeImapServer {
   final int? moveDestinationUid;
   final _commands = <String>[];
   final fetchedUids = <int>[];
+  int connectionCount = 0;
 
   int get port => _server.port;
+
+  int get loginCount {
+    return _commands
+        .where(
+          (command) =>
+              command.contains(' LOGIN ') ||
+              command.contains(' AUTHENTICATE XOAUTH2 '),
+        )
+        .length;
+  }
+
+  int get selectCount {
+    return _commands.where((command) => command.contains(' SELECT ')).length;
+  }
+
   String? get selectedMailbox {
     for (final command in _commands) {
       final match = RegExp(r'^A\d+ SELECT "(.+)"$').firstMatch(command);
@@ -1090,6 +1176,7 @@ class _FakeImapServer {
 
   Future<void> _serve() async {
     await for (final socket in _server) {
+      connectionCount++;
       unawaited(_handle(socket));
     }
   }
@@ -1154,6 +1241,10 @@ class _FakeImapServer {
         final matching = searchUids.where((uid) => uid >= firstUid);
         socket.write('* SEARCH ${matching.join(' ')}\r\n');
         socket.write('$tag OK SEARCH completed\r\n');
+      } else if (command.contains(' UID STORE ')) {
+        socket.write('$tag OK STORE completed\r\n');
+      } else if (command.contains(' NOOP')) {
+        socket.write('$tag OK NOOP completed\r\n');
       } else if (command.contains(' UID MOVE ')) {
         final sourceUid =
             RegExp(r' UID MOVE (\d+) ').firstMatch(command)?.group(1) ?? '1';
