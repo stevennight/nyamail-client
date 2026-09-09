@@ -71,6 +71,42 @@ const _automaticMailRefreshInterval = Duration(minutes: 1);
 /// the accent colour.
 const _starColor = Color(0xFFF5A623);
 
+/// Below this width the folder list collapses into a drawer; at or above it the
+/// sidebar is always visible, the way desktop mail clients keep it. Kept low
+/// enough that a typical 1280–1440 laptop window shows the sidebar.
+const _kSidebarBreakpoint = 1100.0;
+
+/// Below this width the two-pane (list + reading) layout collapses to a single
+/// pane that pushes the message onto its own route.
+const _kSinglePaneBreakpoint = 820.0;
+
+/// A stable, muted accent colour for an account, used as the thin bar down the
+/// left edge of its messages so multi-account inboxes stay legible without a
+/// bulky per-row chip.
+Color _accountAccentColor(String accountId, ColorScheme scheme) {
+  if (accountId.isEmpty) return scheme.outlineVariant;
+  var hash = 0x811c9dc5;
+  for (final unit in accountId.codeUnits) {
+    hash = (hash ^ unit) * 0x01000193 & 0xffffffff;
+  }
+  final hue = (hash % 360).toDouble();
+  final lightness = scheme.brightness == Brightness.dark ? 0.62 : 0.45;
+  return HSLColor.fromAHSL(1, hue, 0.45, lightness).toColor();
+}
+
+/// Best-effort display name for a sender header: the quoted/display part when
+/// present, otherwise the bare address.
+String _displaySender(String from) {
+  final value = from.trim();
+  if (value.isEmpty) return 'Unknown sender';
+  final angle = value.indexOf('<');
+  if (angle > 0) {
+    final name = value.substring(0, angle).trim().replaceAll('"', '').trim();
+    if (name.isNotEmpty) return name;
+  }
+  return value.replaceAll('<', '').replaceAll('>', '').trim();
+}
+
 const _mailHomeShortcuts = <ShortcutActivator, Intent>{
   SingleActivator(LogicalKeyboardKey.keyN, control: true): _ComposeMailIntent(),
   SingleActivator(LogicalKeyboardKey.keyN, meta: true): _ComposeMailIntent(),
@@ -1899,7 +1935,7 @@ class _MailHomePageState extends State<MailHomePage>
       );
     }
     final shellWidth = MediaQuery.sizeOf(context).width;
-    final useFolderDrawer = shellWidth < 1500;
+    final useFolderDrawer = shellWidth < _kSidebarBreakpoint;
     final scaffold = Scaffold(
       drawer:
           useFolderDrawer
@@ -1959,7 +1995,7 @@ class _MailHomePageState extends State<MailHomePage>
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  if (constraints.maxWidth < 860) {
+                  if (constraints.maxWidth < _kSinglePaneBreakpoint) {
                     return _MobileInbox(
                       messages: _messages,
                       selected: _selected,
@@ -1990,7 +2026,8 @@ class _MailHomePageState extends State<MailHomePage>
                       supportsDesktopContextMenu: _supportsDesktopContextMenu,
                     );
                   }
-                  final collapseSidebar = constraints.maxWidth < 1500;
+                  final collapseSidebar =
+                      constraints.maxWidth < _kSidebarBreakpoint;
                   return Row(
                     children: [
                       if (!collapseSidebar) ...[
@@ -7872,127 +7909,165 @@ class _MessageListTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final colorScheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final textTheme = theme.textTheme;
+    final colorScheme = theme.colorScheme;
     final secondary = colorScheme.onSurfaceVariant;
-    final receivedLabel = mailMessageCompactDisplayDate(message.receivedAt);
+    final unread = !message.read;
+    final accent = _accountAccentColor(message.accountId, colorScheme);
+    final dateLabel = mailMessageCompactDisplayDate(message.receivedAt);
     final subjectLabel = mailMessageSubjectLabel(message.subject);
     final preview = message.preview.trim();
-    final summaryLabel =
-        preview.isEmpty ? subjectLabel : '$subjectLabel - $preview';
-    return ListTile(
-      isThreeLine: true,
-      selected: selected,
-      leading:
-          selecting
-              ? Checkbox(
-                value: selectedForBatch,
-                onChanged:
-                    multiSelectEnabled
-                        ? (value) => onSelectionChanged(value ?? false)
-                        : null,
-              )
-              : null,
-      title: Row(
-        children: [
-          if (pinned) ...[
-            Icon(Icons.push_pin_outlined, size: 16, color: colorScheme.primary),
-            const SizedBox(width: 6),
-          ],
-          Expanded(
-            child: Text(
-              message.from,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontWeight: message.read ? FontWeight.w500 : FontWeight.w700,
-              ),
-            ),
-          ),
-          if (message.starred) ...[
-            const SizedBox(width: 6),
-            const Icon(Icons.star, size: 16, color: _starColor),
-          ],
-          if (message.hasAttachments) ...[
-            const SizedBox(width: 6),
-            Icon(Icons.attach_file, size: 16, color: secondary),
-          ],
-          const SizedBox(width: 8),
-          Text(
-            receivedLabel,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: textTheme.labelSmall?.copyWith(color: secondary),
-          ),
-        ],
-      ),
-      subtitle: Padding(
-        padding: const EdgeInsets.only(top: 2),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              summaryLabel,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontWeight: message.read ? FontWeight.w500 : FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                Icon(
-                  message.read
-                      ? Icons.mark_email_read_outlined
-                      : Icons.mark_email_unread_outlined,
-                  size: 14,
-                  color: secondary,
-                ),
-                const Spacer(),
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: Container(
-                      constraints: const BoxConstraints(maxWidth: 150),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 2,
-                      ),
-                      decoration: ShapeDecoration(
-                        color: colorScheme.secondaryContainer,
-                        shape: StadiumBorder(
-                          side: BorderSide(color: colorScheme.outlineVariant),
+    final showAccountLabel =
+        accountLabel.trim().isNotEmpty &&
+        accountLabel.trim() != message.accountId;
+
+    return Material(
+      color:
+          selected
+              ? colorScheme.primaryContainer.withValues(alpha: 0.4)
+              : colorScheme.surface,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        child: IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Container(width: 3, color: accent),
+              Padding(
+                padding: const EdgeInsets.only(left: 10, top: 12),
+                child:
+                    selecting
+                        ? SizedBox(
+                          width: 24,
+                          child: Checkbox(
+                            value: selectedForBatch,
+                            visualDensity: VisualDensity.compact,
+                            onChanged:
+                                multiSelectEnabled
+                                    ? (value) =>
+                                        onSelectionChanged(value ?? false)
+                                    : null,
+                          ),
+                        )
+                        : Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color:
+                                unread
+                                    ? colorScheme.primary
+                                    : Colors.transparent,
+                          ),
                         ),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              _displaySender(message.from),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: textTheme.bodyMedium?.copyWith(
+                                fontWeight:
+                                    unread ? FontWeight.w700 : FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            dateLabel,
+                            style: textTheme.labelSmall?.copyWith(
+                              color: secondary,
+                              fontWeight:
+                                  unread ? FontWeight.w600 : FontWeight.w400,
+                            ),
+                          ),
+                        ],
                       ),
-                      child: Text(
-                        accountLabel,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.right,
-                        style: textTheme.labelSmall?.copyWith(
-                          color: colorScheme.onSecondaryContainer,
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          if (pinned) ...[
+                            Icon(Icons.push_pin, size: 14, color: secondary),
+                            const SizedBox(width: 4),
+                          ],
+                          Expanded(
+                            child: Text(
+                              subjectLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: textTheme.bodyMedium?.copyWith(
+                                fontWeight:
+                                    unread ? FontWeight.w600 : FontWeight.w400,
+                                color:
+                                    unread
+                                        ? colorScheme.onSurface
+                                        : colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                          if (message.hasAttachments) ...[
+                            const SizedBox(width: 6),
+                            Icon(Icons.attach_file, size: 14, color: secondary),
+                          ],
+                          if (message.starred) ...[
+                            const SizedBox(width: 4),
+                            const Icon(Icons.star, size: 14, color: _starColor),
+                          ],
+                        ],
+                      ),
+                      if (preview.isNotEmpty || showAccountLabel) ...[
+                        const SizedBox(height: 2),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                preview.isEmpty ? ' ' : preview,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.bodySmall?.copyWith(
+                                  color: secondary,
+                                ),
+                              ),
+                            ),
+                            if (showAccountLabel) ...[
+                              const SizedBox(width: 8),
+                              Text(
+                                accountLabel.trim(),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.labelSmall?.copyWith(
+                                  color: secondary,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
-                      ),
-                    ),
+                      ],
+                    ],
                   ),
                 ),
-              ],
-            ),
-          ],
+              ),
+              if (!selecting)
+                _MessageOverflowMenu(
+                  message: message,
+                  pinned: pinned,
+                  onAction: onAction,
+                ),
+            ],
+          ),
         ),
       ),
-      trailing:
-          selecting
-              ? null
-              : _MessageOverflowMenu(
-                message: message,
-                pinned: pinned,
-                onAction: onAction,
-              ),
-      onTap: onTap,
-      onLongPress: onLongPress,
     );
   }
 }
