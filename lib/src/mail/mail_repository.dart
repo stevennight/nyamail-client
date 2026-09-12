@@ -1539,7 +1539,7 @@ class CachedTransportMailRepository
   String? _messageIdentityKey(MailMessage message) {
     final header = message.messageIdHeader.trim();
     if (header.isEmpty) return null;
-    return '${message.accountId} ${header.toLowerCase()}';
+    return '${message.accountId} ${header.toLowerCase()}';
   }
 
   MailMessage _preferredCachedMessage(MailMessage a, MailMessage b) {
