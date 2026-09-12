@@ -120,6 +120,29 @@ void main() {
     expect(loaded.single.attachments.single.filename, '报告.pdf');
   });
 
+  test('mail cache persists the Message-ID header in the index', () async {
+    final cache = MailCache(supportDirectoryProvider: () async => tempDir);
+    await cache.saveMessages([
+      MailMessage(
+        id: 'work:inbox:mid',
+        accountId: 'work',
+        from: 'Alice <alice@example.com>',
+        subject: 'Digest',
+        preview: 'Preview',
+        body: 'Body',
+        receivedAt: DateTime.utc(2026, 7, 2),
+        messageIdHeader: 'digest-42@example.com',
+      ),
+    ]);
+
+    final file = File('${tempDir.path}/mail-cache/messages.json');
+    final raw = jsonDecode(await file.readAsString(encoding: utf8)) as List;
+    expect(raw.single['message_id_header'], 'digest-42@example.com');
+
+    final loaded = await cache.loadMessages();
+    expect(loaded.single.messageIdHeader, 'digest-42@example.com');
+  });
+
   test('mail cache skips disk rewrites for unchanged messages', () async {
     final cache = MailCache(
       localCacheSecret: _testSecret(),

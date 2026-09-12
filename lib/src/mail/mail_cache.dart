@@ -371,7 +371,7 @@ class MailCache implements MailMessageCache {
   }
 
   void _forgetMessagesForFile(File file) {
-    final prefix = '${file.path} ';
+    final prefix = '${file.path}\u0000';
     _memoryCaches.removeWhere((key, _) => key.startsWith(prefix));
   }
 
@@ -380,7 +380,7 @@ class MailCache implements MailMessageCache {
     final prefix =
         normalizedDir.endsWith('/') ? normalizedDir : '$normalizedDir/';
     _memoryCaches.removeWhere((key, _) {
-      final path = key.split(' ').first;
+      final path = key.split('\u0000').first;
       final normalizedPath = path.replaceAll('\\', '/');
       return normalizedPath == normalizedDir ||
           normalizedPath.startsWith(prefix);
@@ -391,7 +391,7 @@ class MailCache implements MailMessageCache {
     final secret = _normalizedLocalCacheSecret;
     final keyMaterial = secret ?? 'plaintext';
     final fingerprint = sha256.convert(utf8.encode(keyMaterial)).toString();
-    return '${file.path} $fingerprint';
+    return '${file.path}\u0000$fingerprint';
   }
 
   Future<void> _writeCache({
@@ -661,6 +661,7 @@ Map<String, Object?> _indexToJson(MailMessage message) => {
   'starred': message.starred,
   'has_attachments': message.hasAttachments,
   'body_loaded': message.bodyLoaded,
+  'message_id_header': message.messageIdHeader,
   'attachments': [
     for (final attachment in message.attachments)
       {
@@ -694,6 +695,7 @@ MailMessage _messageFromJson(Map<String, Object?> json) => MailMessage(
   starred: json['starred'] as bool? ?? false,
   hasAttachments: json['has_attachments'] as bool? ?? false,
   bodyLoaded: json['body_loaded'] as bool? ?? true,
+  messageIdHeader: json['message_id_header'] as String? ?? '',
   attachments:
       ((json['attachments'] as List?) ?? const []).map((item) {
         final data = (item as Map).cast<String, Object?>();
@@ -744,6 +746,7 @@ bool _sameIndexMessage(MailMessage first, MailMessage second) {
       first.starred == second.starred &&
       first.hasAttachments == second.hasAttachments &&
       first.bodyLoaded == second.bodyLoaded &&
+      first.messageIdHeader == second.messageIdHeader &&
       _sameAttachments(first.attachments, second.attachments);
 }
 
@@ -783,7 +786,8 @@ int _estimatedIndexPayloadSize(Iterable<MailMessage> messages) {
         message.subject.length +
         message.preview.length +
         message.folderPath.length +
-        message.folderDisplayName.length;
+        message.folderDisplayName.length +
+        message.messageIdHeader.length;
     for (final recipient in [
       ...message.to,
       ...message.cc,

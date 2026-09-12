@@ -675,6 +675,66 @@ void main() {
     },
   );
 
+  test(
+    'all incoming view dedupes a message filed in both a label folder and Inbox',
+    () async {
+      final cache = _MemoryMailCache();
+      await cache.saveMessages([
+        MailMessage(
+          id: 'work:inbox:20',
+          accountId: 'work',
+          from: 'Newsletter <news@example.com>',
+          subject: 'Weekly digest',
+          preview: 'Digest',
+          body: 'Digest',
+          receivedAt: DateTime.utc(2026, 7, 5),
+          mailbox: MailboxKind.inbox,
+          messageIdHeader: 'digest-42@example.com',
+        ),
+        MailMessage(
+          id: 'work:folder:Newsletters:7',
+          accountId: 'work',
+          from: 'Newsletter <news@example.com>',
+          subject: 'Weekly digest',
+          preview: 'Digest',
+          body: 'Digest',
+          receivedAt: DateTime.utc(2026, 7, 5),
+          mailbox: MailboxKind.custom,
+          folderPath: 'Newsletters',
+          folderDisplayName: 'Newsletters',
+          messageIdHeader: 'digest-42@example.com',
+        ),
+      ]);
+      final repository = CachedTransportMailRepository(
+        cache: cache,
+        transport: _RecordingTransport(),
+        credentials: const [
+          MailboxCredential(
+            accountId: 'work',
+            address: 'me@example.com',
+            displayName: 'Me',
+            imapHost: 'imap.example.com',
+            imapPort: 993,
+            smtpHost: 'smtp.example.com',
+            smtpPort: 465,
+            username: 'me@example.com',
+            secret: 'secret',
+          ),
+        ],
+      );
+
+      final incoming = await repository.cachedViewPage(
+        view: const MailboxView.smart(MailSmartFolder.allIncoming),
+        limit: 10,
+      );
+
+      // Same Message-ID filed into two folders (a Gmail-style label plus
+      // INBOX) must show once, and the Inbox copy should win.
+      expect(incoming.messages, hasLength(1));
+      expect(incoming.messages.single.id, 'work:inbox:20');
+    },
+  );
+
   test('smart view reuses a recent folder listing', () async {
     const inbox = MailFolder(
       accountId: 'work',

@@ -1480,6 +1480,9 @@ class CachedTransportMailRepository
     Iterable<MailMessage> messages, {
     int? maxResults,
   }) {
+    // Pass 1: collapse cache entries that refer to the exact same remote
+    // (account, folder, UID) slot — an artifact of id-format changes or a
+    // message being reconciled mid-flight.
     final byRemoteLocation = <String, MailMessage>{};
     for (final message in messages) {
       final key = _remoteLocationKey(message);
@@ -1493,7 +1496,31 @@ class CachedTransportMailRepository
         byRemoteLocation[key] = _preferredCachedMessage(existing, message);
       }
     }
-    return byRemoteLocation.values.toList(growable: false);
+    // Pass 2: collapse the *same physical email* filed into more than one
+    // folder (a Gmail label alongside INBOX, a sieve rule that copies into a
+    // custom folder) — each copy has a different UID and thus a different
+    // remote-location key, but shares the same Message-ID header. Without
+    // this, "All incoming"/"Unread" would show such mail twice.
+    final byIdentity = <String, MailMessage>{};
+    final deduped = <MailMessage>[];
+    for (final message in byRemoteLocation.values) {
+      final identityKey = _messageIdentityKey(message);
+      if (identityKey == null) {
+        deduped.add(message);
+        continue;
+      }
+      final existing = byIdentity[identityKey];
+      if (existing == null) {
+        byIdentity[identityKey] = message;
+        deduped.add(message);
+        continue;
+      }
+      final preferred = _preferredCachedMessage(existing, message);
+      final existingIndex = deduped.indexOf(existing);
+      if (existingIndex >= 0) deduped[existingIndex] = preferred;
+      byIdentity[identityKey] = preferred;
+    }
+    return deduped;
   }
 
   String _remoteLocationKey(MailMessage message) {
@@ -1506,12 +1533,22 @@ class CachedTransportMailRepository
     return '${message.accountId}:mailbox:${message.effectiveMailbox.name}:$uid';
   }
 
+  /// A cross-folder identity for the message, or `null` when the provider
+  /// didn't send a usable `Message-ID` header (in which case the message can
+  /// only be deduplicated by its remote location).
+  String? _messageIdentityKey(MailMessage message) {
+    final header = message.messageIdHeader.trim();
+    if (header.isEmpty) return null;
+    return '${message.accountId} ${header.toLowerCase()}';
+  }
+
   MailMessage _preferredCachedMessage(MailMessage a, MailMessage b) {
     return _cachedMessageScore(b) > _cachedMessageScore(a) ? b : a;
   }
 
   int _cachedMessageScore(MailMessage message) {
     var score = 0;
+    if (message.effectiveMailbox == MailboxKind.inbox) score += 8;
     if (message.mailbox == message.effectiveMailbox) score += 4;
     if (message.bodyLoaded) score += 2;
     if (message.hasAttachments) score += 1;

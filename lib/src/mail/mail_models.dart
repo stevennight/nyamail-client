@@ -128,6 +128,7 @@ class MailMessage {
     this.hasAttachments = false,
     this.attachments = const [],
     this.bodyLoaded = true,
+    this.messageIdHeader = '',
   });
 
   final String id;
@@ -150,6 +151,14 @@ class MailMessage {
   final List<MailAttachment> attachments;
   final bool bodyLoaded;
 
+  /// The RFC 5322 `Message-ID` header (angle brackets stripped), when the
+  /// provider sent one. The same physical email can be filed into more than
+  /// one IMAP folder (Gmail labels, sieve rules that copy into a custom
+  /// folder in addition to INBOX); this is the only value that identifies
+  /// those copies as "the same message" across folders, since each copy gets
+  /// its own per-folder UID. Empty when the header was missing or malformed.
+  final String messageIdHeader;
+
   MailMessage copyWith({
     String? id,
     String? accountId,
@@ -170,6 +179,7 @@ class MailMessage {
     bool? hasAttachments,
     List<MailAttachment>? attachments,
     bool? bodyLoaded,
+    String? messageIdHeader,
   }) {
     return MailMessage(
       id: id ?? this.id,
@@ -191,6 +201,7 @@ class MailMessage {
       hasAttachments: hasAttachments ?? this.hasAttachments,
       attachments: attachments ?? this.attachments,
       bodyLoaded: bodyLoaded ?? this.bodyLoaded,
+      messageIdHeader: messageIdHeader ?? this.messageIdHeader,
     );
   }
 

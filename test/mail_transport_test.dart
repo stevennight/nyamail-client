@@ -20,6 +20,7 @@ void main() {
         'Reply-To: Replies <replies@example.com>',
         'Subject: Hello NyaMail',
         'Date: 2026-07-01T08:00:00Z',
+        'Message-ID: <digest-42@example.com>',
         '',
         'This is the first line.',
         'This is the second line.',
@@ -44,6 +45,17 @@ void main() {
     expect(message.read, isTrue);
     expect(message.starred, isTrue);
     expect(message.hasAttachments, isFalse);
+    expect(message.messageIdHeader, 'digest-42@example.com');
+  });
+
+  test('parseRfc822Message tolerates a missing Message-ID header', () {
+    final message = parseRfc822Message(
+      ['From: Alice <alice@example.com>', '', 'Body.'].join('\r\n'),
+      id: 'acc:2',
+      accountId: 'acc',
+    );
+
+    expect(message.messageIdHeader, isEmpty);
   });
 
   test('parseRfc822Message decodes RFC 2047 encoded headers', () {

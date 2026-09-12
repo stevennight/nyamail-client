@@ -803,6 +803,7 @@ MailMessage parseRfc822Message(
     cc: _parseAddressHeader(headers['cc'] ?? ''),
     replyTo: _parseAddressHeader(headers['reply-to'] ?? ''),
     subject: _decodeHeader(headers['subject'] ?? '(no subject)'),
+    messageIdHeader: _normalizedMessageIdHeader(headers['message-id']),
     preview:
         preview.length <= 180 ? preview : '${preview.substring(0, 180)}...',
     body: body,
@@ -817,6 +818,18 @@ MailMessage parseRfc822Message(
     attachments: parsed.attachments,
     bodyLoaded: bodyLoaded,
   );
+}
+
+/// Interior of a `Message-ID:` header with the enclosing `<...>` stripped, or
+/// '' when the header is missing or empty.
+String _normalizedMessageIdHeader(String? raw) {
+  final value = (raw ?? '').trim();
+  if (value.isEmpty) return '';
+  final stripped =
+      value.startsWith('<') && value.endsWith('>')
+          ? value.substring(1, value.length - 1).trim()
+          : value;
+  return stripped;
 }
 
 _ParsedMimeEntity _parseMimeEntity(String raw, {String partId = ''}) {
