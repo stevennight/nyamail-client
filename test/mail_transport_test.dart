@@ -610,6 +610,97 @@ void main() {
     }
   });
 
+  MailMessage openedMessage(int uid) {
+    return MailMessage(
+      id: 'acc:inbox:$uid',
+      accountId: 'acc',
+      from: 'Alice <alice@example.com>',
+      to: const [],
+      subject: 'Report',
+      preview: '',
+      body: '',
+      receivedAt: DateTime.utc(2026, 7, 1),
+      mailbox: MailboxKind.inbox,
+      folderPath: 'INBOX',
+      read: true,
+      bodyLoaded: false,
+    );
+  }
+
+  test('opening a small message needs a single fetch', () async {
+    final server = await _FakeImapServer.start();
+    server.structureByUid[501] = _FakeStructure(
+      raw: [
+        'From: Alice <alice@example.com>',
+        'Subject: Hello',
+        'Content-Type: text/plain; charset=utf-8',
+        '',
+        'Short body',
+      ].join('\r\n'),
+      bodyStructure:
+          '("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 10 1 NIL NIL NIL)',
+    );
+    try {
+      final message = await const SocketMailTransport().fetchMessageBody(
+        credential: localCredential(server.port),
+        message: openedMessage(501),
+      );
+
+      expect(message.body, 'Short body');
+      expect(message.subject, 'Hello');
+      expect(server.wholeMessageFetchCount, 0);
+      expect(server.sectionFetches, isEmpty);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('opening a large message fetches text parts only', () async {
+    final server = await _FakeImapServer.start();
+    final padding = 'A' * (400 * 1024);
+    server.structureByUid[502] = _FakeStructure(
+      raw: 'Subject: Report\r\n\r\n$padding',
+      bodyStructure:
+          '((("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "QUOTED-PRINTABLE" '
+          '20 1 NIL NIL NIL)("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" '
+          '30 1 NIL NIL NIL) "ALTERNATIVE" ("BOUNDARY" "alt") NIL NIL)'
+          '("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 409600 '
+          'NIL ("ATTACHMENT" ("FILENAME" "report.pdf")) NIL) '
+          '"MIXED" ("BOUNDARY" "mix") NIL NIL)',
+      sections: {
+        'HEADER':
+            'From: Alice <alice@example.com>\r\n'
+            'Subject: =?UTF-8?B?5oql5ZGK?=\r\n\r\n',
+        '1.1.MIME':
+            'Content-Type: text/plain; charset=utf-8\r\n'
+            'Content-Transfer-Encoding: quoted-printable\r\n\r\n',
+        '1.1': 'See the attached r=\r\neport.',
+        '1.2.MIME': 'Content-Type: text/html; charset=utf-8\r\n\r\n',
+        '1.2': '<p>See the attached report.</p>',
+      },
+    );
+    try {
+      final message = await const SocketMailTransport().fetchMessageBody(
+        credential: localCredential(server.port),
+        message: openedMessage(502),
+      );
+
+      expect(server.sectionFetches, [
+        ['HEADER', '1.1.MIME', '1.1', '1.2.MIME', '1.2'],
+      ]);
+      expect(server.wholeMessageFetchCount, 0);
+      expect(message.subject, '报告');
+      expect(message.body, 'See the attached report.');
+      expect(message.htmlBody, '<p>See the attached report.</p>');
+      expect(message.bodyLoaded, isTrue);
+      expect(message.attachments.single.partId, '2');
+      expect(message.attachments.single.filename, 'report.pdf');
+      expect(message.attachments.single.transferEncoding, 'base64');
+    } finally {
+      await server.close();
+    }
+  });
+
   test('ImapIdleWatcher reports pushed mailbox changes', () async {
     final server = await _FakeImapServer.start();
     final changes = StreamController<void>();
@@ -1236,7 +1327,24 @@ class _FakeImapServer {
   final fetchedUids = <int>[];
   final flagFetchedUids = <int>[];
   final flagsByUid = <int, String>{};
+  final structureByUid = <int, _FakeStructure>{};
+  final sectionFetches = <List<String>>[];
   bool supportsIdle = true;
+
+  int get wholeMessageFetchCount {
+    return _commands
+        .where(
+          (command) => command.endsWith('(FLAGS INTERNALDATE BODY.PEEK[])'),
+        )
+        .length;
+  }
+
+  static int _fetchUid(String command) {
+    return int.parse(
+      RegExp(r' UID FETCH (\d+) ').firstMatch(command)!.group(1)!,
+    );
+  }
+
   int idleCount = 0;
   int connectionCount = 0;
   String? _idleTag;
@@ -1424,6 +1532,39 @@ class _FakeImapServer {
         final waiter = _idleWaiter;
         _idleWaiter = null;
         waiter?.complete();
+      } else if (command.contains(' BODYSTRUCTURE ') &&
+          structureByUid.containsKey(_fetchUid(command))) {
+        final uid = _fetchUid(command);
+        final structure = structureByUid[uid]!;
+        final prefixLimit = int.parse(
+          RegExp(r'BODY\.PEEK\[\]<0\.(\d+)>').firstMatch(command)!.group(1)!,
+        );
+        final prefix = structure.raw.take(prefixLimit).toList();
+        socket.write(
+          '* 1 FETCH (UID $uid FLAGS (\\Seen) '
+          'INTERNALDATE "01-Jul-2026 08:00:00 +0000" '
+          'RFC822.SIZE ${structure.raw.length} '
+          'BODYSTRUCTURE ${structure.bodyStructure} '
+          'BODY[]<0> {${prefix.length}}\r\n',
+        );
+        socket.add(prefix);
+        socket.write(')\r\n');
+        socket.write('$tag OK FETCH completed\r\n');
+      } else if (command.contains('BODY.PEEK[HEADER]')) {
+        final uid = _fetchUid(command);
+        final sections = structureByUid[uid]!.sections;
+        final requested = RegExp(
+          r'BODY\.PEEK\[([^\]]*)\]',
+        ).allMatches(command).map((match) => match.group(1)!);
+        sectionFetches.add(requested.toList());
+        socket.write('* 1 FETCH (UID $uid');
+        for (final section in requested) {
+          final bytes = utf8.encode(sections[section] ?? '');
+          socket.write(' BODY[$section] {${bytes.length}}\r\n');
+          socket.add(bytes);
+        }
+        socket.write(')\r\n');
+        socket.write('$tag OK FETCH completed\r\n');
       } else if (command.contains(' UID FETCH ') &&
           command.endsWith('(UID FLAGS)')) {
         final set = RegExp(r' UID FETCH (\S+) ').firstMatch(command)!.group(1)!;
@@ -1551,6 +1692,18 @@ class _FakeImapServer {
       }
     }
   }
+}
+
+class _FakeStructure {
+  _FakeStructure({
+    required String raw,
+    required this.bodyStructure,
+    this.sections = const {},
+  }) : raw = utf8.encode(raw);
+
+  final List<int> raw;
+  final String bodyStructure;
+  final Map<String, String> sections;
 }
 
 class _FakeSmtpServer {
