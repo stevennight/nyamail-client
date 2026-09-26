@@ -7,6 +7,8 @@ import android.content.IntentSender
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
 import com.google.android.gms.auth.api.identity.AuthorizationResult
@@ -36,8 +38,15 @@ class MainActivity : FlutterFragmentActivity() {
     private var pendingOAuthRedirect: String? = null
     private var pendingGoogleAuthorization: PendingGoogleAuthorization? = null
 
+    // The engine lives at process level so background mail sync survives the
+    // activity being destroyed; see NyaMailEngine.
+    override fun getCachedEngineId(): String = NyaMailEngine.ensure(this)
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        configureBackgroundSyncChannel(flutterEngine)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.nyatori.nyamail/update_installer"
@@ -171,6 +180,57 @@ class MainActivity : FlutterFragmentActivity() {
                         null
                     )
                 }
+            }
+        }
+    }
+
+    private fun configureBackgroundSyncChannel(flutterEngine: FlutterEngine) {
+        // Uses the application context: the engine, and so this handler,
+        // outlives the activity while the sync service runs.
+        val appContext = applicationContext
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.nyatori.nyamail/background_sync"
+        ).setMethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "start" -> {
+                        MailSyncService.start(appContext)
+                        result.success(true)
+                    }
+                    "stop" -> {
+                        MailSyncService.stop(appContext)
+                        result.success(null)
+                    }
+                    "acquireWakeLock" -> {
+                        val timeout = call.argument<Number>("timeoutMs")?.toLong() ?: 60_000L
+                        MailSyncService.acquireWakeLock(appContext, timeout)
+                        result.success(null)
+                    }
+                    "releaseWakeLock" -> {
+                        MailSyncService.releaseWakeLock()
+                        result.success(null)
+                    }
+                    "isIgnoringBatteryOptimizations" -> {
+                        val power = appContext.getSystemService(POWER_SERVICE) as PowerManager
+                        result.success(power.isIgnoringBatteryOptimizations(appContext.packageName))
+                    }
+                    "openBatteryOptimizationSettings" -> {
+                        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        appContext.startActivity(intent)
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (error: Exception) {
+                // e.g. ForegroundServiceStartNotAllowedException when asked to
+                // start while the app is already in the background.
+                result.error(
+                    "background_sync_failed",
+                    error.localizedMessage ?: error.javaClass.simpleName,
+                    null
+                )
             }
         }
     }
