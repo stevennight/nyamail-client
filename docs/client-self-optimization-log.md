@@ -653,6 +653,9 @@ Implemented:
   secret. Legacy JSON caches are imported once.
 - `mail_home_page.dart` split into part files under `lib/src/ui/mail_home/`.
 - Gradle 8.14.3 / AGP 8.11.1, the minimums of the current Flutter SDK.
+- Message text is decoded with its MIME charset (GBK family, Windows code
+  pages, ISO-8859, Shift_JIS, EUC) instead of always UTF-8; raw literals stay
+  latin1 binary strings until a part is decoded.
 
 Validation:
 
@@ -660,7 +663,8 @@ Validation:
   sync, BODYSTRUCTURE parsing and partial body fetch, and SQLite row writes,
   reload and legacy import; all against loopback fakes.
 - `flutter analyze --no-pub`: only the 4 pre-existing warnings.
-- `flutter test --no-pub`: 254 passing.
-- `flutter build apk --debug` succeeds. A local Windows build could not run
-  because `nuget.exe` (needed by flutter_inappwebview_windows) is missing.
+- `flutter test --no-pub`: 259 passing.
+- `flutter build apk --debug` and `flutter build windows` succeed; the APK
+  bundles libsqlite3.so for all ABIs and the Windows build ships sqlite3.dll.
+  Windows builds need `nuget.exe` on PATH for flutter_inappwebview_windows.
 - Not yet exercised against live mailboxes or on a real Android device.
