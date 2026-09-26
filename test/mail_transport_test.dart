@@ -1502,6 +1502,8 @@ class _FakeImapServer {
   }
 
   Future<void> _handle(Socket socket) async {
+    // Writes racing a client reset must not fail the test run.
+    unawaited(socket.done.catchError((_) {}));
     socket.write('* OK NyaMail test IMAP\r\n');
     final reader = _SocketTestReader(socket);
     while (true) {
@@ -1818,6 +1820,14 @@ class _SocketTestReader {
         _flush();
       },
       onError: (Object error) {
+        // A client that drops its socket (as ImapIdleWatcher.stop does)
+        // shows up as a reset on Linux and a plain close on Windows; both
+        // just mean the client went away.
+        if (error is SocketException) {
+          _closed = true;
+          _flush();
+          return;
+        }
         _completeError(error);
       },
     );
