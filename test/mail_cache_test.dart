@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nyamail/src/mail/mail_cache.dart';
 import 'package:nyamail/src/mail/mail_models.dart';
+import 'package:nyamail/src/security/local_cache_crypto.dart';
 
 void main() {
   late Directory tempDir;
@@ -13,6 +14,7 @@ void main() {
   });
 
   tearDown(() async {
+    await MailCache.closeAll();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
     }
@@ -77,13 +79,16 @@ void main() {
         ),
       ]);
 
-      final file = File('${tempDir.path}/mail-cache/$namespace/messages.json');
-      final raw = await file.readAsString(encoding: utf8);
+      final raw = await _cacheFilesText(
+        Directory('${tempDir.path}/mail-cache/$namespace'),
+      );
       final loaded = await cache.loadMessages();
 
       expect(raw, contains('nyamail-local-cache-aes256gcm-v1'));
       expect(raw, isNot(contains('Quarterly plan')));
       expect(raw, isNot(contains('Sensitive body')));
+      // Row keys are keyed hashes, so message ids do not leak either.
+      expect(raw, isNot(contains('work:inbox:secret')));
       expect(loaded.single.subject, 'Quarterly plan');
       expect(loaded.single.body, contains('Sensitive body'));
     },
@@ -135,15 +140,13 @@ void main() {
       ),
     ]);
 
-    final file = File('${tempDir.path}/mail-cache/messages.json');
-    final raw = jsonDecode(await file.readAsString(encoding: utf8)) as List;
-    expect(raw.single['message_id_header'], 'digest-42@example.com');
-
+    // Reopen from disk rather than the in-memory index.
+    await MailCache.closeAll();
     final loaded = await cache.loadMessages();
     expect(loaded.single.messageIdHeader, 'digest-42@example.com');
   });
 
-  test('mail cache skips disk rewrites for unchanged messages', () async {
+  test('mail cache skips row writes for unchanged messages', () async {
     final cache = MailCache(
       localCacheSecret: _testSecret(),
       supportDirectoryProvider: () async => tempDir,
@@ -160,12 +163,47 @@ void main() {
     );
 
     await cache.saveMessages([message]);
-    final file = File('${tempDir.path}/mail-cache/messages.json');
-    final firstWrite = await file.readAsString(encoding: utf8);
+    final indexWrites = MailCache.debugIndexWrites;
+    final bodyWrites = MailCache.debugBodyWrites;
 
     await cache.saveMessages([message]);
 
-    expect(await file.readAsString(encoding: utf8), firstWrite);
+    expect(MailCache.debugIndexWrites, indexWrites);
+    expect(MailCache.debugBodyWrites, bodyWrites);
+  });
+
+  test('mail cache writes only the rows that changed', () async {
+    final cache = MailCache(supportDirectoryProvider: () async => tempDir);
+    final messages = [
+      for (var index = 0; index < 50; index++)
+        MailMessage(
+          id: 'work:inbox:$index',
+          accountId: 'work',
+          from: 'Alice <alice@example.com>',
+          subject: 'Message $index',
+          preview: 'Preview',
+          body: '',
+          receivedAt: DateTime.utc(2026, 7, 2, 0, index),
+          bodyLoaded: false,
+        ),
+    ];
+    await cache.saveMessages(messages);
+    final indexWrites = MailCache.debugIndexWrites;
+
+    await cache.saveMessages([
+      for (final message in messages)
+        message.id == 'work:inbox:7' ? message.copyWith(read: true) : message,
+    ]);
+
+    expect(MailCache.debugIndexWrites - indexWrites, 1);
+    await MailCache.closeAll();
+    final reloaded = await cache.loadMessages();
+    expect(reloaded, hasLength(50));
+    expect(reloaded.first.id, 'work:inbox:49');
+    expect(
+      reloaded.singleWhere((message) => message.id == 'work:inbox:7').read,
+      isTrue,
+    );
   });
 
   test('mail cache round trips a large encrypted payload', () async {
@@ -184,19 +222,11 @@ void main() {
     );
 
     await cache.saveMessages([message]);
-    final indexFile = File('${tempDir.path}/mail-cache/messages.json');
-    final bodiesFile = File('${tempDir.path}/mail-cache/bodies.json');
-    final encryptedIndex = await indexFile.readAsString(encoding: utf8);
-    final encryptedBodies = await bodiesFile.readAsString(encoding: utf8);
+    final raw = await _cacheFilesText(Directory('${tempDir.path}/mail-cache'));
+    expect(raw, contains('nyamail-local-cache-aes256gcm-v1'));
+    expect(raw, isNot(contains('xxxxxxxxxx')));
 
-    expect(encryptedBodies, contains('nyamail-local-cache-aes256gcm-v1'));
-    expect(encryptedBodies, isNot(contains('xxxxxxxxxx')));
-
-    await cache.clear();
-    await indexFile.parent.create(recursive: true);
-    await indexFile.writeAsString(encryptedIndex, encoding: utf8);
-    await bodiesFile.writeAsString(encryptedBodies, encoding: utf8);
-
+    await MailCache.closeAll();
     final loaded = await cache.loadMessages();
 
     expect(loaded, hasLength(1));
@@ -204,8 +234,9 @@ void main() {
     expect(loaded.single.body, message.body);
   });
 
-  test('mail cache splits legacy inline bodies into a bodies file', () async {
+  test('mail cache imports the legacy JSON cache once', () async {
     final indexFile = File('${tempDir.path}/mail-cache/messages.json');
+    final bodiesFile = File('${tempDir.path}/mail-cache/bodies.json');
     await indexFile.parent.create(recursive: true);
     await indexFile.writeAsString(
       jsonEncode([
@@ -220,22 +251,75 @@ void main() {
           'received_at': DateTime.utc(2026, 7, 2).toIso8601String(),
           'body_loaded': true,
         },
+        {
+          'id': 'work:inbox:split',
+          'account_id': 'work',
+          'from': 'Bob <bob@example.com>',
+          'subject': 'Split entry',
+          'preview': 'Split preview',
+          'received_at': DateTime.utc(2026, 7, 3).toIso8601String(),
+          'body_loaded': true,
+        },
       ]),
+      encoding: utf8,
+    );
+    await bodiesFile.writeAsString(
+      jsonEncode({
+        'work:inbox:split': {'body': 'Split body', 'html_body': ''},
+      }),
       encoding: utf8,
     );
 
     final cache = MailCache(supportDirectoryProvider: () async => tempDir);
     final loaded = await cache.loadMessages();
 
-    expect(loaded.single.body, 'Legacy plain body');
-    expect(loaded.single.htmlBody, '<p>Legacy body</p>');
+    expect(loaded.map((message) => message.id), [
+      'work:inbox:split',
+      'work:inbox:legacy',
+    ]);
+    expect(loaded.last.body, 'Legacy plain body');
+    expect(loaded.last.htmlBody, '<p>Legacy body</p>');
+    expect(loaded.first.body, 'Split body');
+    expect(await indexFile.exists(), isFalse);
+    expect(await bodiesFile.exists(), isFalse);
 
-    final bodiesFile = File('${tempDir.path}/mail-cache/bodies.json');
-    expect(await bodiesFile.exists(), isTrue);
-    final rewrittenIndex = jsonDecode(
-      await indexFile.readAsString(encoding: utf8),
+    await MailCache.closeAll();
+    expect(await cache.loadMessages(), hasLength(2));
+  });
+
+  test('mail cache leaves legacy files it cannot decrypt', () async {
+    final indexFile = File('${tempDir.path}/mail-cache/messages.json');
+    await indexFile.parent.create(recursive: true);
+    await indexFile.writeAsString(
+      await LocalCacheCipher(_testSecret()).encryptText(
+        jsonEncode([
+          {
+            'id': 'work:inbox:encrypted',
+            'account_id': 'work',
+            'from': 'Alice <alice@example.com>',
+            'subject': 'Encrypted legacy',
+            'preview': 'Preview',
+            'received_at': DateTime.utc(2026, 7, 2).toIso8601String(),
+            'body_loaded': false,
+          },
+        ]),
+      ),
+      encoding: utf8,
     );
-    expect((rewrittenIndex as List).single, isNot(contains('body')));
+
+    final withoutSecret = MailCache(
+      supportDirectoryProvider: () async => tempDir,
+    );
+    expect(await withoutSecret.loadMessages(), isEmpty);
+    expect(await indexFile.exists(), isTrue);
+
+    final withSecret = MailCache(
+      localCacheSecret: _testSecret(),
+      supportDirectoryProvider: () async => tempDir,
+    );
+    final loaded = await withSecret.loadMessages();
+    expect(loaded.single.subject, 'Encrypted legacy');
+    expect(await indexFile.exists(), isFalse);
   });
 
   test(
@@ -267,7 +351,7 @@ void main() {
   );
 
   test(
-    'mail cache flag-only change does not rewrite the bodies file',
+    'mail cache flag-only change does not rewrite the stored body',
     () async {
       final cache = MailCache(supportDirectoryProvider: () async => tempDir);
       final message = MailMessage(
@@ -280,17 +364,14 @@ void main() {
         receivedAt: DateTime.utc(2026, 7, 2),
       );
       await cache.saveMessages([message]);
-      final bodiesFile = File('${tempDir.path}/mail-cache/bodies.json');
-      final bodiesBefore = await bodiesFile.readAsString(encoding: utf8);
-      final bodiesModifiedBefore = (await bodiesFile.stat()).modified;
+      final bodyWrites = MailCache.debugBodyWrites;
 
-      await Future<void>.delayed(const Duration(milliseconds: 10));
       await cache.updateMessage(
         message.copyWith(read: true, body: '', bodyLoaded: false),
       );
 
-      expect(await bodiesFile.readAsString(encoding: utf8), bodiesBefore);
-      expect((await bodiesFile.stat()).modified, bodiesModifiedBefore);
+      expect(MailCache.debugBodyWrites, bodyWrites);
+      await MailCache.closeAll();
       final loaded = await cache.loadMessages();
       expect(loaded.single.read, isTrue);
       expect(loaded.single.body, 'Body text');
@@ -339,7 +420,7 @@ void main() {
   });
 
   test(
-    'mail cache quarantines unreadable json instead of failing load',
+    'mail cache drops corrupt legacy json instead of failing load',
     () async {
       final cache = MailCache(supportDirectoryProvider: () async => tempDir);
       final file = File('${tempDir.path}/mail-cache/messages.json');
@@ -350,16 +431,6 @@ void main() {
 
       expect(loaded, isEmpty);
       expect(await file.exists(), isFalse);
-      final quarantined =
-          await file.parent
-              .list()
-              .where(
-                (entity) =>
-                    entity is File &&
-                    entity.path.contains('messages.json.invalid-'),
-              )
-              .toList();
-      expect(quarantined, hasLength(1));
     },
   );
 
@@ -537,3 +608,15 @@ void main() {
 
 String _testSecret() =>
     base64UrlEncode(List<int>.generate(32, (index) => index));
+
+/// Every cache file in [directory] (database, WAL, legacy JSON) as one
+/// latin1 string, so tests can assert what is readable on disk.
+Future<String> _cacheFilesText(Directory directory) async {
+  final buffer = StringBuffer();
+  await for (final entity in directory.list()) {
+    if (entity is File) {
+      buffer.write(latin1.decode(await entity.readAsBytes()));
+    }
+  }
+  return buffer.toString();
+}

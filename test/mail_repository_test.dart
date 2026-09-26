@@ -15,6 +15,7 @@ void main() {
   });
 
   tearDown(() async {
+    await MailCache.closeAll();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
     }
