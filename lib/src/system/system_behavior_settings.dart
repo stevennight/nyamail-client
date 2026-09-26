@@ -8,6 +8,7 @@ class SystemBehaviorSettings {
     required this.newMailNotifications,
     required this.openMessageFromNotification,
     this.notificationGrouping = NotificationGrouping.stack,
+    this.androidBackgroundSync = false,
   });
 
   static const defaults = SystemBehaviorSettings(
@@ -15,6 +16,7 @@ class SystemBehaviorSettings {
     newMailNotifications: false,
     openMessageFromNotification: true,
     notificationGrouping: NotificationGrouping.stack,
+    androidBackgroundSync: false,
   );
 
   final bool minimizeToTray;
@@ -22,11 +24,17 @@ class SystemBehaviorSettings {
   final bool openMessageFromNotification;
   final NotificationGrouping notificationGrouping;
 
+  /// Android only: keep a foreground service running so new mail is still
+  /// checked (and IMAP IDLE push stays connected) while the app is in the
+  /// background.
+  final bool androidBackgroundSync;
+
   SystemBehaviorSettings copyWith({
     bool? minimizeToTray,
     bool? newMailNotifications,
     bool? openMessageFromNotification,
     NotificationGrouping? notificationGrouping,
+    bool? androidBackgroundSync,
   }) {
     return SystemBehaviorSettings(
       minimizeToTray: minimizeToTray ?? this.minimizeToTray,
@@ -34,6 +42,8 @@ class SystemBehaviorSettings {
       openMessageFromNotification:
           openMessageFromNotification ?? this.openMessageFromNotification,
       notificationGrouping: notificationGrouping ?? this.notificationGrouping,
+      androidBackgroundSync:
+          androidBackgroundSync ?? this.androidBackgroundSync,
     );
   }
 }
@@ -46,6 +56,7 @@ class SystemBehaviorSettingsStore {
   static const _openMessageFromNotificationKey =
       'system.openMessageFromNotification';
   static const _notificationGroupingKey = 'system.notificationGrouping';
+  static const _androidBackgroundSyncKey = 'system.androidBackgroundSync';
 
   Future<SystemBehaviorSettings> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -62,6 +73,9 @@ class SystemBehaviorSettingsStore {
       notificationGrouping: notificationGroupingFromStorage(
         prefs.getString(_notificationGroupingKey),
       ),
+      androidBackgroundSync:
+          prefs.getBool(_androidBackgroundSyncKey) ??
+          SystemBehaviorSettings.defaults.androidBackgroundSync,
     );
   }
 
@@ -79,6 +93,10 @@ class SystemBehaviorSettingsStore {
     await prefs.setString(
       _notificationGroupingKey,
       settings.notificationGrouping.storageValue,
+    );
+    await prefs.setBool(
+      _androidBackgroundSyncKey,
+      settings.androidBackgroundSync,
     );
   }
 }
