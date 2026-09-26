@@ -1256,21 +1256,56 @@ class CachedTransportMailRepository
           refreshState != null &&
           now.difference(refreshState.lastFullRefreshAt) <
               _fullFolderRefreshInterval;
-      final fetched = await (useIncrementalRefresh
-              ? incrementalTransport.fetchNewFolderMessagePreviews(
-                credential: credential,
-                folder: folder,
-                afterUid: refreshState.cursor,
-                limit: limit,
-              )
-              : _transport.fetchFolderMessagePreviews(
-                credential: credential,
-                folder: folder,
-                limit: limit,
-                beforeUid: beforeUid,
-              ))
-          .timeout(_previewFetchTimeout);
-      await _cache.saveMessages(fetched.messages);
+      final cacheAwareTransport =
+          _transport is CacheAwareMailTransport
+              ? _transport as CacheAwareMailTransport
+              : null;
+      final List<MailMessage> knownMessages =
+          cacheAwareTransport == null
+              ? const []
+              : await _cache.loadMessages(
+                accountId: credential.accountId,
+                folderPath: folder.path,
+                includeBodies: false,
+              );
+      final Future<MailPreviewPage> request;
+      if (cacheAwareTransport != null) {
+        request = cacheAwareTransport.syncFolderMessagePreviews(
+          credential: credential,
+          folder: folder,
+          // Incremental refreshes re-check flags on the newest cached page;
+          // full ones skip every preview that is already cached.
+          knownMessageIds: {
+            for (final message
+                in useIncrementalRefresh
+                    ? _newestMessages(knownMessages, limit)
+                    : knownMessages)
+              message.id,
+          },
+          limit: limit,
+          beforeUid: beforeUid,
+          afterUid: useIncrementalRefresh ? refreshState.cursor : null,
+        );
+      } else if (useIncrementalRefresh) {
+        request = incrementalTransport.fetchNewFolderMessagePreviews(
+          credential: credential,
+          folder: folder,
+          afterUid: refreshState.cursor,
+          limit: limit,
+        );
+      } else {
+        request = _transport.fetchFolderMessagePreviews(
+          credential: credential,
+          folder: folder,
+          limit: limit,
+          beforeUid: beforeUid,
+        );
+      }
+      final fetched = await request.timeout(_previewFetchTimeout);
+      await _cache.saveMessages([
+        ...fetched.messages,
+        ..._flagChangedMessages(knownMessages, fetched.flagUpdates),
+      ]);
       if (fetched.complete && beforeUid == null) {
         final remoteUids = fetched.remoteUids;
         if (!useIncrementalRefresh || remoteUids != null) {
@@ -1314,6 +1349,25 @@ class CachedTransportMailRepository
         error: error,
       );
     }
+  }
+
+  List<MailMessage> _newestMessages(List<MailMessage> messages, int limit) {
+    final sorted = [...messages]
+      ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+    return sorted.take(limit).toList(growable: false);
+  }
+
+  List<MailMessage> _flagChangedMessages(
+    List<MailMessage> cached,
+    Map<String, MailFlagState> flagUpdates,
+  ) {
+    if (flagUpdates.isEmpty) return const [];
+    return [
+      for (final message in cached)
+        if (flagUpdates[message.id] case final flags?)
+          if (flags.read != message.read || flags.starred != message.starred)
+            message.copyWith(read: flags.read, starred: flags.starred),
+    ];
   }
 
   void _scheduleRemoteUidReconciliation({

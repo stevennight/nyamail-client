@@ -546,6 +546,165 @@ void main() {
     }
   });
 
+  MailboxCredential localCredential(int port, {String accountId = 'acc'}) {
+    return MailboxCredential(
+      accountId: accountId,
+      address: 'me@example.com',
+      displayName: 'Me',
+      imapHost: InternetAddress.loopbackIPv4.address,
+      imapPort: port,
+      smtpHost: 'smtp.example.com',
+      smtpPort: 465,
+      username: 'me@example.com',
+      secret: 'secret',
+      useTls: false,
+    );
+  }
+
+  const inboxFolder = MailFolder(
+    accountId: 'acc',
+    path: 'INBOX',
+    displayName: 'Inbox',
+    kind: MailboxKind.inbox,
+  );
+
+  test('sync skips previews that are already cached', () async {
+    final server = await _FakeImapServer.start(searchUids: [501, 502, 503]);
+    server.flagsByUid[501] = '';
+    try {
+      final page = await const SocketMailTransport().syncFolderMessagePreviews(
+        credential: localCredential(server.port),
+        folder: inboxFolder,
+        knownMessageIds: {'acc:inbox:501', 'acc:inbox:502'},
+        limit: 10,
+      );
+
+      expect(server.fetchedUids, [503]);
+      expect(server.flagFetchedUids, [501, 502]);
+      expect(page.messages.map((message) => message.id), ['acc:inbox:503']);
+      expect(page.flagUpdates.keys, {'acc:inbox:501', 'acc:inbox:502'});
+      expect(page.flagUpdates['acc:inbox:501']!.read, isFalse);
+      expect(page.flagUpdates['acc:inbox:502']!.read, isTrue);
+      expect(page.remoteUids, [501, 502, 503]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('incremental sync re-checks flags of known messages', () async {
+    final server = await _FakeImapServer.start(searchUids: [501, 502, 503]);
+    try {
+      final page = await const SocketMailTransport().syncFolderMessagePreviews(
+        credential: localCredential(server.port),
+        folder: inboxFolder,
+        knownMessageIds: {'acc:inbox:501', 'acc:inbox:502'},
+        afterUid: 502,
+      );
+
+      expect(server.fetchedUids, [503]);
+      expect(server.flagFetchedUids..sort(), [501, 502]);
+      expect(page.messages.map((message) => message.id), ['acc:inbox:503']);
+      expect(page.flagUpdates.length, 2);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('ImapIdleWatcher reports pushed mailbox changes', () async {
+    final server = await _FakeImapServer.start();
+    final changes = StreamController<void>();
+    final states = <ImapIdleState>[];
+    final watcher = ImapIdleWatcher(
+      accountId: 'acc',
+      credential: () async => localCredential(server.port),
+      onMailboxChanged: () => changes.add(null),
+      onStateChanged: states.add,
+    );
+    final queue = StreamIterator(changes.stream);
+    try {
+      watcher.start();
+      await server.waitForIdle();
+      expect(watcher.state, ImapIdleState.idling);
+
+      server.pushToIdler('* 2 EXISTS');
+      expect(await queue.moveNext().timeout(const Duration(seconds: 5)), true);
+      // After DONE the watcher goes straight back into IDLE.
+      await server.waitForIdle();
+      expect(server.idleCount, 2);
+      expect(server.selectedMailbox, isNull);
+    } finally {
+      watcher.stop();
+      await queue.cancel();
+      await server.close();
+    }
+    expect(states.last, ImapIdleState.stopped);
+  });
+
+  test('ImapIdleWatcher reconnects and reports a catch-up change', () async {
+    final server = await _FakeImapServer.start();
+    var changes = 0;
+    final watcher = ImapIdleWatcher(
+      accountId: 'acc',
+      credential: () async => localCredential(server.port),
+      onMailboxChanged: () => changes++,
+      retryDelays: const [Duration(milliseconds: 10)],
+    );
+    try {
+      watcher.start();
+      await server.waitForIdle();
+      await server.dropIdler();
+      await server.waitForIdle();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(server.connectionCount, 2);
+      expect(changes, 1);
+    } finally {
+      watcher.stop();
+      await server.close();
+    }
+  });
+
+  test('ImapIdleWatcher gives up on servers without IDLE', () async {
+    final server = await _FakeImapServer.start();
+    server.supportsIdle = false;
+    final unsupported = Completer<void>();
+    final watcher = ImapIdleWatcher(
+      accountId: 'acc',
+      credential: () async => localCredential(server.port),
+      onMailboxChanged: () {},
+      onStateChanged: (state) {
+        if (state == ImapIdleState.unsupported) unsupported.complete();
+      },
+    );
+    try {
+      watcher.start();
+      await unsupported.future.timeout(const Duration(seconds: 5));
+      expect(server.idleCount, 0);
+    } finally {
+      watcher.stop();
+      await server.close();
+    }
+  });
+
+  test('ImapIdleWatcher stops promptly while idling', () async {
+    final server = await _FakeImapServer.start();
+    final watcher = ImapIdleWatcher(
+      accountId: 'acc',
+      credential: () async => localCredential(server.port),
+      onMailboxChanged: () {},
+    );
+    try {
+      watcher.start();
+      await server.waitForIdle();
+      watcher.stop();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(watcher.state, ImapIdleState.stopped);
+      expect(server.connectionCount, 1);
+    } finally {
+      await server.close();
+    }
+  });
+
   test('SocketMailTransport reuses one pooled IMAP connection', () async {
     final server = await _FakeImapServer.start(searchUids: [501]);
     final credential = MailboxCredential(
@@ -1075,9 +1234,50 @@ class _FakeImapServer {
   final int? moveDestinationUid;
   final _commands = <String>[];
   final fetchedUids = <int>[];
+  final flagFetchedUids = <int>[];
+  final flagsByUid = <int, String>{};
+  bool supportsIdle = true;
+  int idleCount = 0;
   int connectionCount = 0;
+  String? _idleTag;
+  Socket? _idleSocket;
+  Completer<void>? _idleWaiter;
 
   int get port => _server.port;
+
+  /// Completes once a client is idling (immediately if one already is).
+  Future<void> waitForIdle() {
+    if (_idleSocket != null) return Future.value();
+    return (_idleWaiter ??= Completer<void>()).future;
+  }
+
+  /// Pushes an untagged response to the idling client.
+  void pushToIdler(String line) {
+    _idleSocket?.write('$line\r\n');
+  }
+
+  /// Drops every client connection currently idling.
+  Future<void> dropIdler() async {
+    final socket = _idleSocket;
+    _idleSocket = null;
+    _idleTag = null;
+    socket?.destroy();
+  }
+
+  static List<int> _expandUidSet(String set) {
+    return [
+      for (final part in set.split(','))
+        if (part.contains(':'))
+          for (
+            var uid = int.parse(part.split(':').first);
+            uid <= int.parse(part.split(':').last);
+            uid++
+          )
+            uid
+        else
+          int.parse(part),
+    ];
+  }
 
   int get loginCount {
     return _commands
@@ -1201,7 +1401,40 @@ class _FakeImapServer {
       if (command == null) return;
       _commands.add(command);
       final tag = command.split(' ').first;
-      if (command.contains(' LOGIN ')) {
+      if (command == 'DONE') {
+        final pending = _idleTag;
+        _idleTag = null;
+        _idleSocket = null;
+        socket.write('$pending OK IDLE terminated\r\n');
+        continue;
+      }
+      if (command.endsWith(' CAPABILITY')) {
+        socket.write(
+          '* CAPABILITY IMAP4rev1 ${supportsIdle ? 'IDLE ' : ''}AUTH=PLAIN\r\n',
+        );
+        socket.write('$tag OK CAPABILITY completed\r\n');
+      } else if (command.contains(' EXAMINE ')) {
+        socket.write('* 1 EXISTS\r\n');
+        socket.write('$tag OK [READ-ONLY] EXAMINE completed\r\n');
+      } else if (command.endsWith(' IDLE')) {
+        _idleTag = tag;
+        _idleSocket = socket;
+        idleCount++;
+        socket.write('+ idling\r\n');
+        final waiter = _idleWaiter;
+        _idleWaiter = null;
+        waiter?.complete();
+      } else if (command.contains(' UID FETCH ') &&
+          command.endsWith('(UID FLAGS)')) {
+        final set = RegExp(r' UID FETCH (\S+) ').firstMatch(command)!.group(1)!;
+        final requested = _expandUidSet(set);
+        flagFetchedUids.addAll(requested);
+        for (final uid in requested) {
+          final flags = flagsByUid[uid] ?? r'\Seen \Flagged';
+          socket.write('* 1 FETCH (UID $uid FLAGS ($flags))\r\n');
+        }
+        socket.write('$tag OK FETCH completed\r\n');
+      } else if (command.contains(' LOGIN ')) {
         socket.write('$tag OK LOGIN completed\r\n');
       } else if (command.contains(' AUTHENTICATE XOAUTH2 ')) {
         socket.write('$tag OK AUTHENTICATE completed\r\n');

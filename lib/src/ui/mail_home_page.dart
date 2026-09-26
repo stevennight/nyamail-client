@@ -66,6 +66,8 @@ const _mailLoadMoreTimeout = Duration(seconds: 60);
 const _oauthRefreshTimeout = Duration(seconds: 20);
 const _folderDiscoveryTimeout = Duration(seconds: 45);
 const _automaticMailRefreshInterval = Duration(minutes: 1);
+const _pushBackedMailRefreshInterval = Duration(minutes: 5);
+const _mailPushDebounceDelay = Duration(milliseconds: 1500);
 
 /// Fixed amber for the "starred" affordance so it reads as a star regardless of
 /// the accent colour.
@@ -351,7 +353,13 @@ class _MailHomePageState extends State<MailHomePage>
   int _messageLoadGeneration = 0;
   SystemBehaviorSettings _systemSettings = SystemBehaviorSettings.defaults;
   Timer? _automaticMailRefreshTimer;
+  Duration? _automaticMailRefreshTimerInterval;
   bool _automaticMailRefreshInProgress = false;
+  final _mailPushWatchers = <String, ImapIdleWatcher>{};
+  final _mailPushStates = <String, ImapIdleState>{};
+  final _mailPushUnsupported = <String>{};
+  Timer? _mailPushDebounce;
+  bool _mailPushRefreshQueued = false;
   bool _appIsInForeground = true;
   int _pendingStartupMailboxWork = 0;
   bool _pollingNewMail = false;
@@ -398,6 +406,8 @@ class _MailHomePageState extends State<MailHomePage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _automaticMailRefreshTimer?.cancel();
+    _mailPushDebounce?.cancel();
+    _stopMailPush();
     unawaited(_flushPendingMailActions());
     unawaited(SocketMailTransport.disposeConnections());
     unawaited(_trayService.dispose());
@@ -414,18 +424,29 @@ class _MailHomePageState extends State<MailHomePage>
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
+        if (!_appIsInForeground) break;
         _appIsInForeground = false;
-        _automaticMailRefreshTimer?.cancel();
-        _automaticMailRefreshTimer = null;
         unawaited(_flushPendingMailActions());
+        if (_mailSyncContinuesInBackground) {
+          // Desktop windows hidden in the tray (or minimized) and Android with
+          // the background service keep polling so notifications still fire.
+          break;
+        }
+        _syncAutomaticMailRefresh();
         // Mobile platforms drop idle sockets in the background anyway; release
         // pooled IMAP connections so we reconnect cleanly on resume.
         unawaited(SocketMailTransport.disposeConnections());
         break;
       case AppLifecycleState.resumed:
+        // Focus changes on desktop go inactive -> resumed; only a return from
+        // the background needs a catch-up refresh.
+        if (_appIsInForeground) break;
+        final syncedWhileAway = _mailSyncContinuesInBackground;
         _appIsInForeground = true;
         _syncAutomaticMailRefresh();
-        unawaited(_refreshMailboxAutomatically(forceFullRefresh: true));
+        unawaited(
+          _refreshMailboxAutomatically(forceFullRefresh: !syncedWhileAway),
+        );
         break;
       case AppLifecycleState.inactive:
         break;
@@ -803,29 +824,141 @@ class _MailHomePageState extends State<MailHomePage>
       _pendingStartupMailboxWork--;
       if (mounted && _pendingStartupMailboxWork == 0) {
         _syncAutomaticMailRefresh();
+        if (_mailPushRefreshQueued) unawaited(_runQueuedMailPushRefresh());
       }
     }
   }
 
+  /// Whether mail polling (and IDLE push) keeps running while the window is
+  /// hidden. Desktop processes stay alive in the tray or when minimized; on
+  /// Android only the opt-in foreground service keeps the process alive.
+  bool get _mailSyncContinuesInBackground {
+    if (kIsWeb) return false;
+    if (io.Platform.isWindows || io.Platform.isLinux || io.Platform.isMacOS) {
+      return true;
+    }
+    return io.Platform.isAndroid && _systemSettings.androidBackgroundSync;
+  }
+
+  bool get _mailSyncAllowed =>
+      _appIsInForeground || _mailSyncContinuesInBackground;
+
   void _syncAutomaticMailRefresh() {
-    _automaticMailRefreshTimer?.cancel();
-    _automaticMailRefreshTimer = null;
-    if (_pendingStartupMailboxWork > 0 ||
-        !_appIsInForeground ||
-        !_hasUnlockedLocalVault ||
-        _accounts.isEmpty) {
+    _syncMailPush();
+    final active =
+        _pendingStartupMailboxWork == 0 &&
+        _mailSyncAllowed &&
+        _hasUnlockedLocalVault &&
+        _accounts.isNotEmpty;
+    // With IDLE push up for every account, polling is only a safety net.
+    final interval =
+        _mailPushCoversAllAccounts
+            ? _pushBackedMailRefreshInterval
+            : _automaticMailRefreshInterval;
+    if (active &&
+        _automaticMailRefreshTimer != null &&
+        _automaticMailRefreshTimerInterval == interval) {
       return;
     }
+    _automaticMailRefreshTimer?.cancel();
+    _automaticMailRefreshTimer = null;
+    _automaticMailRefreshTimerInterval = null;
+    if (!active) return;
+    _automaticMailRefreshTimerInterval = interval;
     _automaticMailRefreshTimer = Timer.periodic(
-      _automaticMailRefreshInterval,
+      interval,
       (_) => unawaited(_refreshMailboxAutomatically()),
     );
+  }
+
+  bool get _mailPushCoversAllAccounts {
+    if (_accounts.isEmpty) return false;
+    return _accounts.every(
+      (account) => _mailPushStates[account.id] == ImapIdleState.idling,
+    );
+  }
+
+  void _syncMailPush() {
+    final wanted =
+        _mailSyncAllowed && _hasUnlockedLocalVault
+            ? {for (final account in _accounts) account.id}
+            : const <String>{};
+    for (final accountId in _mailPushWatchers.keys.toList()) {
+      if (wanted.contains(accountId)) continue;
+      _mailPushWatchers.remove(accountId)?.stop();
+      _mailPushStates.remove(accountId);
+    }
+    for (final accountId in wanted) {
+      if (_mailPushWatchers.containsKey(accountId) ||
+          _mailPushUnsupported.contains(accountId)) {
+        continue;
+      }
+      final watcher = ImapIdleWatcher(
+        accountId: accountId,
+        credential: () => _pushCredentialFor(accountId),
+        onMailboxChanged: _handleMailPush,
+        onStateChanged: (state) {
+          if (!mounted) return;
+          _mailPushStates[accountId] = state;
+          if (state == ImapIdleState.unsupported) {
+            _mailPushUnsupported.add(accountId);
+            _mailPushWatchers.remove(accountId);
+          }
+          _syncAutomaticMailRefresh();
+        },
+      );
+      _mailPushWatchers[accountId] = watcher;
+      watcher.start();
+    }
+  }
+
+  void _stopMailPush() {
+    for (final watcher in _mailPushWatchers.values) {
+      watcher.stop();
+    }
+    _mailPushWatchers.clear();
+    _mailPushStates.clear();
+  }
+
+  Future<MailboxCredential?> _pushCredentialFor(String accountId) async {
+    try {
+      await _refreshOAuthVaultIfNeeded();
+    } catch (error) {
+      debugPrint('[NyaMail push] OAuth refresh failed: $error');
+    }
+    if (!mounted) return null;
+    final document = _vaultDocument;
+    if (document == null) return null;
+    for (final credential in document.toCredentials()) {
+      if (credential.accountId == accountId) return credential;
+    }
+    return null;
+  }
+
+  void _handleMailPush() {
+    if (!mounted) return;
+    // Servers often send EXISTS and FETCH lines in quick bursts; coalesce them.
+    _mailPushDebounce?.cancel();
+    _mailPushDebounce = Timer(_mailPushDebounceDelay, () {
+      _mailPushRefreshQueued = true;
+      unawaited(_runQueuedMailPushRefresh());
+    });
+  }
+
+  Future<void> _runQueuedMailPushRefresh() async {
+    if (!mounted || !_mailPushRefreshQueued) return;
+    if (_automaticMailRefreshInProgress || _refreshingMail) {
+      // Picked up again when the running refresh finishes.
+      return;
+    }
+    _mailPushRefreshQueued = false;
+    await _refreshMailboxAutomatically();
   }
 
   Future<void> _refreshMailboxAutomatically({
     bool forceFullRefresh = false,
   }) async {
-    if (!_appIsInForeground ||
+    if (!_mailSyncAllowed ||
         _automaticMailRefreshInProgress ||
         _refreshingMail ||
         _pendingStartupMailboxWork > 0 ||
@@ -854,6 +987,7 @@ class _MailHomePageState extends State<MailHomePage>
       }
     } finally {
       _automaticMailRefreshInProgress = false;
+      if (_mailPushRefreshQueued) unawaited(_runQueuedMailPushRefresh());
     }
   }
 
@@ -1891,6 +2025,7 @@ class _MailHomePageState extends State<MailHomePage>
       _refreshingMail = false;
       _refreshingMailRequestId = null;
     });
+    if (_mailPushRefreshQueued) unawaited(_runQueuedMailPushRefresh());
   }
 
   Future<void> _reloadMessages() async {
@@ -3240,6 +3375,8 @@ class _MailHomePageState extends State<MailHomePage>
       _selectedMessageIds = const <String>{};
       _banner = null;
     });
+    _mailPushUnsupported.clear();
+    _syncAutomaticMailRefresh();
     _showTransientNotice(
       'Local data cleared on this device.',
       kind: _NoticeKind.success,

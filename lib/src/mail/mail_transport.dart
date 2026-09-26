@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'mail_models.dart';
 
@@ -103,6 +104,14 @@ class MailMoveResult {
   final int? destinationUid;
 }
 
+/// Server-side read/starred state of a message that is already cached.
+class MailFlagState {
+  const MailFlagState({required this.read, required this.starred});
+
+  final bool read;
+  final bool starred;
+}
+
 class MailPreviewPage extends IterableBase<MailMessage> {
   const MailPreviewPage({
     required this.messages,
@@ -110,6 +119,7 @@ class MailPreviewPage extends IterableBase<MailMessage> {
     this.remoteUids,
     this.hasMore = false,
     this.complete = true,
+    this.flagUpdates = const {},
   });
 
   factory MailPreviewPage.fromMessages(
@@ -142,6 +152,10 @@ class MailPreviewPage extends IterableBase<MailMessage> {
   final List<int>? remoteUids;
   final bool hasMore;
   final bool complete;
+
+  /// Current flags for messages the caller already had cached, keyed by
+  /// message id. Those messages are not re-downloaded into [messages].
+  final Map<String, MailFlagState> flagUpdates;
 
   @override
   Iterator<MailMessage> get iterator => messages.iterator;
@@ -221,7 +235,28 @@ abstract class IncrementalMailTransport {
   });
 }
 
-class SocketMailTransport implements MailTransport, IncrementalMailTransport {
+/// A transport that can skip downloading previews the caller already has and
+/// only refresh their flags.
+abstract class CacheAwareMailTransport {
+  /// Like [MailTransport.fetchFolderMessagePreviews] (or, with [afterUid],
+  /// [IncrementalMailTransport.fetchNewFolderMessagePreviews]), but messages
+  /// whose ids are in [knownMessageIds] only get a cheap FLAGS fetch that is
+  /// reported through [MailPreviewPage.flagUpdates].
+  Future<MailPreviewPage> syncFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required Set<String> knownMessageIds,
+    int limit = 30,
+    int? beforeUid,
+    int? afterUid,
+  });
+}
+
+class SocketMailTransport
+    implements
+        MailTransport,
+        IncrementalMailTransport,
+        CacheAwareMailTransport {
   const SocketMailTransport();
 
   /// Shared pool of logged-in IMAP connections.
@@ -428,12 +463,32 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
     );
   }
 
+  @override
+  Future<MailPreviewPage> syncFolderMessagePreviews({
+    required MailboxCredential credential,
+    required MailFolder folder,
+    required Set<String> knownMessageIds,
+    int limit = 30,
+    int? beforeUid,
+    int? afterUid,
+  }) {
+    return _fetchFolderMessagePreviews(
+      credential: credential,
+      folder: folder,
+      limit: limit,
+      beforeUid: beforeUid,
+      afterUid: afterUid,
+      knownMessageIds: knownMessageIds,
+    );
+  }
+
   Future<MailPreviewPage> _fetchFolderMessagePreviews({
     required MailboxCredential credential,
     required MailFolder folder,
     required int limit,
     int? beforeUid,
     int? afterUid,
+    Set<String> knownMessageIds = const {},
   }) {
     return _pool.run(
       credential,
@@ -455,17 +510,51 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
                   afterUid: afterUid,
                   limit: limit * _incrementalPreviewPageMultiplier,
                 );
+        String idFor(int uid) =>
+            _messageIdForFolder(credential.accountId, folder, uid);
+        final newUids = [
+          for (final uid in selectedUids)
+            if (!knownMessageIds.contains(idFor(uid))) uid,
+        ];
+        // Cached messages only need their flags checked. On a full refresh
+        // that is the known part of the selected page; on an incremental one
+        // the caller passes its newest cached ids for this folder.
+        final flagUids =
+            afterUid == null
+                ? [
+                  for (final uid in selectedUids)
+                    if (knownMessageIds.contains(idFor(uid))) uid,
+                ]
+                : [
+                  for (final id in knownMessageIds)
+                    if (_uidFromMessageId(id) case final uid?)
+                      if (idFor(uid) == id) uid,
+                ];
+        final flagUpdates = <String, MailFlagState>{};
+        if (flagUids.isNotEmpty) {
+          try {
+            final flagsByUid = await imap.uidFetchFlags(flagUids);
+            for (final entry in flagsByUid.entries) {
+              flagUpdates[idFor(entry.key)] = MailFlagState(
+                read: entry.value.contains(r'\Seen'),
+                starred: entry.value.contains(r'\Flagged'),
+              );
+            }
+          } catch (_) {
+            // Flags are a best-effort refresh; new previews still count.
+          }
+        }
         final messages = <MailMessage>[];
         var complete = true;
         Map<int, _FetchedImapMessage> fetchedByUid;
         try {
-          fetchedByUid = await imap.uidFetchMessagePreviews(selectedUids);
+          fetchedByUid = await imap.uidFetchMessagePreviews(newUids);
         } catch (_) {
           complete = false;
           fetchedByUid = const <int, _FetchedImapMessage>{};
         }
         final requests = <_Rfc822ParseRequest>[];
-        for (final uid in selectedUids) {
+        for (final uid in newUids) {
           final fetched = fetchedByUid[uid];
           if (fetched == null) {
             complete = false;
@@ -512,6 +601,7 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
                   : uids.where((uid) => uid > afterUid).length >
                       selectedUids.length,
           complete: complete,
+          flagUpdates: flagUpdates,
         );
       },
     );
@@ -671,6 +761,122 @@ class SocketMailTransport implements MailTransport, IncrementalMailTransport {
             flags: const [r'\Seen'],
           ),
     );
+  }
+}
+
+/// Supplies the latest credential for an account, refreshing OAuth tokens
+/// first when needed. Returns null when the account is gone.
+typedef MailboxCredentialProvider = Future<MailboxCredential?> Function();
+
+enum ImapIdleState { connecting, idling, unsupported, retrying, stopped }
+
+/// Keeps one dedicated IMAP connection per account in IDLE on the inbox and
+/// calls [onMailboxChanged] as soon as the server reports new or changed
+/// mail, so the app no longer waits for its next polling tick.
+///
+/// The connection is separate from the command pool because an idling
+/// connection cannot run other commands. It reconnects with backoff and,
+/// after every reconnect, reports a change so mail that arrived while the
+/// connection was down is picked up.
+class ImapIdleWatcher {
+  ImapIdleWatcher({
+    required this.accountId,
+    required MailboxCredentialProvider credential,
+    required void Function() onMailboxChanged,
+    void Function(ImapIdleState state)? onStateChanged,
+    this.mailbox = 'INBOX',
+    this.idleCycle = const Duration(minutes: 8),
+    this.retryDelays = const [
+      Duration(seconds: 5),
+      Duration(seconds: 15),
+      Duration(seconds: 30),
+      Duration(minutes: 1),
+      Duration(minutes: 2),
+      Duration(minutes: 5),
+    ],
+  }) : _credential = credential,
+       _onMailboxChanged = onMailboxChanged,
+       _onStateChanged = onStateChanged;
+
+  final String accountId;
+  final String mailbox;
+  final Duration idleCycle;
+  final List<Duration> retryDelays;
+  final MailboxCredentialProvider _credential;
+  final void Function() _onMailboxChanged;
+  final void Function(ImapIdleState state)? _onStateChanged;
+
+  ImapIdleState _state = ImapIdleState.stopped;
+  bool _running = false;
+  Completer<void> _cancel = Completer<void>();
+  _ImapConnection? _connection;
+
+  ImapIdleState get state => _state;
+
+  void start() {
+    if (_running) return;
+    _running = true;
+    _cancel = Completer<void>();
+    unawaited(_run());
+  }
+
+  void stop() {
+    if (!_running) return;
+    _running = false;
+    if (!_cancel.isCompleted) _cancel.complete();
+    _connection?.destroy();
+    _connection = null;
+    _setState(ImapIdleState.stopped);
+  }
+
+  void _setState(ImapIdleState state) {
+    if (_state == state) return;
+    _state = state;
+    _onStateChanged?.call(state);
+  }
+
+  Future<void> _run() async {
+    var failures = 0;
+    var connectedBefore = false;
+    final cancel = _cancel;
+    while (_running && !cancel.isCompleted) {
+      _setState(ImapIdleState.connecting);
+      _ImapConnection? connection;
+      try {
+        final credential = await _credential();
+        if (credential == null || !_running) break;
+        connection = await _ImapConnection.connect(credential);
+        _connection = connection;
+        await connection.login();
+        final capabilities = await connection.capabilities();
+        if (!capabilities.contains('IDLE')) {
+          _setState(ImapIdleState.unsupported);
+          _running = false;
+          break;
+        }
+        await connection.examineMailbox(mailbox);
+        if (connectedBefore) _onMailboxChanged();
+        connectedBefore = true;
+        failures = 0;
+        _setState(ImapIdleState.idling);
+        while (_running && !cancel.isCompleted) {
+          final changed = await connection.idle(
+            maxDuration: idleCycle,
+            cancel: cancel.future,
+          );
+          if (changed && _running) _onMailboxChanged();
+        }
+      } catch (error) {
+        if (!_running) break;
+        _setState(ImapIdleState.retrying);
+        final delay = retryDelays[math.min(failures, retryDelays.length - 1)];
+        failures++;
+        await Future.any([Future<void>.delayed(delay), cancel.future]);
+      } finally {
+        if (identical(_connection, connection)) _connection = null;
+        connection?.destroy();
+      }
+    }
   }
 }
 
@@ -1714,6 +1920,28 @@ class _ImapConnection {
     return fetchedByUid;
   }
 
+  /// Fetches only the flags of [uids]; keyed by UID.
+  Future<Map<int, Set<String>>> uidFetchFlags(Iterable<int> uids) async {
+    final requested = LinkedHashSet<int>.of(
+      uids.where((uid) => uid > 0),
+    ).toList(growable: false);
+    if (requested.isEmpty) return const <int, Set<String>>{};
+    final lines = await _commandLines(
+      'UID FETCH ${_compactUidSet(requested)} (UID FLAGS)',
+    );
+    final requestedUids = requested.toSet();
+    final flagsByUid = <int, Set<String>>{};
+    for (final line in lines) {
+      if (!line.startsWith('* ') || !line.toUpperCase().contains(' FETCH ')) {
+        continue;
+      }
+      final uid = _parseFetchUid([line]);
+      if (uid == null || !requestedUids.contains(uid)) continue;
+      flagsByUid[uid] = _parseFetchFlags([line]);
+    }
+    return flagsByUid;
+  }
+
   Future<List<int>> fetchBodyPartBytes(int id, String partId) async {
     return uidFetchBodyPartBytes(id, partId);
   }
@@ -1870,6 +2098,107 @@ class _ImapConnection {
 
   /// Lightweight round trip used to check a pooled connection is still alive.
   Future<void> noop() => _command('NOOP');
+
+  Future<Set<String>> capabilities() async {
+    final lines = await _commandLines('CAPABILITY');
+    final capabilities = <String>{};
+    for (final line in lines) {
+      final upper = line.toUpperCase();
+      final start = upper.indexOf('CAPABILITY ');
+      if (start < 0) continue;
+      final values = upper.substring(start + 'CAPABILITY '.length);
+      capabilities.addAll(
+        values
+            .replaceAll(']', ' ')
+            .split(RegExp(r'\s+'))
+            .where((value) => value.isNotEmpty),
+      );
+    }
+    return capabilities;
+  }
+
+  /// Read-only SELECT, used by the IDLE watcher so it never changes \Recent.
+  Future<void> examineMailbox(String mailbox) {
+    return _command('EXAMINE "${_escape(mailbox)}"');
+  }
+
+  /// Runs one IDLE cycle and returns whether the server reported a change to
+  /// the selected mailbox (new, expunged or re-flagged messages).
+  ///
+  /// The cycle ends at the first change, after [maxDuration] (servers drop
+  /// IDLE after ~30 minutes, NATs often much sooner), or when [cancel]
+  /// completes.
+  Future<bool> idle({
+    required Duration maxDuration,
+    required Future<void> cancel,
+  }) async {
+    final tag = _nextTag();
+    var changed = false;
+    _socket.write('$tag IDLE\r\n');
+    while (true) {
+      final line = await _reader.readLine().timeout(
+        const Duration(seconds: 30),
+      );
+      if (line.startsWith('+')) break;
+      if (line.startsWith('$tag ')) {
+        throw MailTransportException('IMAP IDLE failed: $line');
+      }
+      changed = changed || _isMailboxChangeLine(line);
+    }
+
+    // A readLine that loses the race stays queued in the reader and receives
+    // the next line, so it is carried over instead of being abandoned.
+    Future<String>? pending;
+    final stop = Completer<void>();
+    final timer = Timer(maxDuration, () {
+      if (!stop.isCompleted) stop.complete();
+    });
+    unawaited(
+      cancel.then((_) {
+        if (!stop.isCompleted) stop.complete();
+      }),
+    );
+    try {
+      while (!changed) {
+        final read = pending ??= _reader.readLine();
+        final stopped = await Future.any<bool>([
+          read.then((_) => false),
+          stop.future.then((_) => true),
+        ]);
+        if (stopped) break;
+        final line = await read;
+        pending = null;
+        if (line.startsWith('$tag OK')) return changed;
+        if (line.startsWith('$tag ')) {
+          throw MailTransportException('IMAP IDLE ended: $line');
+        }
+        if (line.startsWith('* BYE')) {
+          throw MailTransportException('IMAP connection closed: $line');
+        }
+        changed = _isMailboxChangeLine(line);
+      }
+    } finally {
+      timer.cancel();
+    }
+
+    _socket.write('DONE\r\n');
+    while (true) {
+      final read = pending ?? _reader.readLine();
+      pending = null;
+      final line = await read.timeout(const Duration(seconds: 30));
+      if (line.startsWith('$tag OK')) return changed;
+      if (line.startsWith('$tag ')) {
+        throw MailTransportException('IMAP IDLE failed: $line');
+      }
+      changed = changed || _isMailboxChangeLine(line);
+    }
+  }
+
+  /// Drops the socket immediately without a LOGOUT round trip.
+  void destroy() {
+    _reader.abort();
+    _socket.destroy();
+  }
 
   Future<void> close() async {
     try {
@@ -2242,6 +2571,32 @@ bool _hasMoreUidPage(List<int> uids, {required int limit, int? beforeUid}) {
     if (eligibleCount > limit) return true;
   }
   return false;
+}
+
+final _mailboxChangeLine = RegExp(
+  r'^\* \d+ (EXISTS|EXPUNGE|RECENT|FETCH)\b',
+  caseSensitive: false,
+);
+
+bool _isMailboxChangeLine(String line) => _mailboxChangeLine.hasMatch(line);
+
+/// Formats UIDs as an IMAP sequence set, collapsing consecutive runs into
+/// `a:b` ranges so large flag refreshes stay short on the wire.
+String _compactUidSet(Iterable<int> uids) {
+  final sorted = uids.toSet().toList()..sort();
+  final parts = <String>[];
+  var index = 0;
+  while (index < sorted.length) {
+    final start = sorted[index];
+    var end = start;
+    while (index + 1 < sorted.length && sorted[index + 1] == end + 1) {
+      index++;
+      end = sorted[index];
+    }
+    parts.add(start == end ? '$start' : '$start:$end');
+    index++;
+  }
+  return parts.join(',');
 }
 
 String _messageId(String accountId, MailboxKind mailbox, int uid) {
@@ -2724,6 +3079,14 @@ class _SocketLineReader {
 
   Future<void> close() {
     return _subscription.cancel();
+  }
+
+  /// Fails every pending read and stops listening, so awaiting callers wake up
+  /// even though the socket will never deliver another line.
+  void abort() {
+    _closed = true;
+    _pendingError(const MailTransportException('socket closed'));
+    unawaited(_subscription.cancel());
   }
 
   void pause() {
