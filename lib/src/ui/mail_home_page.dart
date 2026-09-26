@@ -52,6 +52,7 @@ import '../security/vault_record_crypto.dart';
 import '../security/vault_record_sync_engine.dart';
 import '../security/vault_records.dart';
 import '../security/vault_share_crypto.dart';
+import '../system/android_background_sync.dart';
 import '../system/notification_grouping.dart';
 import '../system/notification_service.dart';
 import '../system/startup_service.dart';
@@ -347,6 +348,7 @@ class _MailHomePageState extends State<MailHomePage>
   final _systemSettingsStore = const SystemBehaviorSettingsStore();
   final _trayService = NyaMailTrayService();
   final _notificationService = NyaMailNotificationService();
+  final _androidBackgroundSync = AndroidBackgroundSync();
   final _search = TextEditingController();
   final _searchFocusNode = FocusNode(debugLabel: 'Mail search');
   bool _hasMoreMessages = true;
@@ -408,6 +410,7 @@ class _MailHomePageState extends State<MailHomePage>
     _automaticMailRefreshTimer?.cancel();
     _mailPushDebounce?.cancel();
     _stopMailPush();
+    unawaited(_androidBackgroundSync.stop());
     unawaited(_flushPendingMailActions());
     unawaited(SocketMailTransport.disposeConnections());
     unawaited(_trayService.dispose());
@@ -837,13 +840,34 @@ class _MailHomePageState extends State<MailHomePage>
     if (io.Platform.isWindows || io.Platform.isLinux || io.Platform.isMacOS) {
       return true;
     }
-    return io.Platform.isAndroid && _systemSettings.androidBackgroundSync;
+    return io.Platform.isAndroid && _androidBackgroundSyncWanted;
+  }
+
+  /// Background sync on Android only matters for notifications.
+  bool get _androidBackgroundSyncWanted =>
+      _systemSettings.androidBackgroundSync &&
+      _systemSettings.newMailNotifications;
+
+  void _syncAndroidBackgroundService() {
+    if (!AndroidBackgroundSync.isSupported) return;
+    final wanted =
+        _androidBackgroundSyncWanted &&
+        _hasUnlockedLocalVault &&
+        _accounts.isNotEmpty;
+    if (wanted && !_androidBackgroundSync.isRunning && _appIsInForeground) {
+      // Android only allows starting it from the foreground; a refused start
+      // is retried the next time the app comes back.
+      unawaited(_androidBackgroundSync.start());
+    } else if (!wanted && _androidBackgroundSync.isRunning) {
+      unawaited(_androidBackgroundSync.stop());
+    }
   }
 
   bool get _mailSyncAllowed =>
       _appIsInForeground || _mailSyncContinuesInBackground;
 
   void _syncAutomaticMailRefresh() {
+    _syncAndroidBackgroundService();
     _syncMailPush();
     final active =
         _pendingStartupMailboxWork == 0 &&
@@ -967,6 +991,13 @@ class _MailHomePageState extends State<MailHomePage>
       return;
     }
     _automaticMailRefreshInProgress = true;
+    // An IDLE push can wake a dozing phone just long enough to deliver the
+    // packet; hold the CPU until the refresh and its notifications are done.
+    final holdsWakeLock =
+        !_appIsInForeground && _androidBackgroundSync.isRunning;
+    if (holdsWakeLock) {
+      await _androidBackgroundSync.acquireWakeLock(const Duration(minutes: 1));
+    }
     try {
       final requestId = _nextMessageLoadGeneration();
       final completesNotificationBaseline =
@@ -987,6 +1018,7 @@ class _MailHomePageState extends State<MailHomePage>
       }
     } finally {
       _automaticMailRefreshInProgress = false;
+      if (holdsWakeLock) unawaited(_androidBackgroundSync.releaseWakeLock());
       if (_mailPushRefreshQueued) unawaited(_runQueuedMailPushRefresh());
     }
   }
@@ -6951,11 +6983,14 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
   late SystemBehaviorSettings _settings = widget.settings;
   bool _launchAtStartup = false;
   String? _error;
+  final _backgroundSync = AndroidBackgroundSync();
+  bool? _ignoringBatteryOptimizations;
 
   @override
   void initState() {
     super.initState();
     _load();
+    unawaited(_loadBatteryOptimizationState());
   }
 
   Future<void> _load() async {
@@ -7033,6 +7068,41 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
                       ? null
                       : _setOpenMessageFromNotification,
             ),
+            if (AndroidBackgroundSync.isSupported) ...[
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: const Icon(Icons.sync_outlined),
+                title: const Text('Keep checking in the background'),
+                subtitle: const Text(
+                  '${AndroidBackgroundSync.platformLabel} Without it, new '
+                  'mail is only noticed while NyaMail is open.',
+                ),
+                value:
+                    _settings.androidBackgroundSync &&
+                    _settings.newMailNotifications,
+                onChanged:
+                    _loading || !_settings.newMailNotifications
+                        ? null
+                        : _setAndroidBackgroundSync,
+              ),
+              if (_settings.androidBackgroundSync &&
+                  _settings.newMailNotifications &&
+                  _ignoringBatteryOptimizations == false)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.battery_alert_outlined),
+                  title: const Text('Battery optimization is on'),
+                  subtitle: const Text(
+                    'Android may still pause NyaMail. Set it to '
+                    '"Not optimized" / "Unrestricted" for reliable '
+                    'notifications.',
+                  ),
+                  trailing: TextButton(
+                    onPressed: _openBatteryOptimizationSettings,
+                    child: const Text('Open settings'),
+                  ),
+                ),
+            ],
             if (NyaMailNotificationService.isSupported &&
                 _settings.newMailNotifications) ...[
               const SizedBox(height: 8),
@@ -7106,6 +7176,30 @@ class _SystemSettingsDialogState extends State<_SystemSettingsDialog> {
 
   Future<void> _setMinimizeToTray(bool enabled) async {
     await _setBehaviorSetting(_settings.copyWith(minimizeToTray: enabled));
+  }
+
+  Future<void> _setAndroidBackgroundSync(bool enabled) async {
+    await _setBehaviorSetting(
+      _settings.copyWith(androidBackgroundSync: enabled),
+    );
+    await _loadBatteryOptimizationState();
+  }
+
+  Future<void> _loadBatteryOptimizationState() async {
+    if (!AndroidBackgroundSync.isSupported) return;
+    final ignoring =
+        await _backgroundSync.isIgnoringBatteryOptimizations();
+    if (!mounted) return;
+    setState(() => _ignoringBatteryOptimizations = ignoring);
+  }
+
+  Future<void> _openBatteryOptimizationSettings() async {
+    try {
+      await _backgroundSync.openBatteryOptimizationSettings();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _error = error.toString());
+    }
   }
 
   Future<void> _setNewMailNotifications(bool enabled) async {
