@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'imap_body_structure.dart';
+import 'mail_charset.dart';
 import 'mail_models.dart';
 
 const _messagePreviewFetchBytes = 8 * 1024;
@@ -658,7 +659,7 @@ class SocketMailTransport
         }
         if (head != null && head.isComplete) {
           return parseWhole(
-            utf8.decode(head.prefix!, allowMalformed: true),
+            latin1.decode(head.prefix!),
             head.flags,
             head.internalDate,
           );
@@ -678,10 +679,10 @@ class SocketMailTransport
           'HEADER',
           for (final part in textParts) ...['${part.partId}.MIME', part.partId],
         ]);
-        String sectionText(String name) => utf8.decode(
-          sections[name.toUpperCase()] ?? const <int>[],
-          allowMalformed: true,
-        );
+        // Binary strings, like whole raw messages; the MIME parser decodes
+        // each part with its own charset.
+        String sectionText(String name) =>
+            latin1.decode(sections[name.toUpperCase()] ?? const <int>[]);
         var plain = '';
         var html = '';
         for (final part in textParts) {
@@ -1218,7 +1219,6 @@ _ParsedMimeEntity _parseMimeEntity(String raw, {String partId = ''}) {
     );
   }
 
-  final decodedBody = _decodeBody(body, transferEncoding);
   final filename =
       disposition.params['filename'] ?? contentType.params['name'] ?? '';
   final lowerContentType = contentType.value.toLowerCase();
@@ -1226,6 +1226,14 @@ _ParsedMimeEntity _parseMimeEntity(String raw, {String partId = ''}) {
   final isAttachment =
       lowerDisposition == 'attachment' ||
       (filename.isNotEmpty && lowerDisposition != 'inline');
+  final decodedBody =
+      isAttachment
+          ? ''
+          : _decodeBody(
+            body,
+            transferEncoding,
+            charset: contentType.params['charset'],
+          );
   return _ParsedMimeEntity(
     headers: headers,
     body:
@@ -1270,7 +1278,9 @@ Map<String, String> _parseHeaders(String rawHeaders) {
     currentName = line.substring(0, index).toLowerCase();
     headers[currentName] = line.substring(index + 1).trim();
   }
-  return headers;
+  return headers.map(
+    (name, value) => MapEntry(name, decodeRawHeaderText(value)),
+  );
 }
 
 _HeaderValue _parseHeaderValue(String value) {
@@ -1316,19 +1326,26 @@ List<String> _splitMultipart(String body, String boundary) {
   return parts;
 }
 
-String _decodeBody(String body, String transferEncoding) {
+/// Decodes a text part. [body] is normally a latin1 binary string of the raw
+/// bytes; text that is already decoded (code units above 0xFF) is kept.
+String _decodeBody(String body, String transferEncoding, {String? charset}) {
   final normalized = transferEncoding.toLowerCase();
+  final List<int> bytes;
   if (normalized == 'base64') {
     try {
-      return utf8.decode(_decodeBase64Body(body), allowMalformed: true);
+      bytes = _decodeBase64Body(body);
     } on FormatException {
       return body;
     }
+  } else if (normalized == 'quoted-printable') {
+    if (binaryStringBytes(body) == null) return _decodeQuotedPrintable(body);
+    bytes = _decodeQuotedPrintableBytes(body);
+  } else {
+    final raw = binaryStringBytes(body);
+    if (raw == null) return body;
+    bytes = raw;
   }
-  if (normalized == 'quoted-printable') {
-    return _decodeQuotedPrintable(body);
-  }
-  return body;
+  return decodeMailText(bytes, charset);
 }
 
 List<int> _decodeTransferBytes(List<int> body, String transferEncoding) {
@@ -1355,7 +1372,7 @@ int? _decodedSize(String body, String transferEncoding) {
       return null;
     }
   }
-  return utf8.encode(body).length;
+  return binaryStringBytes(body)?.length ?? utf8.encode(body).length;
 }
 
 List<int> _decodeBase64Body(String value) {
@@ -1488,17 +1505,8 @@ List<int> _decodeHeaderQuotedPrintable(String value) {
 }
 
 String _decodeHeaderBytes(List<int> bytes, String charset) {
-  final normalized = charset.trim().toLowerCase();
-  if (normalized == 'utf-8' || normalized == 'utf8') {
-    return utf8.decode(bytes, allowMalformed: true);
-  }
-  if (normalized == 'us-ascii' || normalized == 'ascii') {
-    return ascii.decode(bytes, allowInvalid: true);
-  }
-  if (normalized == 'iso-8859-1' || normalized == 'latin1') {
-    return latin1.decode(bytes, allowInvalid: true);
-  }
-  return utf8.decode(bytes, allowMalformed: true);
+  // RFC 2231 language suffix: =?UTF-8*en?...
+  return decodeMailText(bytes, charset.split('*').first);
 }
 
 List<String> _parseAddressHeader(String value) {
@@ -1998,9 +2006,7 @@ class _ImapConnection {
       'UID FETCH $uid (FLAGS INTERNALDATE BODY.PEEK[])',
     );
     return _FetchedImapMessage(
-      raw: response.chunks
-          .map((bytes) => utf8.decode(bytes, allowMalformed: true))
-          .join('\n'),
+      raw: response.chunks.map((bytes) => latin1.decode(bytes)).join('\n'),
       flags: _parseFetchFlags(response.lines),
       internalDate: _parseFetchInternalDate(response.lines),
     );
@@ -2011,9 +2017,7 @@ class _ImapConnection {
       'UID FETCH $uid (FLAGS INTERNALDATE BODY.PEEK[]<0.$_messagePreviewFetchBytes>)',
     );
     return _FetchedImapMessage(
-      raw: response.chunks
-          .map((bytes) => utf8.decode(bytes, allowMalformed: true))
-          .join('\n'),
+      raw: response.chunks.map((bytes) => latin1.decode(bytes)).join('\n'),
       flags: _parseFetchFlags(response.lines),
       internalDate: _parseFetchInternalDate(response.lines),
     );
@@ -2041,9 +2045,7 @@ class _ImapConnection {
         continue;
       }
       fetchedByUid[uid] = _FetchedImapMessage(
-        raw: response.chunks
-            .map((bytes) => utf8.decode(bytes, allowMalformed: true))
-            .join('\n'),
+        raw: response.chunks.map((bytes) => latin1.decode(bytes)).join('\n'),
         flags: _parseFetchFlags(response.lines),
         internalDate: _parseFetchInternalDate(response.lines),
       );
