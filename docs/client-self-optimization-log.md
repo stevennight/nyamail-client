@@ -622,3 +622,45 @@ Validation:
 - `flutter test --no-pub` completed with 200 passing tests. Tests use fake
   loopback IMAP/cache data only; no live mailbox was accessed.
 - No git commit or release build was made in this round.
+
+## 2026-09-26 Round 20 - Push, Background Sync and Cache Storage
+
+Focus: new-mail notifications that actually fire outside the foreground, and
+refreshes whose cost no longer grows with the mailbox.
+
+Implemented:
+
+- Desktop keeps polling while the window is hidden in the tray or minimized;
+  before, the `hidden` lifecycle state stopped the timer, so notifications
+  only fired with the window open. Focus changes no longer force a full
+  refresh.
+- IMAP IDLE push (`ImapIdleWatcher`): one dedicated connection per account
+  watches the inbox, reconnects with backoff and reports a catch-up change
+  after reconnecting. While every account idles, polling backs off from 1 to
+  5 minutes. Servers without IDLE keep 1-minute polling.
+- Refreshes skip previews that are already cached and only fetch FLAGS for
+  them (`CacheAwareMailTransport`), so read/starred changes made elsewhere
+  sync on every refresh, including incremental ones.
+- Opening a message fetches flags, size, BODYSTRUCTURE and the first 256 KB in
+  one command. Larger multipart messages fetch only the header and text
+  parts; attachments are listed from the structure and downloaded on demand.
+- Android: opt-in foreground service (System behavior > Keep checking in the
+  background) plus a process-level cached Flutter engine, so the unlocked
+  vault, IDLE connections and timers survive the activity. No credentials are
+  persisted for it. Background refreshes hold a bounded wake lock.
+- The mail cache moved from whole-file encrypted JSON to SQLite with one
+  encrypted row per message and keyed-hash row ids; one database per cache
+  secret. Legacy JSON caches are imported once.
+- `mail_home_page.dart` split into part files under `lib/src/ui/mail_home/`.
+- Gradle 8.14.3 / AGP 8.11.1, the minimums of the current Flutter SDK.
+
+Validation:
+
+- New tests for IDLE (push, reconnect, unsupported server, stop), flag-only
+  sync, BODYSTRUCTURE parsing and partial body fetch, and SQLite row writes,
+  reload and legacy import; all against loopback fakes.
+- `flutter analyze --no-pub`: only the 4 pre-existing warnings.
+- `flutter test --no-pub`: 254 passing.
+- `flutter build apk --debug` succeeds. A local Windows build could not run
+  because `nuget.exe` (needed by flutter_inappwebview_windows) is missing.
+- Not yet exercised against live mailboxes or on a real Android device.
