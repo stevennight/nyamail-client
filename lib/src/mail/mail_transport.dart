@@ -5,9 +5,15 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 
+import 'imap_body_structure.dart';
 import 'mail_models.dart';
 
 const _messagePreviewFetchBytes = 8 * 1024;
+
+/// Messages up to this size are fetched whole when opened; one round trip is
+/// cheaper than structure + sections. Larger ones (usually attachments) only
+/// fetch their text parts.
+const _wholeMessageFetchThreshold = 256 * 1024;
 const _rfc822BackgroundParseThreshold = 48 * 1024;
 const _uidSearchBackgroundParseThreshold = 48 * 1024;
 const _uidPageBackgroundSelectionThreshold = 4096;
@@ -618,21 +624,113 @@ class SocketMailTransport
       credential,
       selectMailbox: folderName,
       action: (imap) async {
-        final fetched = await imap.uidFetchMessage(_imapUid(message.id));
-        return _parseFetchedRfc822Message(
-          _Rfc822ParseRequest(
-            raw: fetched.raw,
-            id: message.id,
-            accountId: credential.accountId,
-            mailbox: message.mailbox,
-            folderPath: folderName,
-            folderDisplayName: message.folderDisplayName,
-            read: fetched.flags.contains(r'\Seen'),
-            starred: fetched.flags.contains(r'\Flagged'),
-            bodyLoaded: true,
-            receivedAt: fetched.internalDate,
-            fallbackReceivedAt: message.receivedAt,
-          ),
+        final uid = _imapUid(message.id);
+        Future<MailMessage> parseWhole(
+          String raw,
+          Set<String> flags,
+          DateTime? internalDate,
+        ) {
+          return _parseFetchedRfc822Message(
+            _Rfc822ParseRequest(
+              raw: raw,
+              id: message.id,
+              accountId: credential.accountId,
+              mailbox: message.mailbox,
+              folderPath: folderName,
+              folderDisplayName: message.folderDisplayName,
+              read: flags.contains(r'\Seen'),
+              starred: flags.contains(r'\Flagged'),
+              bodyLoaded: true,
+              receivedAt: internalDate,
+              fallbackReceivedAt: message.receivedAt,
+            ),
+          );
+        }
+
+        _FetchedStructure? head;
+        try {
+          head = await imap.uidFetchStructure(
+            uid,
+            prefixBytes: _wholeMessageFetchThreshold,
+          );
+        } on MailTransportException {
+          head = null;
+        }
+        if (head != null && head.isComplete) {
+          return parseWhole(
+            utf8.decode(head.prefix!, allowMalformed: true),
+            head.flags,
+            head.internalDate,
+          );
+        }
+        final structure = head?.structure;
+        if (head == null || structure == null || !structure.isMultipart) {
+          final fetched = await imap.uidFetchMessage(uid);
+          return parseWhole(fetched.raw, fetched.flags, fetched.internalDate);
+        }
+
+        // Large multipart message: fetch only the header and the text parts;
+        // attachments come from the structure and download on demand.
+        final textParts = structure.leaves
+            .where((part) => part.isText)
+            .toList(growable: false);
+        final sections = await imap.uidFetchSections(uid, [
+          'HEADER',
+          for (final part in textParts) ...['${part.partId}.MIME', part.partId],
+        ]);
+        String sectionText(String name) => utf8.decode(
+          sections[name.toUpperCase()] ?? const <int>[],
+          allowMalformed: true,
+        );
+        var plain = '';
+        var html = '';
+        for (final part in textParts) {
+          var mime = sectionText('${part.partId}.MIME');
+          if (!mime.endsWith('\r\n\r\n') && !mime.endsWith('\n\n')) {
+            mime = '${mime.trimRight()}\r\n\r\n';
+          }
+          final entity = _parseMimeEntity(
+            '$mime${sectionText(part.partId)}',
+            partId: part.partId,
+          );
+          if (part.subtype == 'plain' && plain.trim().isEmpty) {
+            plain = entity.body;
+          } else if (part.subtype == 'html' && html.trim().isEmpty) {
+            html = entity.htmlBody;
+          }
+        }
+        return _mailMessageFromParts(
+          headers: _parseHeaders(sectionText('HEADER')),
+          body: plain.trim().isNotEmpty ? plain : _htmlToText(html),
+          htmlBody: html,
+          attachments: [
+            for (final part in structure.leaves)
+              if (part.isAttachment ||
+                  (part.type == 'message' && part.subtype == 'rfc822'))
+                MailAttachment(
+                  filename: _decodeHeader(
+                    part.filename.isEmpty
+                        ? (part.type == 'message'
+                            ? 'message.eml'
+                            : 'attachment')
+                        : part.filename,
+                  ),
+                  contentType: part.mimeType,
+                  partId: part.partId,
+                  transferEncoding: part.encoding,
+                  size: part.decodedSize,
+                ),
+          ],
+          id: message.id,
+          accountId: credential.accountId,
+          mailbox: message.mailbox,
+          folderPath: folderName,
+          folderDisplayName: message.folderDisplayName,
+          read: head.flags.contains(r'\Seen'),
+          starred: head.flags.contains(r'\Flagged'),
+          bodyLoaded: true,
+          receivedAt: head.internalDate,
+          fallbackReceivedAt: message.receivedAt,
         );
       },
     );
@@ -992,14 +1090,47 @@ MailMessage parseRfc822Message(
   DateTime? fallbackReceivedAt,
 }) {
   final parsed = _parseMimeEntity(raw);
-  final headers = parsed.headers;
+  return _mailMessageFromParts(
+    headers: parsed.headers,
+    body: parsed.bestBody,
+    htmlBody: parsed.htmlBody,
+    attachments: parsed.attachments,
+    id: id,
+    accountId: accountId,
+    mailbox: mailbox,
+    folderPath: folderPath,
+    folderDisplayName: folderDisplayName,
+    read: read,
+    starred: starred,
+    bodyLoaded: bodyLoaded,
+    receivedAt: receivedAt,
+    fallbackReceivedAt: fallbackReceivedAt,
+  );
+}
+
+MailMessage _mailMessageFromParts({
+  required Map<String, String> headers,
+  required String body,
+  required String htmlBody,
+  required List<MailAttachment> attachments,
+  required String id,
+  required String accountId,
+  required MailboxKind mailbox,
+  required String folderPath,
+  required String folderDisplayName,
+  required bool read,
+  required bool starred,
+  required bool bodyLoaded,
+  DateTime? receivedAt,
+  DateTime? fallbackReceivedAt,
+}) {
   final date =
       receivedAt?.toUtc() ??
       _parseMailDate(headers['date'] ?? '') ??
       fallbackReceivedAt?.toUtc() ??
       DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
-  final body = parsed.bestBody.replaceAll('\r\n', '\n').trim();
-  final htmlBody = parsed.htmlBody.replaceAll('\r\n', '\n').trim();
+  body = body.replaceAll('\r\n', '\n').trim();
+  htmlBody = htmlBody.replaceAll('\r\n', '\n').trim();
   final preview = body.replaceAll(RegExp(r'\s+'), ' ').trim();
   return MailMessage(
     id: id,
@@ -1020,8 +1151,8 @@ MailMessage parseRfc822Message(
     folderDisplayName: folderDisplayName,
     read: read,
     starred: starred,
-    hasAttachments: parsed.attachments.isNotEmpty,
-    attachments: parsed.attachments,
+    hasAttachments: attachments.isNotEmpty,
+    attachments: attachments,
     bodyLoaded: bodyLoaded,
   );
 }
@@ -1920,6 +2051,108 @@ class _ImapConnection {
     return fetchedByUid;
   }
 
+  /// Fetches size, flags, BODYSTRUCTURE and the first [prefixBytes] of one
+  /// message in a single round trip. When the message fits in the prefix the
+  /// caller already has all of it. Other literals inside the response are
+  /// inlined as quoted strings so the structure parses as one line.
+  Future<_FetchedStructure> uidFetchStructure(
+    int uid, {
+    required int prefixBytes,
+  }) async {
+    final tag = _nextTag();
+    _socket.write(
+      '$tag UID FETCH $uid (UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE '
+      'BODY.PEEK[]<0.$prefixBytes>)\r\n',
+    );
+    final prefixPattern = RegExp(
+      r'BODY\[\]<0>\s+\{\d+\}$',
+      caseSensitive: false,
+    );
+    List<int>? prefix;
+    final logical = <String>[];
+    final current = StringBuffer();
+    while (true) {
+      final line = await _reader.readLine().timeout(
+        const Duration(seconds: 30),
+      );
+      if (current.isEmpty && line.startsWith('$tag OK')) break;
+      if (current.isEmpty &&
+          (line.startsWith('$tag NO') || line.startsWith('$tag BAD'))) {
+        throw MailTransportException('IMAP fetch failed: $line');
+      }
+      final literal = RegExp(r'\{(\d+)\}$').firstMatch(line);
+      if (literal == null) {
+        current.write(line);
+        logical.add(current.toString());
+        current.clear();
+        continue;
+      }
+      final bytes = await _reader
+          .readBytes(int.parse(literal.group(1)!))
+          .timeout(const Duration(seconds: 30));
+      if (prefixPattern.hasMatch(line)) {
+        prefix = bytes;
+        current
+          ..write(line.substring(0, literal.start))
+          ..write('NIL');
+        continue;
+      }
+      final text = utf8.decode(bytes, allowMalformed: true);
+      current
+        ..write(line.substring(0, literal.start))
+        ..write('"${text.replaceAll(r'\', r'\\').replaceAll('"', r'\"')}"');
+    }
+    for (final line in logical) {
+      if (!line.startsWith('* ') || !line.toUpperCase().contains(' FETCH ')) {
+        continue;
+      }
+      final size = RegExp(
+        r'\bRFC822\.SIZE\s+(\d+)',
+        caseSensitive: false,
+      ).firstMatch(line);
+      return _FetchedStructure(
+        size: size == null ? null : int.parse(size.group(1)!),
+        structure: parseBodyStructureFromFetch(line),
+        flags: _parseFetchFlags([line]),
+        internalDate: _parseFetchInternalDate([line]),
+        prefix: prefix,
+      );
+    }
+    throw const MailTransportException('IMAP fetch returned no structure');
+  }
+
+  /// Fetches several body sections of one message in a single round trip,
+  /// keyed by upper-case section name (e.g. `HEADER`, `1.2.MIME`, `1.2`).
+  Future<Map<String, List<int>>> uidFetchSections(
+    int uid,
+    List<String> sections,
+  ) async {
+    final tag = _nextTag();
+    final items = sections.map((section) => 'BODY.PEEK[$section]').join(' ');
+    _socket.write('$tag UID FETCH $uid ($items)\r\n');
+    final result = <String, List<int>>{};
+    final sectionPattern = RegExp(
+      r'BODY\[([^\]]*)\](?:<\d+>)?\s+\{(\d+)\}$',
+      caseSensitive: false,
+    );
+    while (true) {
+      final line = await _reader.readLine().timeout(
+        const Duration(seconds: 30),
+      );
+      if (line.startsWith('$tag OK')) return result;
+      if (line.startsWith('$tag NO') || line.startsWith('$tag BAD')) {
+        throw MailTransportException('IMAP fetch failed: $line');
+      }
+      final literal = RegExp(r'\{(\d+)\}$').firstMatch(line);
+      if (literal == null) continue;
+      final bytes = await _reader
+          .readBytes(int.parse(literal.group(1)!))
+          .timeout(const Duration(seconds: 30));
+      final section = sectionPattern.firstMatch(line)?.group(1);
+      if (section != null) result[section.toUpperCase()] = bytes;
+    }
+  }
+
   /// Fetches only the flags of [uids]; keyed by UID.
   Future<Map<int, Set<String>>> uidFetchFlags(Iterable<int> uids) async {
     final requested = LinkedHashSet<int>.of(
@@ -2425,6 +2658,30 @@ class _FetchedImapMessage {
   final String raw;
   final Set<String> flags;
   final DateTime? internalDate;
+}
+
+class _FetchedStructure {
+  const _FetchedStructure({
+    required this.size,
+    required this.structure,
+    required this.flags,
+    this.internalDate,
+    this.prefix,
+  });
+
+  final int? size;
+  final ImapBodyPart? structure;
+  final Set<String> flags;
+  final DateTime? internalDate;
+
+  /// The first bytes of the raw message; all of it when [isComplete].
+  final List<int>? prefix;
+
+  bool get isComplete {
+    final bytes = prefix;
+    final total = size;
+    return bytes != null && total != null && bytes.length >= total;
+  }
 }
 
 class _FetchLiteralResponse {
