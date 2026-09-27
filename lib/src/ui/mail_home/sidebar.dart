@@ -13,6 +13,8 @@ class _Sidebar extends StatefulWidget {
     required this.onAddMailbox,
     required this.onDeleteAccount,
     required this.onResolveAccountFailure,
+    this.onCompose,
+    this.onSettings,
   });
 
   final List<MailAccount> accounts;
@@ -25,13 +27,17 @@ class _Sidebar extends StatefulWidget {
   final ValueChanged<MailAccount> onDeleteAccount;
   final ValueChanged<MailAccount> onResolveAccountFailure;
 
+  /// Compose and settings live in the sidebar when there is no app bar.
+  final VoidCallback? onCompose;
+  final VoidCallback? onSettings;
+
   @override
   State<_Sidebar> createState() => _SidebarState();
 }
 
 class _SidebarState extends State<_Sidebar> {
   static const _sidebarTileShape = RoundedRectangleBorder(
-    borderRadius: BorderRadius.all(Radius.circular(24)),
+    borderRadius: BorderRadius.all(Radius.circular(kNyaRadius)),
   );
 
   final _folderFilter = TextEditingController();
@@ -44,6 +50,8 @@ class _SidebarState extends State<_Sidebar> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
     final filter = _folderFilter.text.trim().toLowerCase();
     final smartFolders = [
       for (final item in MailSmartFolder.values)
@@ -66,75 +74,122 @@ class _SidebarState extends State<_Sidebar> {
       accountWidgets.add(_buildAccountSection(account, visibleFolders, filter));
     }
     final hasMatches = smartFolders.isNotEmpty || accountWidgets.isNotEmpty;
-    return SizedBox(
-      width: 250,
-      child: ListView(
-        padding: const EdgeInsets.all(12),
+    final sectionStyle = theme.textTheme.labelMedium?.copyWith(
+      color: colorScheme.onSurfaceVariant,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0.2,
+    );
+    final onSettings = widget.onSettings;
+    return Container(
+      width: 256,
+      color: colorScheme.surfaceContainerLow,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SearchBar(
-            controller: _folderFilter,
-            hintText: 'Search folders',
-            leading: const Icon(Icons.search),
-            trailing:
-                filter.isEmpty
-                    ? null
-                    : [
+          if (onSettings != null) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 8, 6),
+              child: Row(
+                children: [
+                  Icon(Icons.mail_rounded, color: colorScheme.primary),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text('NyaMail', style: theme.textTheme.titleMedium),
+                  ),
+                  IconButton(
+                    tooltip: 'Settings',
+                    onPressed: onSettings,
+                    icon: const Icon(Icons.settings_outlined),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: FilledButton.icon(
+                onPressed: widget.onCompose,
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(44),
+                ),
+                icon: const Icon(Icons.edit_outlined, size: 20),
+                label: const Text('New message'),
+              ),
+            ),
+          ],
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(8, 4, 8, 12),
+              children: [
+                for (final item in smartFolders)
+                  _SidebarTile(
+                    icon: _iconForSmartFolder(item),
+                    label: _labelForSmartFolder(item),
+                    selected: widget.view.smartFolder == item,
+                    onTap: () => widget.onViewChanged(MailboxView.smart(item)),
+                  ),
+                const SizedBox(height: 14),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 4, 2),
+                  child: Row(
+                    children: [
+                      Expanded(child: Text('Accounts', style: sectionStyle)),
                       IconButton(
-                        tooltip: 'Clear folder search',
-                        onPressed: () {
-                          _folderFilter.clear();
-                          setState(() {});
-                        },
-                        icon: const Icon(Icons.close),
+                        tooltip: 'Add mailbox',
+                        visualDensity: VisualDensity.compact,
+                        iconSize: 20,
+                        onPressed: widget.onAddMailbox,
+                        icon: const Icon(Icons.add),
                       ),
                     ],
-            onChanged: (_) => setState(() {}),
-          ),
-          const SizedBox(height: 16),
-          Text('Smart Folders', style: Theme.of(context).textTheme.labelLarge),
-          const SizedBox(height: 8),
-          for (final item in smartFolders)
-            ListTile(
-              selected: widget.view.smartFolder == item,
-              selectedColor: Theme.of(context).colorScheme.onSecondaryContainer,
-              selectedTileColor:
-                  Theme.of(context).colorScheme.secondaryContainer,
-              shape: _sidebarTileShape,
-              leading: Icon(_iconForSmartFolder(item)),
-              title: Text(_labelForSmartFolder(item)),
-              dense: true,
-              onTap: () => widget.onViewChanged(MailboxView.smart(item)),
-            ),
-          const SizedBox(height: 18),
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Accounts',
-                  style: Theme.of(context).textTheme.labelLarge,
+                  ),
                 ),
-              ),
-              IconButton(
-                tooltip: 'Add mailbox',
-                onPressed: widget.onAddMailbox,
-                icon: const Icon(Icons.add),
-              ),
-            ],
+                if (hasMatches)
+                  ...accountWidgets
+                else
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 24),
+                    child: Text(
+                      'No matching folders',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
-          const SizedBox(height: 8),
-          if (hasMatches)
-            ...accountWidgets
-          else
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 24),
-              child: Text(
-                'No matching folders',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+            child: SizedBox(
+              height: 36,
+              child: TextField(
+                controller: _folderFilter,
+                style: theme.textTheme.bodyMedium,
+                textAlignVertical: TextAlignVertical.center,
+                decoration: InputDecoration(
+                  hintText: 'Filter folders',
+                  fillColor: colorScheme.surfaceContainerHigh,
+                  contentPadding: EdgeInsets.zero,
+                  prefixIcon: const Icon(Icons.filter_list, size: 18),
+                  prefixIconConstraints: const BoxConstraints(minWidth: 36),
+                  suffixIcon:
+                      filter.isEmpty
+                          ? null
+                          : IconButton(
+                            tooltip: 'Clear folder filter',
+                            iconSize: 16,
+                            onPressed: () {
+                              _folderFilter.clear();
+                              setState(() {});
+                            },
+                            icon: const Icon(Icons.close),
+                          ),
                 ),
+                onChanged: (_) => setState(() {}),
               ),
             ),
+          ),
         ],
       ),
     );
@@ -151,7 +206,13 @@ class _SidebarState extends State<_Sidebar> {
         failure?.authenticationRequired == true
             ? 'Authorization required'
             : 'Sync failed';
-    final colorScheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final accent = _accountAccentColor(account.id, colorScheme);
+    final name =
+        account.displayName.trim().isEmpty
+            ? account.address
+            : account.displayName;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onSecondaryTapDown:
@@ -173,88 +234,104 @@ class _SidebarState extends State<_Sidebar> {
                   MediaQuery.sizeOf(context).height / 3,
                 ),
               ),
-      child: ExpansionTile(
-        key:
-            filtering
-                ? ValueKey('filtered-account-${account.id}')
-                : PageStorageKey('account-${account.id}'),
-        initiallyExpanded:
-            filtering ||
-            widget.view.folder?.accountId == account.id ||
-            widget.accounts.length == 1,
-        leading: Icon(
-          failure == null
-              ? Icons.alternate_email
-              : failure.authenticationRequired
-              ? Icons.key_off_outlined
-              : Icons.sync_problem_outlined,
-          color: failure == null ? null : colorScheme.error,
-        ),
-        title: Row(
-          children: [
-            Expanded(
-              child: Text(
-                account.displayName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+      child: Theme(
+        data: theme.copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          key:
+              filtering
+                  ? ValueKey('filtered-account-${account.id}')
+                  : PageStorageKey('account-${account.id}'),
+          initiallyExpanded:
+              filtering ||
+              widget.view.folder?.accountId == account.id ||
+              widget.accounts.length == 1,
+          dense: true,
+          shape: _sidebarTileShape,
+          collapsedShape: _sidebarTileShape,
+          tilePadding: const EdgeInsets.only(left: 10, right: 6),
+          childrenPadding: const EdgeInsets.only(bottom: 4),
+          minTileHeight: 48,
+          leading: Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color:
+                  failure == null
+                      ? accent.withValues(alpha: 0.18)
+                      : colorScheme.errorContainer,
+              shape: BoxShape.circle,
             ),
-            if (failure != null)
-              IconButton(
-                tooltip:
-                    failure.authenticationRequired
-                        ? 'Reauthorize ${account.address}'
-                        : 'Retry ${account.address}',
-                visualDensity: VisualDensity.compact,
-                onPressed: () => widget.onResolveAccountFailure(account),
-                icon: Icon(
-                  failure.authenticationRequired ? Icons.key : Icons.refresh,
-                  size: 18,
+            child:
+                failure == null
+                    ? Text(
+                      _senderInitial(name),
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: accent,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    )
+                    : Icon(
+                      failure.authenticationRequired
+                          ? Icons.key_off_outlined
+                          : Icons.sync_problem_outlined,
+                      size: 15,
+                      color: colorScheme.onErrorContainer,
+                    ),
+          ),
+          title: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
+              ),
+              if (failure != null)
+                IconButton(
+                  tooltip:
+                      failure.authenticationRequired
+                          ? 'Reauthorize ${account.address}'
+                          : 'Retry ${account.address}',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => widget.onResolveAccountFailure(account),
+                  icon: Icon(
+                    failure.authenticationRequired ? Icons.key : Icons.refresh,
+                    size: 18,
+                  ),
+                ),
+            ],
+          ),
+          subtitle: Text(
+            failure == null ? account.address : failureLabel,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color:
+                  failure == null
+                      ? colorScheme.onSurfaceVariant
+                      : colorScheme.error,
+            ),
+          ),
+          children: [
+            for (final folder in visibleFolders)
+              _SidebarTile(
+                icon: _iconForMailbox(folder.kind),
+                label: folder.displayName,
+                tooltip:
+                    folder.effectiveDisplayPath == folder.displayName
+                        ? null
+                        : folder.effectiveDisplayPath,
+                indent: 22,
+                selected: widget.view.folder?.key == folder.key,
+                onTap: () => widget.onViewChanged(MailboxView.folder(folder)),
               ),
           ],
         ),
-        subtitle: Text(
-          failure == null
-              ? account.address
-              : '$failureLabel\n${account.address}',
-          maxLines: failure == null ? 1 : 2,
-          overflow: TextOverflow.ellipsis,
-          style: failure == null ? null : TextStyle(color: colorScheme.error),
-        ),
-        children: [
-          for (final folder in visibleFolders)
-            Builder(
-              builder: (context) {
-                final folderPathLabel = folder.effectiveDisplayPath;
-                return ListTile(
-                  contentPadding: const EdgeInsets.only(left: 56, right: 12),
-                  selected: widget.view.folder?.key == folder.key,
-                  selectedColor:
-                      Theme.of(context).colorScheme.onSecondaryContainer,
-                  selectedTileColor:
-                      Theme.of(context).colorScheme.secondaryContainer,
-                  shape: _sidebarTileShape,
-                  leading: Icon(_iconForMailbox(folder.kind), size: 18),
-                  title: Text(
-                    folder.displayName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle:
-                      folderPathLabel == folder.displayName
-                          ? null
-                          : Text(
-                            folderPathLabel,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                  dense: true,
-                  onTap: () => widget.onViewChanged(MailboxView.folder(folder)),
-                );
-              },
-            ),
-        ],
       ),
     );
   }
@@ -321,3 +398,77 @@ class _SidebarState extends State<_Sidebar> {
 }
 
 enum _AccountContextAction { settings, delete }
+
+/// Compact, rounded navigation row used for smart folders and account folders.
+class _SidebarTile extends StatelessWidget {
+  const _SidebarTile({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.indent = 0,
+    this.tooltip,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final double indent;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final foreground =
+        selected ? colorScheme.onPrimaryContainer : colorScheme.onSurface;
+    final tile = Padding(
+      padding: EdgeInsets.only(left: indent, bottom: 1),
+      child: Material(
+        color: selected ? colorScheme.primaryContainer : Colors.transparent,
+        borderRadius: BorderRadius.circular(kNyaRadius),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(kNyaRadius),
+          onTap: onTap,
+          child: SizedBox(
+            height: 36,
+            child: Row(
+              children: [
+                const SizedBox(width: 12),
+                Icon(
+                  icon,
+                  size: 19,
+                  color:
+                      selected
+                          ? colorScheme.primary
+                          : colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: foreground,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    final text = tooltip;
+    if (text == null) return tile;
+    return Tooltip(
+      message: text,
+      waitDuration: const Duration(milliseconds: 600),
+      child: tile,
+    );
+  }
+}

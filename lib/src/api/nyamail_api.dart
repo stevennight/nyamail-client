@@ -5,12 +5,19 @@ import 'package:http/http.dart' as http;
 import 'models.dart';
 
 class NyaMailApi {
-  NyaMailApi({required String baseUrl, http.Client? client})
-    : _baseUri = Uri.parse(baseUrl),
-      _client = client ?? http.Client();
+  NyaMailApi({
+    required String baseUrl,
+    http.Client? client,
+    this.requestTimeout = const Duration(seconds: 20),
+  }) : _baseUri = Uri.parse(baseUrl),
+       _client = client ?? http.Client();
 
   final Uri _baseUri;
   final http.Client _client;
+
+  /// Upper bound for one request. An unreachable self-hosted server must not
+  /// hold up mail refreshes that wait on vault sync.
+  final Duration requestTimeout;
 
   Future<AuthSession> register({
     required String email,
@@ -127,7 +134,9 @@ class NyaMailApi {
     final uri = _resolve('/v1/sync/pull').replace(
       queryParameters: {'after': after.toString(), 'limit': limit.toString()},
     );
-    final response = await _client.get(uri, headers: _headers(token));
+    final response = await _client
+        .get(uri, headers: _headers(token))
+        .timeout(requestTimeout);
     return SyncPullResult.fromJson(_decode(response));
   }
 
@@ -149,15 +158,14 @@ class NyaMailApi {
         if (arch.isNotEmpty) 'arch': arch,
       },
     );
-    final response = await _client.get(uri);
+    final response = await _client.get(uri).timeout(requestTimeout);
     return ReleaseCheckResult.fromJson(_decode(response));
   }
 
   Future<dynamic> _get(String path, {String? token}) async {
-    final response = await _client.get(
-      _resolve(path),
-      headers: _headers(token),
-    );
+    final response = await _client
+        .get(_resolve(path), headers: _headers(token))
+        .timeout(requestTimeout);
     return _decode(response);
   }
 
@@ -166,11 +174,9 @@ class NyaMailApi {
     Map<String, Object?> body, {
     String? token,
   }) async {
-    final response = await _client.post(
-      _resolve(path),
-      headers: _headers(token),
-      body: jsonEncode(body),
-    );
+    final response = await _client
+        .post(_resolve(path), headers: _headers(token), body: jsonEncode(body))
+        .timeout(requestTimeout);
     final decoded = _decode(response);
     if (decoded == null) return <String, Object?>{};
     return (decoded as Map).cast<String, Object?>();
@@ -181,11 +187,9 @@ class NyaMailApi {
     Map<String, Object?> body, {
     String? token,
   }) async {
-    final response = await _client.put(
-      _resolve(path),
-      headers: _headers(token),
-      body: jsonEncode(body),
-    );
+    final response = await _client
+        .put(_resolve(path), headers: _headers(token), body: jsonEncode(body))
+        .timeout(requestTimeout);
     return _decode(response) as Map<String, Object?>;
   }
 

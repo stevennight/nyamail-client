@@ -15,6 +15,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../api/models.dart';
 import '../api/nyamail_api.dart';
+import '../app/app_theme.dart';
 import '../app/app_theme_settings.dart';
 import '../mail/mail_cache.dart';
 import '../mail/mail_draft_cache.dart';
@@ -63,6 +64,7 @@ import 'mail_html_view.dart';
 part 'mail_home/account_dialogs.dart';
 part 'mail_home/devices.dart';
 part 'mail_home/helpers.dart';
+part 'mail_home/list_entries.dart';
 part 'mail_home/mailbox_dialogs.dart';
 part 'mail_home/message_list.dart';
 part 'mail_home/reader_compose.dart';
@@ -74,6 +76,9 @@ part 'mail_home/vault_dialogs.dart';
 
 const _maxOutgoingAttachmentBytes = 25 * 1024 * 1024;
 const _googleAndroidOAuthClient = GoogleAndroidOAuthClient();
+
+/// More new messages than this in one refresh collapse into one notification.
+const _maxIndividualNewMailNotifications = 3;
 const _mailRefreshTimeout = Duration(seconds: 45);
 const _mailLoadMoreTimeout = Duration(seconds: 60);
 const _oauthRefreshTimeout = Duration(seconds: 20);
@@ -271,6 +276,7 @@ class MailHomePage extends StatefulWidget {
     required this.outlookAndroidOAuthClientSecret,
     required this.outlookAndroidOAuthRedirectUri,
     required this.mailRepository,
+    this.vaultMailRepositoryBuilder,
     super.key,
   });
 
@@ -299,6 +305,11 @@ class MailHomePage extends StatefulWidget {
   final String outlookAndroidOAuthClientSecret;
   final String outlookAndroidOAuthRedirectUri;
   final MailRepository mailRepository;
+
+  /// Builds the repository used once a vault is unlocked. Defaults to the
+  /// IMAP/SMTP-backed [CachedTransportMailRepository]; tests inject fakes.
+  final MailRepository Function(VaultDocument document)?
+  vaultMailRepositoryBuilder;
 
   @override
   State<MailHomePage> createState() => _MailHomePageState();
@@ -357,6 +368,10 @@ class _MailHomePageState extends State<MailHomePage>
   final _mobileMessageNotifiers = <String, ValueNotifier<MailMessage>>{};
   final _messageBodyLoads = <String, Future<MailMessage?>>{};
   final _startupService = const StartupService();
+
+  /// Theme picked in an open settings screen, until the app rebuilds this
+  /// page with the saved value.
+  AppThemeSetting? _appThemeSettingOverride;
   final _systemSettingsStore = const SystemBehaviorSettingsStore();
   final _trayService = NyaMailTrayService();
   final _notificationService = NyaMailNotificationService();
@@ -380,6 +395,9 @@ class _MailHomePageState extends State<MailHomePage>
   String? _pendingNotificationMessageId;
   bool _openingNotificationMessage = false;
   final _newMailNotificationBaseline = MailNotificationBaseline();
+
+  /// New-mail notifications currently posted, by message id.
+  final _shownNewMailNotifications = <String, MailMessage>{};
   late final LocalVaultAuthenticator _vaultAuthenticator =
       LocalVaultAuthenticator();
 
@@ -596,7 +614,14 @@ class _MailHomePageState extends State<MailHomePage>
     await _showMainWindowFromSystemSurface();
     if (!mounted || !_systemSettings.openMessageFromNotification) return;
     final messageId = notificationMessageIdFromPayload(payload);
-    if (messageId == null) return;
+    if (messageId == null) {
+      if (payload == newMailInboxNotificationPayload &&
+          _hasUnlockedLocalVault) {
+        Navigator.of(context).popUntil((route) => route.isFirst);
+        _changeView(const MailboxView.smart(MailSmartFolder.allIncoming));
+      }
+      return;
+    }
     _pendingNotificationMessageId = messageId;
     await _openPendingNotificationMessageIfReady();
   }
@@ -827,14 +852,6 @@ class _MailHomePageState extends State<MailHomePage>
           _newMailNotificationBaseline.startupPending) {
         await _pollNewMailForNotifications();
       }
-      if (!mounted) return;
-      await _discoverFoldersInBackground();
-      if (!mounted) return;
-      if (session != null) {
-        await _tryUnlockStoredVault(session);
-      }
-      if (!mounted) return;
-      await _checkUpdates(silent: true);
     } finally {
       _pendingStartupMailboxWork--;
       if (mounted && _pendingStartupMailboxWork == 0) {
@@ -842,6 +859,17 @@ class _MailHomePageState extends State<MailHomePage>
         if (_mailPushRefreshQueued) unawaited(_runQueuedMailPushRefresh());
       }
     }
+    // Folder discovery, server vault sync and the update check used to hold
+    // back automatic refresh and IMAP push until they finished; a slow or
+    // unreachable sync server then left the mailbox stale for minutes.
+    if (!mounted) return;
+    await _discoverFoldersInBackground();
+    if (!mounted) return;
+    if (session != null) {
+      await _tryUnlockStoredVault(session);
+    }
+    if (!mounted) return;
+    await _checkUpdates(silent: true);
   }
 
   /// Whether mail polling (and IDLE push) keeps running while the window is
@@ -1080,7 +1108,7 @@ class _MailHomePageState extends State<MailHomePage>
     await _refreshOAuthVaultIfNeeded();
     try {
       final page = await load().timeout(_mailRefreshTimeout);
-      return _retryPageAfterTargetedOAuthRefresh(page, load);
+      return await _retryPageAfterTargetedOAuthRefresh(page, load);
     } catch (error) {
       if (!looksLikeMailAuthenticationFailure(error)) rethrow;
       await _refreshOAuthVaultIfNeeded(force: true);
@@ -1108,7 +1136,7 @@ class _MailHomePageState extends State<MailHomePage>
       }
 
       final page = await load();
-      return _retryPageAfterTargetedOAuthRefresh(page, load);
+      return await _retryPageAfterTargetedOAuthRefresh(page, load);
     } catch (error) {
       if (!looksLikeMailAuthenticationFailure(error)) rethrow;
       await _refreshOAuthVaultIfNeeded(force: true);
@@ -1176,16 +1204,40 @@ class _MailHomePageState extends State<MailHomePage>
       messages.where(_isNotifiableIncomingUnread),
       completeStartupBaseline: completeStartupBaseline,
     );
+    _pruneShownNewMailNotifications(messages);
     if (!_systemSettings.newMailNotifications || fresh.isEmpty) return;
-    fresh.sort((a, b) => a.receivedAt.compareTo(b.receivedAt));
+    final announced = [
+      for (final message in fresh)
+        if (!_systemSettings.smartNotifications ||
+            message.effectiveCategory == MailCategory.people)
+          message,
+    ]..sort((a, b) => a.receivedAt.compareTo(b.receivedAt));
+    if (announced.isEmpty) return;
     final grouping = _systemSettings.notificationGrouping;
 
-    final byAccount = <String, List<MailMessage>>{};
-    for (final message in fresh) {
-      byAccount.putIfAbsent(message.accountId, () => []).add(message);
+    // A burst (first sync after a while, a newsletter drop, ...) becomes one
+    // notification instead of a column of toasts.
+    if (announced.length > _maxIndividualNewMailNotifications) {
+      final senders = <String>[];
+      for (final message in announced.reversed) {
+        final sender = _displaySender(message.from);
+        if (!senders.contains(sender)) senders.add(sender);
+      }
+      final shownSenders = senders.take(3).join(', ');
+      final moreSenders = senders.length - 3;
+      await _notificationService.showNewMailBurst(
+        title: '${announced.length} new messages',
+        body:
+            moreSenders > 0
+                ? '$shownSenders and $moreSenders more'
+                : shownSenders,
+        lines: _notificationSummaryLines(announced),
+      );
+      return;
     }
 
-    for (final message in fresh) {
+    for (final message in announced) {
+      _shownNewMailNotifications[message.id] = message;
       final content = MailNotificationContent.fromMessage(message);
       await _notificationService.showNewMail(
         notificationKey: message.id,
@@ -1199,28 +1251,65 @@ class _MailHomePageState extends State<MailHomePage>
     }
 
     if (grouping == NotificationGrouping.individual) return;
+    // Summaries count every notification still showing, not just this batch.
+    final shown = _shownNewMailNotifications.values.toList();
     if (grouping == NotificationGrouping.perAccount) {
-      for (final entry in byAccount.entries) {
+      final touchedAccounts = {
+        for (final message in announced) message.accountId,
+      };
+      for (final accountId in touchedAccounts) {
+        final accountMessages = [
+          for (final message in shown)
+            if (message.accountId == accountId) message,
+        ];
         await _notificationService.showNewMailSummary(
-          messageCount: entry.value.length,
-          lines: _notificationSummaryLines(entry.value),
-          accountLabel: _notificationAccountLabel(entry.key),
-          accountId: entry.key,
+          messageCount: accountMessages.length,
+          lines: _notificationSummaryLines(accountMessages),
+          accountLabel: _notificationAccountLabel(accountId),
+          accountId: accountId,
           grouping: grouping,
         );
       }
       return;
     }
-    // stack: one summary across every account.
+    final accountIds = {for (final message in shown) message.accountId};
     await _notificationService.showNewMailSummary(
-      messageCount: fresh.length,
-      lines: _notificationSummaryLines(fresh),
+      messageCount: shown.length,
+      lines: _notificationSummaryLines(shown),
       accountLabel:
-          byAccount.length == 1
-              ? _notificationAccountLabel(fresh.first.accountId)
+          accountIds.length == 1
+              ? _notificationAccountLabel(accountIds.first)
               : null,
       grouping: grouping,
     );
+  }
+
+  /// Drops notifications for mail that has been read (here or elsewhere) or
+  /// has left the incoming folders.
+  void _pruneShownNewMailNotifications(List<MailMessage> latest) {
+    if (_shownNewMailNotifications.isEmpty) return;
+    final latestById = {for (final message in latest) message.id: message};
+    final stale = [
+      for (final id in _shownNewMailNotifications.keys)
+        if (latestById[id] case final message?
+            when !_isNotifiableIncomingUnread(message))
+          id,
+    ];
+    for (final id in stale) {
+      _dismissNewMailNotification(id);
+    }
+  }
+
+  void _dismissNewMailNotification(String messageId) {
+    if (_shownNewMailNotifications.remove(messageId) == null) return;
+    unawaited(_notificationService.cancelNewMail(messageId));
+    if (_shownNewMailNotifications.isEmpty) {
+      unawaited(
+        _notificationService.cancelSummaries(
+          _accounts.map((account) => account.id),
+        ),
+      );
+    }
   }
 
   List<String> _notificationSummaryLines(List<MailMessage> messages) {
@@ -2177,13 +2266,17 @@ class _MailHomePageState extends State<MailHomePage>
                 ),
               )
               : null,
-      appBar: _MailHomeAppBar(
-        title: _labelForMailboxView(_view, _accounts),
-        onCompose: _accounts.isEmpty ? null : _showCompose,
-        onRefresh: _refreshingMail ? null : _loadMessages,
-        refreshing: _refreshingMail,
-        onSettings: _showSettings,
-      ),
+      appBar:
+          useFolderDrawer
+              ? _MailHomeAppBar(
+                title: _labelForMailboxView(_view, _accounts),
+                onCompose: _accounts.isEmpty || isMobile ? null : _showCompose,
+                showCompose: !isMobile,
+                onRefresh: _refreshingMail ? null : _loadMessages,
+                refreshing: _refreshingMail,
+                onSettings: _showSettings,
+              )
+              : null,
       floatingActionButton:
           isMobile && _accounts.isNotEmpty
               ? FloatingActionButton(
@@ -2250,6 +2343,9 @@ class _MailHomePageState extends State<MailHomePage>
                       onSelectAll: _selectAllVisibleMessages,
                       supportsMobileSwipe: _supportsMobileSwipe,
                       supportsDesktopContextMenu: _supportsDesktopContextMenu,
+                      groupBundles: _groupSmartInboxBundles,
+                      onMarkMessagesRead: _markMessagesRead,
+                      onPullToRefresh: _loadMessages,
                     );
                   }
                   final collapseSidebar =
@@ -2259,6 +2355,8 @@ class _MailHomePageState extends State<MailHomePage>
                       if (!collapseSidebar) ...[
                         _Sidebar(
                           accounts: _accounts,
+                          onCompose: _accounts.isEmpty ? null : _showCompose,
+                          onSettings: _showSettings,
                           folders: _folders,
                           accountFailures: _accountSyncFailures,
                           view: _view,
@@ -2306,6 +2404,12 @@ class _MailHomePageState extends State<MailHomePage>
                           supportsMobileSwipe: _supportsMobileSwipe,
                           supportsDesktopContextMenu:
                               _supportsDesktopContextMenu,
+                          groupBundles: _groupSmartInboxBundles,
+                          onMarkMessagesRead: _markMessagesRead,
+                          headerTitle:
+                              collapseSidebar
+                                  ? null
+                                  : _labelForMailboxView(_view, _accounts),
                         ),
                       ),
                       const VerticalDivider(width: 1),
@@ -2379,6 +2483,16 @@ class _MailHomePageState extends State<MailHomePage>
 
   bool get _canLoadMore => _hasMoreMessages;
 
+  bool get _groupSmartInboxBundles =>
+      _interactionSettings.smartInbox &&
+      _viewSupportsSmartInbox(_view) &&
+      _search.text.trim().isEmpty;
+
+  void _markMessagesRead(List<MailMessage> messages) {
+    if (messages.isEmpty) return;
+    _scheduleSetReadMessages(messages, true);
+  }
+
   Object? _handleComposeShortcut() {
     if (_shortcutShouldYieldToTextInput()) return null;
     if (_accounts.isEmpty) {
@@ -2439,16 +2553,19 @@ class _MailHomePageState extends State<MailHomePage>
         _messages.isEmpty) {
       return null;
     }
-    final currentId = _selected?.id;
-    final currentIndex = _messages.indexWhere(
-      (message) => message.id == currentId,
+    final order = _mailListNavigationOrder(
+      messages: _messages,
+      pinnedMessageIds: _pinnedMessageIds,
+      groupBundles: _groupSmartInboxBundles,
     );
+    final currentId = _selected?.id;
+    final currentIndex = order.indexWhere((message) => message.id == currentId);
     final targetIndex =
         currentIndex == -1
-            ? (delta > 0 ? 0 : _messages.length - 1)
-            : (currentIndex + delta).clamp(0, _messages.length - 1).toInt();
+            ? (delta > 0 ? 0 : order.length - 1)
+            : (currentIndex + delta).clamp(0, order.length - 1).toInt();
     if (targetIndex == currentIndex) return null;
-    _selectMessage(_messages[targetIndex], keyboardNavigationDirection: delta);
+    _selectMessage(order[targetIndex], keyboardNavigationDirection: delta);
     return null;
   }
 
@@ -2665,36 +2782,36 @@ class _MailHomePageState extends State<MailHomePage>
   Future<void> _showSettings() async {
     if (!mounted) return;
     final smallScreen = MediaQuery.sizeOf(context).width < 720;
-    final onAction = _runSettingsAction;
+    final environment = _SettingsEnvironment(
+      accounts: () => _accounts,
+      accountFailures: () => _accountSyncFailures,
+      profile: () => _profile,
+      onAction: _runSettingsAction,
+      onOpenAccount: _showMailboxSettings,
+      startupService: _startupService,
+      systemSettings: () => _systemSettings,
+      onSystemSettingsChanged: _setSystemBehaviorSettings,
+      themeSetting: () => _appThemeSettingOverride ?? widget.appThemeSetting,
+      onThemeSettingChanged: (setting) async {
+        _appThemeSettingOverride = setting;
+        await widget.onAppThemeSettingChanged(setting);
+      },
+      interactionSettings: () => _interactionSettings,
+      onInteractionSettingsChanged: _saveInteractionSettings,
+    );
     if (smallScreen) {
       await Navigator.of(context).push<void>(
         MaterialPageRoute(
-          fullscreenDialog: true,
-          builder:
-              (context) => _SettingsPage(
-                session: _session,
-                profile: _profile,
-                accountCount: _accounts.length,
-                claimingVaultShare: _claimingVaultShare,
-                hasPendingPairingQr: _pendingPairingPackage != null,
-                onAction: onAction,
-              ),
+          builder: (context) => _SettingsPage(environment: environment),
         ),
       );
     } else {
       await showDialog<void>(
         context: context,
-        builder:
-            (context) => _SettingsDialog(
-              session: _session,
-              profile: _profile,
-              accountCount: _accounts.length,
-              claimingVaultShare: _claimingVaultShare,
-              hasPendingPairingQr: _pendingPairingPackage != null,
-              onAction: onAction,
-            ),
+        builder: (context) => _SettingsDialog(environment: environment),
       );
     }
+    _appThemeSettingOverride = null;
   }
 
   Future<_SettingsActionResult> _runSettingsAction(
@@ -2751,9 +2868,6 @@ class _MailHomePageState extends State<MailHomePage>
         return true;
       case _SettingsAction.oauthProviderSettings:
         await _showOAuthProviderSettings();
-        return true;
-      case _SettingsAction.systemSettings:
-        await _showSystemSettings();
         return true;
       case _SettingsAction.about:
         await _showAbout();
@@ -2906,18 +3020,6 @@ class _MailHomePageState extends State<MailHomePage>
     );
     if (next == null || next == widget.appThemeSetting) return;
     await widget.onAppThemeSettingChanged(next);
-  }
-
-  Future<void> _showSystemSettings() async {
-    await showDialog<void>(
-      context: context,
-      builder:
-          (context) => _SystemSettingsDialog(
-            service: _startupService,
-            settings: _systemSettings,
-            onSettingsChanged: _setSystemBehaviorSettings,
-          ),
-    );
   }
 
   Future<void> _showAbout() async {
@@ -4563,6 +4665,11 @@ class _MailHomePageState extends State<MailHomePage>
     VaultDocument document, {
     String? localCacheSecret,
   }) {
+    final builder = widget.vaultMailRepositoryBuilder;
+    if (builder != null) {
+      _mailRepository = builder(document);
+      return;
+    }
     final cacheNamespace = _activeCacheNamespace();
     _mailRepository = CachedTransportMailRepository(
       cache: MailCache(
@@ -4598,8 +4705,20 @@ class _MailHomePageState extends State<MailHomePage>
     final current = _oauthRefreshFuture;
     if (current != null) return current;
     late final Future<OAuthVaultRefreshResult?> refresh;
+    // Best effort: an unreachable token endpoint must not fail refreshes or
+    // actions for every account. A token that really expired surfaces as an
+    // authentication failure, which retries with `force: true`.
     refresh = _refreshOAuthVaultIfNeededUnshared()
         .timeout(_oauthRefreshTimeout)
+        .then<OAuthVaultRefreshResult?>(
+          (result) => result,
+          onError: (Object error) {
+            debugPrint(
+              '[NyaMail oauth] background token refresh failed: $error',
+            );
+            return null;
+          },
+        )
         .whenComplete(() {
           if (identical(_oauthRefreshFuture, refresh)) {
             _oauthRefreshFuture = null;
@@ -5910,6 +6029,9 @@ class _MailHomePageState extends State<MailHomePage>
 
   void _replaceMessages(List<MailMessage> updatedMessages) {
     if (updatedMessages.isEmpty) return;
+    for (final message in updatedMessages) {
+      if (message.read) _dismissNewMailNotification(message.id);
+    }
     final currentById = {for (final message in _messages) message.id: message};
     final selected = _selected;
     if (selected != null &&

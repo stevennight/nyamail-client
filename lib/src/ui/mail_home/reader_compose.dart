@@ -961,7 +961,9 @@ class _ReaderBodyState extends State<_ReaderBody> {
     );
     final title = Text(
       mailMessageSubjectLabel(message.subject),
-      style: Theme.of(context).textTheme.headlineSmall,
+      style: Theme.of(
+        context,
+      ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
       maxLines: widget.mobileFullScreen ? 3 : 2,
       overflow: TextOverflow.ellipsis,
     );
@@ -1123,44 +1125,30 @@ class _ReaderBodyState extends State<_ReaderBody> {
                 ),
               ],
             )
-            : LayoutBuilder(
-              builder: (context, constraints) {
-                final actions = SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: actionButtons,
-                  ),
-                );
-                if (constraints.maxWidth < 620) {
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      title,
-                      const SizedBox(height: 4),
-                      Align(alignment: Alignment.centerRight, child: actions),
-                    ],
-                  );
-                }
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+            : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Organize actions on the left, reply actions on the right.
+                Row(
                   children: [
-                    Expanded(child: title),
-                    Flexible(
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: actions,
+                    Expanded(
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(children: actionButtons.sublist(0, 5)),
                       ),
                     ),
+                    ...actionButtons.sublist(5),
                   ],
-                );
-              },
+                ),
+                const SizedBox(height: 14),
+                title,
+              ],
             );
     return Padding(
       padding:
           widget.mobileFullScreen
               ? const EdgeInsets.fromLTRB(16, 12, 16, 0)
-              : const EdgeInsets.all(24),
+              : const EdgeInsets.fromLTRB(20, 10, 24, 24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

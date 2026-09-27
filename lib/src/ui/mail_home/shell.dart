@@ -315,30 +315,33 @@ class _MailHomeAppBar extends StatelessWidget implements PreferredSizeWidget {
     required this.onRefresh,
     required this.refreshing,
     required this.onSettings,
+    this.showCompose = true,
   });
 
   final String title;
+  final bool showCompose;
   final VoidCallback? onCompose;
   final VoidCallback? onRefresh;
   final bool refreshing;
   final VoidCallback onSettings;
 
   @override
-  Size get preferredSize => const Size.fromHeight(kToolbarHeight + 4);
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight + 2);
 
   @override
   Widget build(BuildContext context) {
     return AppBar(
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       actions: [
-        IconButton(
-          tooltip:
-              onCompose == null
-                  ? 'Add a mailbox before composing'
-                  : 'New message',
-          onPressed: onCompose,
-          icon: const Icon(Icons.edit_outlined),
-        ),
+        if (showCompose)
+          IconButton(
+            tooltip:
+                onCompose == null
+                    ? 'Add a mailbox before composing'
+                    : 'New message',
+            onPressed: onCompose,
+            icon: const Icon(Icons.edit_outlined),
+          ),
         IconButton(
           tooltip: refreshing ? 'Refreshing mail…' : 'Refresh mail',
           onPressed: onRefresh,
@@ -352,11 +355,11 @@ class _MailHomeAppBar extends StatelessWidget implements PreferredSizeWidget {
         const SizedBox(width: 4),
       ],
       bottom: PreferredSize(
-        preferredSize: const Size.fromHeight(4),
+        preferredSize: const Size.fromHeight(2),
         child:
             refreshing
-                ? const LinearProgressIndicator(minHeight: 4)
-                : const SizedBox(height: 4),
+                ? const LinearProgressIndicator(minHeight: 2)
+                : const SizedBox(height: 2),
       ),
     );
   }

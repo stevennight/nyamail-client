@@ -38,6 +38,7 @@ class MailInteractionSettings {
     this.mobileSwipeEnabled = true,
     this.desktopContextMenuEnabled = true,
     this.multiSelectEnabled = true,
+    this.smartInbox = true,
     this.mobileSwipeRightToLeftLevel1 = MailListActionPreference.pin,
     this.mobileSwipeRightToLeftLevel2 = MailListActionPreference.delete,
     this.mobileSwipeLeftToRightLevel1 = MailListActionPreference.toggleRead,
@@ -60,6 +61,10 @@ class MailInteractionSettings {
   final bool mobileSwipeEnabled;
   final bool desktopContextMenuEnabled;
   final bool multiSelectEnabled;
+
+  /// Group automated notifications and newsletters into bundles in incoming
+  /// views instead of listing them between mail from people.
+  final bool smartInbox;
   final MailListActionPreference mobileSwipeRightToLeftLevel1;
   final MailListActionPreference mobileSwipeRightToLeftLevel2;
   final MailListActionPreference mobileSwipeLeftToRightLevel1;
@@ -71,6 +76,7 @@ class MailInteractionSettings {
     bool? mobileSwipeEnabled,
     bool? desktopContextMenuEnabled,
     bool? multiSelectEnabled,
+    bool? smartInbox,
     MailListActionPreference? mobileSwipeRightToLeftLevel1,
     MailListActionPreference? mobileSwipeRightToLeftLevel2,
     MailListActionPreference? mobileSwipeLeftToRightLevel1,
@@ -83,6 +89,7 @@ class MailInteractionSettings {
       desktopContextMenuEnabled:
           desktopContextMenuEnabled ?? this.desktopContextMenuEnabled,
       multiSelectEnabled: multiSelectEnabled ?? this.multiSelectEnabled,
+      smartInbox: smartInbox ?? this.smartInbox,
       mobileSwipeRightToLeftLevel1:
           mobileSwipeRightToLeftLevel1 ?? this.mobileSwipeRightToLeftLevel1,
       mobileSwipeRightToLeftLevel2:
@@ -107,6 +114,7 @@ class MailInteractionSettingsStore {
       'nyamail.interaction.desktop_context_menu_enabled';
   static const _multiSelectEnabledKey =
       'nyamail.interaction.multi_select_enabled';
+  static const _smartInboxKey = 'nyamail.interaction.smart_inbox';
   static const _mobileSwipeRightToLeftLevel1Key =
       'nyamail.interaction.mobile_rtl_level_1';
   static const _mobileSwipeRightToLeftLevel2Key =
@@ -136,6 +144,9 @@ class MailInteractionSettingsStore {
       multiSelectEnabled:
           prefs.getBool(_multiSelectEnabledKey) ??
           MailInteractionSettings.defaults.multiSelectEnabled,
+      smartInbox:
+          prefs.getBool(_smartInboxKey) ??
+          MailInteractionSettings.defaults.smartInbox,
       mobileSwipeRightToLeftLevel1: mailListActionPreferenceFromStorage(
         prefs.getString(_mobileSwipeRightToLeftLevel1Key),
       ),
@@ -167,6 +178,7 @@ class MailInteractionSettingsStore {
       settings.desktopContextMenuEnabled,
     );
     await prefs.setBool(_multiSelectEnabledKey, settings.multiSelectEnabled);
+    await prefs.setBool(_smartInboxKey, settings.smartInbox);
     await prefs.setString(
       _mobileSwipeRightToLeftLevel1Key,
       settings.mobileSwipeRightToLeftLevel1.storageValue,

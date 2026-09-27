@@ -18,3 +18,6 @@ macos/Flutter/GeneratedPluginRegistrant.swift
 windows/flutter/ephemeral/
 linux/flutter/ephemeral/
 .codex-remote-attachments/
+
+# UI preview renders (test_preview/ui_preview_test.dart --update-goldens)
+test_preview/shots/
