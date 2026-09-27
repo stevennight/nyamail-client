@@ -1,5 +1,9 @@
 import 'dart:convert';
 
+import 'mail_category.dart';
+
+export 'mail_category.dart';
+
 enum MailboxKind { inbox, sent, drafts, archive, spam, trash, custom }
 
 const standardMailboxKinds = [
@@ -129,6 +133,7 @@ class MailMessage {
     this.attachments = const [],
     this.bodyLoaded = true,
     this.messageIdHeader = '',
+    this.category,
   });
 
   final String id;
@@ -159,6 +164,14 @@ class MailMessage {
   /// its own per-folder UID. Empty when the header was missing or malformed.
   final String messageIdHeader;
 
+  /// Sender kind derived from the message headers (see
+  /// [classifyMailCategory]). Null for messages cached before categories
+  /// existed; [effectiveCategory] then falls back to the sender address.
+  final MailCategory? category;
+
+  MailCategory get effectiveCategory =>
+      category ?? classifyMailCategory(from: from);
+
   MailMessage copyWith({
     String? id,
     String? accountId,
@@ -180,6 +193,7 @@ class MailMessage {
     List<MailAttachment>? attachments,
     bool? bodyLoaded,
     String? messageIdHeader,
+    MailCategory? category,
   }) {
     return MailMessage(
       id: id ?? this.id,
@@ -202,6 +216,7 @@ class MailMessage {
       attachments: attachments ?? this.attachments,
       bodyLoaded: bodyLoaded ?? this.bodyLoaded,
       messageIdHeader: messageIdHeader ?? this.messageIdHeader,
+      category: category ?? this.category,
     );
   }
 

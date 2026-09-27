@@ -1133,10 +1133,12 @@ MailMessage _mailMessageFromParts({
   body = body.replaceAll('\r\n', '\n').trim();
   htmlBody = htmlBody.replaceAll('\r\n', '\n').trim();
   final preview = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final from = _decodeHeader(headers['from'] ?? 'Unknown sender');
   return MailMessage(
     id: id,
     accountId: accountId,
-    from: _decodeHeader(headers['from'] ?? 'Unknown sender'),
+    from: from,
+    category: classifyMailCategory(from: from, headers: headers),
     to: _parseAddressHeader(headers['to'] ?? ''),
     cc: _parseAddressHeader(headers['cc'] ?? ''),
     replyTo: _parseAddressHeader(headers['reply-to'] ?? ''),

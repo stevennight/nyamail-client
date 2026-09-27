@@ -883,6 +883,7 @@ Map<String, Object?> _indexToJson(MailMessage message) => {
   'has_attachments': message.hasAttachments,
   'body_loaded': message.bodyLoaded,
   'message_id_header': message.messageIdHeader,
+  if (message.category != null) 'category': message.category!.name,
   'attachments': [
     for (final attachment in message.attachments)
       {
@@ -917,6 +918,7 @@ MailMessage _messageFromJson(Map<String, Object?> json) => MailMessage(
   hasAttachments: json['has_attachments'] as bool? ?? false,
   bodyLoaded: json['body_loaded'] as bool? ?? true,
   messageIdHeader: json['message_id_header'] as String? ?? '',
+  category: mailCategoryFromName(json['category'] as String?),
   attachments:
       ((json['attachments'] as List?) ?? const []).map((item) {
         final data = (item as Map).cast<String, Object?>();
@@ -968,6 +970,7 @@ bool _sameIndexMessage(MailMessage first, MailMessage second) {
       first.hasAttachments == second.hasAttachments &&
       first.bodyLoaded == second.bodyLoaded &&
       first.messageIdHeader == second.messageIdHeader &&
+      first.category == second.category &&
       _sameAttachments(first.attachments, second.attachments);
 }
 
