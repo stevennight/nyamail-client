@@ -98,6 +98,22 @@ void main() {
       'recovered-account-new-mail',
     ]);
   });
+
+  test('account without unread mail at startup still notifies new mail', () {
+    final baseline = MailNotificationBaseline(
+      clock: () => DateTime.utc(2026, 9, 27, 9),
+    );
+    baseline.freshMessages([
+      _message('known', DateTime.utc(2026, 9, 26)),
+    ], completeStartupBaseline: true);
+
+    final fresh = baseline.freshMessages([
+      _message('old', DateTime.utc(2026, 9, 1), accountId: 'quiet'),
+      _message('arrived', DateTime.utc(2026, 9, 27, 9, 3), accountId: 'quiet'),
+    ]);
+
+    expect(fresh.map((message) => message.id), ['arrived']);
+  });
 }
 
 MailMessage _message(

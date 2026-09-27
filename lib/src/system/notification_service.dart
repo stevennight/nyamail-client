@@ -18,6 +18,11 @@ class NewMailNotificationAccount {
 const _baseChannelId = 'nyamail_new_mail';
 const _baseChannelName = 'New mail';
 const _baseGroupKey = 'nyamail_new_mail';
+const _burstKey = 'burst:nyamail_new_mail';
+
+/// Payload of notifications that stand for several messages: selecting one
+/// opens the incoming mail list instead of a single message.
+const newMailInboxNotificationPayload = 'nyamail:inbox';
 
 class NyaMailNotificationService {
   final FlutterLocalNotificationsPlugin _plugin =
@@ -63,6 +68,21 @@ class NyaMailNotificationService {
     _enabled = true;
   }
 
+  /// Whether the OS lets NyaMail post notifications. Null when unknown
+  /// (platforms without a query API).
+  static Future<bool?> systemPermissionGranted() async {
+    if (kIsWeb || !Platform.isAndroid) return null;
+    try {
+      return await FlutterLocalNotificationsPlugin()
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >()
+          ?.areNotificationsEnabled();
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Pre-creates a per-account notification channel for each account so the
   /// "one group per account" mode can route to it. Android only; a no-op
   /// elsewhere.
@@ -102,6 +122,71 @@ class NyaMailNotificationService {
       ),
       payload: payload,
     );
+  }
+
+  /// One notification standing in for a burst of new mail, so a large sync
+  /// does not flood the notification center. It reuses a single id: a later
+  /// burst replaces it instead of stacking up.
+  Future<void> showNewMailBurst({
+    required String title,
+    required String body,
+    required List<String> lines,
+  }) async {
+    if (!_enabled || !isSupported) return;
+    await _ensureInitialized();
+    await _plugin.show(
+      id: notificationIdForKey(_burstKey),
+      title: title,
+      body: body,
+      notificationDetails: NotificationDetails(
+        android: AndroidNotificationDetails(
+          _baseChannelId,
+          _baseChannelName,
+          channelDescription: 'Unread incoming mail discovered by NyaMail.',
+          importance: Importance.high,
+          priority: Priority.high,
+          category: AndroidNotificationCategory.email,
+          styleInformation: InboxStyleInformation(lines, contentTitle: title),
+        ),
+        iOS: const DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+          threadIdentifier: _baseGroupKey,
+        ),
+        macOS: const DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+          threadIdentifier: _baseGroupKey,
+        ),
+        linux: const LinuxNotificationDetails(),
+      ),
+      payload: newMailInboxNotificationPayload,
+    );
+  }
+
+  /// Removes the notification for a message that has been read.
+  Future<void> cancelNewMail(String notificationKey) async {
+    if (!_initialized || !isSupported) return;
+    try {
+      await _plugin.cancel(id: notificationIdForKey(notificationKey));
+    } catch (error) {
+      debugPrint('[NyaMail notifications] cancel failed: $error');
+    }
+  }
+
+  /// Removes stack summaries, e.g. once nothing they summarized is unread.
+  Future<void> cancelSummaries(Iterable<String> accountIds) async {
+    if (!_initialized || !isSupported) return;
+    final keys = {
+      'summary:$_baseGroupKey',
+      _burstKey,
+      for (final accountId in accountIds) 'summary:$_baseGroupKey:$accountId',
+    };
+    for (final key in keys) {
+      await cancelNewMail(key);
+    }
   }
 
   /// Posts (or refreshes) the summary notification that lets a stack of
@@ -316,7 +401,12 @@ class NyaMailNotificationService {
 
 String? notificationMessageIdFromPayload(String? payload) {
   final value = payload?.trim();
-  return value == null || value.isEmpty ? null : value;
+  if (value == null ||
+      value.isEmpty ||
+      value == newMailInboxNotificationPayload) {
+    return null;
+  }
+  return value;
 }
 
 int notificationIdForKey(String key) {

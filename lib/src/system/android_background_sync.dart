@@ -93,4 +93,15 @@ class AndroidBackgroundSync {
     if (!isSupported) return;
     await _channel.invokeMethod<void>('openBatteryOptimizationSettings');
   }
+
+  /// App info page, where vendor ROMs keep auto-start and background limits.
+  Future<void> openAppDetailsSettings() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('openAppDetailsSettings');
+  }
+
+  Future<void> openNotificationSettings() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('openNotificationSettings');
+  }
 }

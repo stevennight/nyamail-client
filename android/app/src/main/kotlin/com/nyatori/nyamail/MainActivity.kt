@@ -216,8 +216,41 @@ class MainActivity : FlutterFragmentActivity() {
                         result.success(power.isIgnoringBatteryOptimizations(appContext.packageName))
                     }
                     "openBatteryOptimizationSettings" -> {
-                        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        // Ask directly for this app; some ROMs lack the dialog,
+                        // so fall back to the full list.
+                        val request = Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:${appContext.packageName}")
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        try {
+                            appContext.startActivity(request)
+                        } catch (_: Exception) {
+                            appContext.startActivity(
+                                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            )
+                        }
+                        result.success(null)
+                    }
+                    "openAppDetailsSettings" -> {
+                        // Vendor auto-start and background limits live here.
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:${appContext.packageName}")
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        appContext.startActivity(intent)
+                        result.success(null)
+                    }
+                    "openNotificationSettings" -> {
+                        val intent = if (android.os.Build.VERSION.SDK_INT >= 26) {
+                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(Settings.EXTRA_APP_PACKAGE, appContext.packageName)
+                        } else {
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${appContext.packageName}")
+                            )
+                        }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         appContext.startActivity(intent)
                         result.success(null)
                     }

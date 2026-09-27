@@ -9,6 +9,7 @@ class SystemBehaviorSettings {
     required this.openMessageFromNotification,
     this.notificationGrouping = NotificationGrouping.stack,
     this.androidBackgroundSync = false,
+    this.smartNotifications = false,
   });
 
   static const defaults = SystemBehaviorSettings(
@@ -17,6 +18,7 @@ class SystemBehaviorSettings {
     openMessageFromNotification: true,
     notificationGrouping: NotificationGrouping.stack,
     androidBackgroundSync: false,
+    smartNotifications: false,
   );
 
   final bool minimizeToTray;
@@ -29,12 +31,17 @@ class SystemBehaviorSettings {
   /// background.
   final bool androidBackgroundSync;
 
+  /// Only notify for mail from people; notifications and newsletters are
+  /// still fetched and counted, just not announced.
+  final bool smartNotifications;
+
   SystemBehaviorSettings copyWith({
     bool? minimizeToTray,
     bool? newMailNotifications,
     bool? openMessageFromNotification,
     NotificationGrouping? notificationGrouping,
     bool? androidBackgroundSync,
+    bool? smartNotifications,
   }) {
     return SystemBehaviorSettings(
       minimizeToTray: minimizeToTray ?? this.minimizeToTray,
@@ -44,6 +51,7 @@ class SystemBehaviorSettings {
       notificationGrouping: notificationGrouping ?? this.notificationGrouping,
       androidBackgroundSync:
           androidBackgroundSync ?? this.androidBackgroundSync,
+      smartNotifications: smartNotifications ?? this.smartNotifications,
     );
   }
 }
@@ -57,6 +65,7 @@ class SystemBehaviorSettingsStore {
       'system.openMessageFromNotification';
   static const _notificationGroupingKey = 'system.notificationGrouping';
   static const _androidBackgroundSyncKey = 'system.androidBackgroundSync';
+  static const _smartNotificationsKey = 'system.smartNotifications';
 
   Future<SystemBehaviorSettings> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -76,6 +85,9 @@ class SystemBehaviorSettingsStore {
       androidBackgroundSync:
           prefs.getBool(_androidBackgroundSyncKey) ??
           SystemBehaviorSettings.defaults.androidBackgroundSync,
+      smartNotifications:
+          prefs.getBool(_smartNotificationsKey) ??
+          SystemBehaviorSettings.defaults.smartNotifications,
     );
   }
 
@@ -98,5 +110,6 @@ class SystemBehaviorSettingsStore {
       _androidBackgroundSyncKey,
       settings.androidBackgroundSync,
     );
+    await prefs.setBool(_smartNotificationsKey, settings.smartNotifications);
   }
 }
