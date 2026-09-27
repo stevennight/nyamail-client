@@ -668,3 +668,74 @@ Validation:
   bundles libsqlite3.so for all ABIs and the Windows build ships sqlite3.dll.
   Windows builds need `nuget.exe` on PATH for flutter_inappwebview_windows.
 - Not yet exercised against live mailboxes or on a real Android device.
+
+## 2026-09-27 Round 21 - Spark-Style Layout, Smart Inbox and Notifications
+
+Focus: bring the client closer to Spark (Readdle): calmer chrome, a Smart
+Inbox that keeps automated mail out of the way, settings that change in
+place, quieter notifications, and fixes for refreshes that stalled.
+
+Refresh reliability:
+
+- Automatic refresh and IMAP IDLE push now start right after the first
+  mailbox refresh. Folder discovery, server vault sync and the update check
+  used to hold them back, so an unreachable sync server left the mailbox
+  stale for minutes.
+- `NyaMailApi` requests time out after 20 s (they had no timeout).
+- The pre-emptive OAuth token refresh before every refresh or mail action is
+  best effort: a slow or blocked token endpoint no longer fails refreshes for
+  every account, including plain IMAP ones. A real expiry still surfaces as an
+  authentication failure and retries with a forced refresh.
+- Two `return` statements in try blocks now `await`, so auth errors from the
+  targeted retry are caught.
+
+Smart Inbox:
+
+- `MailCategory` (people / notification / newsletter) is derived from
+  `Auto-Submitted`, `List-Unsubscribe`, `Precedence` and the sender mailbox,
+  stored with each cached message; older cache rows fall back to the sender.
+- Incoming views (All incoming, Inbox, Unread, inbox folders) group the list
+  into Pinned / Today / Yesterday / Last 7 days / month sections, and collapse
+  two or more notifications or newsletters into one bundle row with an unread
+  count, sender summary and "mark all read". Toggle: Settings > Inbox &
+  actions. Keyboard navigation follows the on-screen order.
+
+Layout:
+
+- New neutral theme (white / graphite surfaces, one blue accent, flat filled
+  inputs, 10 px radii).
+- Wide layouts drop the app bar: the sidebar carries the brand, settings and
+  a New message button; the list pane has a title, unread count and refresh.
+- Message rows: sender avatar with an account colour dot, unread dot, bold
+  unread text, rounded selection, hover quick actions (read, archive, delete,
+  more) instead of a permanent overflow button. Tapping an avatar starts
+  multi-select. Touch layouts get pull-to-refresh.
+- Reader: organize actions left, reply actions right, title below, so the
+  toolbar no longer gets clipped.
+- Settings: desktop dialog with a category sidebar; phones get a category
+  list with sub-pages. Theme, Smart Inbox, notifications, startup/tray and
+  Android background options change in place instead of via nested dialogs.
+
+Notifications and background:
+
+- More than three new messages in one refresh become one summary
+  notification (all platforms) instead of a stack of toasts.
+- Optional "Only mail from people" (smart notifications).
+- Android stack summaries count every notification still showing; reading a
+  message removes its notification.
+- An account with no unread mail at startup now notifies its first new
+  message (the baseline used to swallow it).
+- Android: battery optimization is requested directly for NyaMail
+  (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`), App info is one tap away for
+  vendor auto-start limits, and a banner appears when Android has blocked
+  NyaMail's notifications.
+
+Validation:
+
+- `test_preview/ui_preview_test.dart` renders the unlocked UI with fake data to
+  PNGs (`--update-goldens`) for visual review; `MailHomePage` accepts a
+  `vaultMailRepositoryBuilder` for it.
+- New tests for the category classifier and the notification baseline.
+- `flutter analyze --no-pub`: only the 2 pre-existing warnings.
+- `flutter test --no-pub`: all passing.
+- Not yet exercised against live mailboxes or on a real Android device.

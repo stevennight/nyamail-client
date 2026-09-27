@@ -11,3 +11,5 @@
 - On mobile, archive, delete, and move from the message detail view return to the list after the local action is applied.
 - Release builds should use `scripts/build-release.ps1` so Windows and Android artifacts keep stable names and paths.
 - Automated checks should not require a real mailbox unless a user explicitly asks for live smoke testing.
+- Smart Inbox: incoming views bundle automated notifications and newsletters (classified from headers and sender) instead of interleaving them with mail from people; it can be turned off.
+- Notification bursts (more than three new messages in one refresh) collapse into one summary notification.
